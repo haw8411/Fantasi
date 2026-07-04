@@ -1,0 +1,11 @@
+# Fantasi - CDC + MSC composite (pid.codes 1209:0001, all platforms)
+SUBSYSTEMS=="usb", ATTRS{idVendor}=="1209", ATTRS{idProduct}=="0001", TAG+="uaccess", GROUP="plugdev", MODE="0660"
+
+# Flipper Zero - STM32 ROM DFU bootloader
+SUBSYSTEMS=="usb", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="df11", TAG+="uaccess", GROUP="plugdev", MODE="0660"
+
+# Proxmark3 - SAM-BA / bootloader mode
+SUBSYSTEMS=="usb", ATTRS{idVendor}=="9ac4", ATTRS{idProduct}=="4b8f", TAG+="uaccess", GROUP="plugdev", MODE="0660"
+
+# Chameleon Ultra - Nordic DFU bootloader
+SUBSYSTEMS=="usb", ATTRS{idVendor}=="1915", ATTRS{idProduct}=="521f", TAG+="uaccess", GROUP="plugdev", MODE="0660"

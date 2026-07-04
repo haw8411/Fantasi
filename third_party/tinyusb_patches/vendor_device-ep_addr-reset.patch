@@ -1,0 +1,20 @@
+diff --git a/src/class/vendor/vendor_device.c b/src/class/vendor/vendor_device.c
+index 1582999..f059ddd 100644
+--- a/src/class/vendor/vendor_device.c
++++ b/src/class/vendor/vendor_device.c
+@@ -185,6 +185,15 @@ void vendord_reset(uint8_t rhport) {
+     tu_memclr(p_itf, ITF_MEM_RESET_SIZE);
+     tu_edpt_stream_clear(&p_itf->rx.stream);
+     tu_edpt_stream_clear(&p_itf->tx.stream);
++
++    /* Fantasi patch: mark the interface un-mounted on bus reset. tud_vendor_n_mounted()
++     * uses stream.ep_addr as the mounted flag, but ep_addr lives past the struct's
++     * "not cleared by bus reset" line, and neither tu_memclr (itf_num only) nor
++     * tu_edpt_stream_clear (fifo only) resets it. So the 2nd enumeration of the vendor
++     * config saw the interface still mounted, vendord_open found no free interface, and
++     * SET_CONFIGURATION stalled — the CDC<->vendor switch stall on the 2nd+ switch. */
++    p_itf->rx.stream.ep_addr = 0;
++    p_itf->tx.stream.ep_addr = 0;
+   }
+ }
+ 

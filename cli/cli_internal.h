@@ -1,0 +1,115 @@
+/* Internal interface shared between the host CLI core (main.c) and the per-command
+ * implementations under cli/commands/. Commands self-register with LOCAL_COMMAND
+ * / LOCAL_COMMAND_BLE (collected into the local_cmd linker section); main.c owns
+ * the transport, FAT mount, and BLE protobuf plumbing and exposes the helpers the
+ * commands call. See cli/commands/README.md. */
+#ifndef FANTASI_CLI_INTERNAL_H
+#define FANTASI_CLI_INTERNAL_H
+
+#include <stddef.h>
+#include <stdint.h>
+#include <stdbool.h>
+
+#ifdef HAS_BLE
+#include "ble_transport.h"
+#include "fantasi.pb.h"
+#include <pb_encode.h>
+#include <pb_decode.h>
+#endif
+
+/* ANSI colors (help highlights local commands). */
+#define C_RED     "\033[31m"
+#define C_YELLOW  "\033[33m"
+#define C_RESET   "\033[0m"
+
+/* Framing sentinels around a command's output in the device's serial CLI. */
+#define FRAME_SENTINEL 0x06
+#define FRAME_START    0x01
+#define FRAME_END      0x02
+
+/* ---- Command registry ----
+ *
+ * One command per file under cli/commands/. Each self-registers into the
+ * local_cmd linker section; main.c iterates __start_local_cmd..__stop_local_cmd.
+ * The Makefile picks up new files via a wildcard over the commands directory. A command may
+ * provide a separate BLE handler (used when the host talks to the device over
+ * BLE instead of the MSC mount). */
+
+typedef void (*local_fn)(const char *arg);
+
+typedef struct {
+    const char *name;
+    const char *help;
+    local_fn    fn;
+#ifdef HAS_BLE
+    local_fn    ble_fn;   /* handler when use_ble is set; NULL falls back to fn */
+#endif
+} local_cmd_t;
+
+#define _CLI_CAT(a, b)  a##b
+#define _CLI_CAT2(a, b) _CLI_CAT(a, b)
+
+#ifdef HAS_BLE
+#define LOCAL_COMMAND(nm, hp, usb_fn)                                   \
+    static const local_cmd_t _CLI_CAT2(_lc_, __LINE__)                  \
+        __attribute__((used, section("local_cmd"), aligned(8))) =       \
+        { (nm), (hp), (usb_fn), 0 }
+#define LOCAL_COMMAND_BLE(nm, hp, usb_fn, ble)                          \
+    static const local_cmd_t _CLI_CAT2(_lc_, __LINE__)                  \
+        __attribute__((used, section("local_cmd"), aligned(8))) =       \
+        { (nm), (hp), (usb_fn), (ble) }
+#else
+#define LOCAL_COMMAND(nm, hp, usb_fn)                                   \
+    static const local_cmd_t _CLI_CAT2(_lc_, __LINE__)                  \
+        __attribute__((used, section("local_cmd"), aligned(8))) =       \
+        { (nm), (hp), (usb_fn) }
+#define LOCAL_COMMAND_BLE(nm, hp, usb_fn, ble)                          \
+    static const local_cmd_t _CLI_CAT2(_lc_, __LINE__)                  \
+        __attribute__((used, section("local_cmd"), aligned(8))) =       \
+        { (nm), (hp), (usb_fn) }
+#endif
+
+extern const local_cmd_t __start_local_cmd[];
+extern const local_cmd_t __stop_local_cmd[];
+
+/* Match the first whitespace-delimited word of `line` to a registered command
+ * (NULL if none). */
+const local_cmd_t *cli_local_match(const char *line);
+
+/* The exit/quit command: empty body; the REPL detects it by function identity. */
+void cmd_exit(const char *arg);
+
+/* ---- Shared CLI internals (defined in main.c) ---- */
+
+extern char cwd[256];                       /* device-side working directory */
+void  resolve_path(const char *arg, char *out, size_t len);
+
+bool  fat_mount(void);                       /* ensure the Fantasi FAT is mounted */
+void  fat_unmount(void);
+const char *fat_path(const char *vpath);     /* device path -> host mount path */
+void  fat_sync(void);
+
+extern int  ser_fd;                          /* serial fd, <0 if not open */
+extern bool msc_active;                      /* MSC mount currently active */
+void  ser_send_cmd(const char *cmd);
+
+#ifdef HAS_BLE
+extern bool     use_ble;                     /* talking over BLE, not USB/MSC */
+#endif
+extern bool     use_usb;                     /* talking over the USB vendor pipe */
+extern bool     g_switch_mode;               /* device is switch-mode (PM3): its SAM7S
+                                              * dual-bank OUT can't take pipelined chunks,
+                                              * so uploads pace one chunk at a time */
+#ifdef HAS_BLE
+extern uint32_t ble_req_id;                  /* monotonic protobuf request id */
+extern size_t   ble_rx_len;                  /* protobuf RX accumulator length */
+int   ble_send_proto(CliRequest *req);       /* drain stale rx, then send */
+int   ble_write_req(CliRequest *req);        /* send without draining (pipelined) */
+int   ble_recv_proto(CliResponse *resp);
+void  ble_send_cmd(const char *cmd);
+void  ble_drain_quiet(void);                 /* discard rx until the link is quiet */
+void  ble_cmd_rm(const char *arg);           /* in rm.c; reused as rmdir's BLE handler */
+#define CAT_WINDOW 4096                       /* windowed download chunk size */
+#endif
+
+#endif

@@ -1,0 +1,28 @@
+name: CI
+
+# Run the hardware-free unit tests on every push and pull request. Device
+# integration tests (make test PLATFORM=<x>) need real hardware and aren't run
+# here.
+on:
+  push:
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      # Pinned: nanopb output is version-specific, and tests/unit/test_proto_sync
+      # only enforces the strict comparison against this exact version.
+      # grpcio-tools provides protoc; without it nanopb_generator falls back to a
+      # system `protoc` binary that isn't installed on the runner.
+      - name: Install nanopb generator
+        run: pip install nanopb==0.4.9.1 grpcio-tools
+
+      - name: Unit tests
+        run: make test-unit

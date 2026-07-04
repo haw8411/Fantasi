@@ -1,0 +1,66 @@
+syntax = "proto2";
+import "nanopb.proto";
+
+message CliRequest {
+  required uint32 id = 1;
+  oneof payload {
+    string command = 2 [(nanopb).max_size = 128];
+    FileWriteChunk file_write = 3;
+    FileReadRequest file_read = 4;
+    DirListRequest dir_list = 5;
+    FileDeleteRequest file_delete = 6;
+    MkdirRequest mkdir = 7;
+  }
+}
+
+message CliResponse {
+  required uint32 id = 1;
+  required bool has_next = 2;
+  oneof payload {
+    string output = 3 [(nanopb).max_size = 512];
+    FileReadChunk file_data = 4;
+    ErrorResponse error = 5;
+    DirEntry dir_entry = 6;
+  }
+}
+
+message FileWriteChunk {
+  required string path = 1 [(nanopb).max_size = 64];
+  required uint32 offset = 2;
+  required bytes data = 3 [(nanopb).max_size = 512];
+  required bool last = 4;
+}
+
+message FileReadRequest {
+  required string path = 1 [(nanopb).max_size = 64];
+  required uint32 offset = 2;
+  required uint32 size = 3;
+}
+
+message FileReadChunk {
+  required uint32 offset = 1;
+  required bytes data = 2 [(nanopb).max_size = 512];
+  required bool last = 3;
+}
+
+message ErrorResponse {
+  required string message = 1 [(nanopb).max_size = 64];
+}
+
+message DirListRequest {
+  required string path = 1 [(nanopb).max_size = 64];
+}
+
+message DirEntry {
+  required string name = 1 [(nanopb).max_size = 64];
+  required bool is_dir = 2;
+  required uint32 size = 3;
+}
+
+message FileDeleteRequest {
+  required string path = 1 [(nanopb).max_size = 64];
+}
+
+message MkdirRequest {
+  required string path = 1 [(nanopb).max_size = 64];
+}

@@ -1,0 +1,1251 @@
+/* Fantasi CLI - host-side shell wrapping the device's serial CLI + its USB
+ * storage. The device exposes a "Fantasi" FAT drive over MSC; local file
+ * commands (ls, cd, cat, upload, rm, mkdir) operate on it via the OS mount
+ * (udisksctl), and over BLE they use the protobuf transport. Serial commands
+ * are passed through to the device unchanged. */
+
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <termios.h>
+#include <errno.h>
+#include <glob.h>
+#include <sys/stat.h>
+#include <dirent.h>
+#include <signal.h>
+#include <poll.h>
+#include <readline/readline.h>
+#include <readline/history.h>
+
+#ifdef HAS_BLE
+#include "ble_transport.h"
+#include "fantasi.pb.h"
+#include <pb_encode.h>
+#include <pb_decode.h>
+#endif
+
+#ifdef HAS_USB_VENDOR
+#include "usb_transport.h"
+#endif
+
+#include "cli_internal.h"
+
+/* Set when the protobuf transport is the USB vendor (WebUSB) pipe rather than
+ * BLE. Declared unconditionally so the shared proto-path checks compile even in
+ * builds without USB/BLE. */
+bool use_usb;
+bool g_switch_mode;   /* PM3 (switch-mode): pace uploads, no pipelining (SAM7S dual-bank OUT) */
+
+/* ---- FAT mount state (the device's "Fantasi" MSC drive, mounted by the OS) ---- */
+
+char cwd[256] = "/";   /* device-side path, e.g. "/", "/apps", "/ramfs" */
+static char g_mnt[256];       /* OS mountpoint of the Fantasi FAT, "" if unmounted */
+static char g_blk[64];        /* block device currently mounted */
+static bool g_switched;       /* sent `msc` to enter MSC mode (switch-mode PM3) */
+
+/* fat_mount / fat_unmount / fat_path are declared in cli_internal.h and defined
+ * below (after the serial/block discovery helpers). */
+
+/* ---- Persistent serial path (for reconnect after MSC) ---- */
+
+static char g_ser_path[64];
+
+/* ---- Serial port ---- */
+
+int ser_fd = -1;
+
+static bool ser_open(const char *path)
+{
+    ser_fd = open(path, O_RDWR | O_NOCTTY | O_NONBLOCK);
+    if (ser_fd < 0) {
+        fprintf(stderr, "cannot open %s: %s\n", path, strerror(errno));
+        return false;
+    }
+    /* Clear O_NONBLOCK - we only needed it for open() to avoid blocking
+     * on carrier detect. Reads use poll(); writes must not silently drop. */
+    int flags = fcntl(ser_fd, F_GETFL, 0);
+    fcntl(ser_fd, F_SETFL, flags & ~O_NONBLOCK);
+
+    struct termios t;
+    tcgetattr(ser_fd, &t);
+    cfmakeraw(&t);
+    cfsetspeed(&t, B115200);
+    t.c_cflag |= CLOCAL | CREAD;
+    tcsetattr(ser_fd, TCSANOW, &t);
+    tcflush(ser_fd, TCIOFLUSH);
+    return true;
+}
+
+static bool ser_connected;
+bool msc_active;
+static void ser_drain(void);
+static bool wait_for_fantasi_serial(char *out, size_t len, int timeout_s);
+
+static void ser_close(void)
+{
+    if (ser_fd >= 0) {
+        close(ser_fd);
+        ser_fd = -1;
+    }
+}
+
+static void ser_mark_disconnected(void)
+{
+    ser_close();
+    ser_connected = false;
+}
+
+static bool ser_try_reconnect(void)
+{
+    char path[64];
+    if (!wait_for_fantasi_serial(path, sizeof(path), 0))
+        return false;
+    usleep(500000);
+    if (!ser_open(path))
+        return false;
+    snprintf(g_ser_path, sizeof(g_ser_path), "%s", path);
+    ser_connected = true;
+    usleep(300000);
+    ser_drain();
+    return true;
+}
+
+static void ser_drain(void)
+{
+    struct pollfd pfd = { .fd = ser_fd, .events = POLLIN };
+    char d[512];
+    while (poll(&pfd, 1, 50) > 0 && (pfd.revents & POLLIN))
+        if (read(ser_fd, d, sizeof(d)) <= 0) break;
+}
+
+static void ser_write(const char *s, size_t len)
+{
+    while (len > 0) {
+        ssize_t n = write(ser_fd, s, len);
+        if (n <= 0) {
+            if (!msc_active) ser_mark_disconnected();
+            return;
+        }
+        s += n; len -= n;
+    }
+}
+
+void ser_send_cmd(const char *cmd)
+{
+    ser_drain();
+    ser_write(cmd, strlen(cmd));
+    ser_write("\r\n", 2);
+}
+
+/* Framing bytes (FRAME_SENTINEL / FRAME_START / FRAME_END) are defined in
+ * cli_internal.h: firmware sends \x06\x01 before command output and \x06\x02
+ * when the command is done. */
+
+static void ser_emit_framed(const uint8_t *buf, ssize_t n, uint8_t *prev,
+                            bool *done)
+{
+    for (ssize_t i = 0; i < n; i++) {
+        uint8_t c = buf[i];
+        if (*prev == FRAME_SENTINEL && c == FRAME_END) { *done = true; return; }
+        if (*prev == FRAME_SENTINEL && c != FRAME_END)
+            ; /* drop stray sentinel */
+        else if (c == FRAME_SENTINEL)
+            ; /* hold - check next byte */
+        else if (c != '\r')
+            putchar(c);
+        *prev = c;
+    }
+    fflush(stdout);
+}
+
+static void ser_read_response(void)
+{
+    /* Phase 1: eat echo + wait for \x06\x01 (command started). */
+    uint8_t prev = 0;
+    uint8_t carry[256];
+    ssize_t carry_len = 0;
+
+    for (;;) {
+        struct pollfd pfd = { .fd = ser_fd, .events = POLLIN };
+        int r = poll(&pfd, 1, 5000);
+        if (r <= 0) return;
+        if (pfd.revents & (POLLERR | POLLHUP)) {
+            if (!msc_active) ser_mark_disconnected();
+            return;
+        }
+
+        uint8_t chunk[256];
+        ssize_t n = read(ser_fd, (char *)chunk, sizeof(chunk));
+        if (n <= 0) {
+            if (!msc_active) ser_mark_disconnected();
+            return;
+        }
+
+        bool found = false;
+        for (ssize_t i = 0; i < n; i++) {
+            uint8_t c = chunk[i];
+            if (prev == FRAME_SENTINEL && c == FRAME_START) {
+                carry_len = n - i - 1;
+                if (carry_len > 0) memcpy(carry, &chunk[i + 1], carry_len);
+                found = true;
+                break;
+            }
+            prev = c;
+        }
+        if (found) break;
+    }
+
+    /* Phase 2: passthrough until \x06\x02 (command done) or Ctrl-C. */
+    struct termios old_tio, raw_tio;
+    tcgetattr(STDIN_FILENO, &old_tio);
+    raw_tio = old_tio;
+    raw_tio.c_lflag &= ~(ICANON | ECHO | ISIG);
+    raw_tio.c_cc[VMIN] = 0;
+    raw_tio.c_cc[VTIME] = 0;
+    tcsetattr(STDIN_FILENO, TCSANOW, &raw_tio);
+
+    /* Process leftover bytes from phase 1 */
+    prev = 0;
+    bool finished = false;
+    if (carry_len > 0)
+        ser_emit_framed(carry, carry_len, &prev, &finished);
+
+    while (!finished) {
+        struct pollfd pfds[2] = {
+            { .fd = STDIN_FILENO, .events = POLLIN },
+            { .fd = ser_fd,       .events = POLLIN },
+        };
+        int r = poll(pfds, 2, 500);
+
+        if (ser_fd < 0) break;
+        if (r < 0 && errno == EINTR) continue;
+
+        if (pfds[1].revents & (POLLERR | POLLHUP)) {
+            /* While MSC is mounted (composite), CDC can briefly hiccup as the
+             * USB task services storage; don't tear down the link on it (matches
+             * phase 1) - only a genuine disconnect (MSC inactive) is fatal. */
+            if (!msc_active) ser_mark_disconnected();
+            break;
+        }
+
+        if (pfds[0].revents & POLLIN) {
+            char in[64];
+            ssize_t n = read(STDIN_FILENO, in, sizeof(in));
+            if (n > 0) {
+                ser_write(in, n);
+                for (ssize_t i = 0; i < n; i++)
+                    if (in[i] == 0x03) goto done;
+            }
+        }
+
+        if (pfds[1].revents & POLLIN) {
+            uint8_t chunk[256];
+            ssize_t n = read(ser_fd, (char *)chunk, sizeof(chunk));
+            if (n <= 0) { if (!msc_active) ser_mark_disconnected(); break; }
+            ser_emit_framed(chunk, n, &prev, &finished);
+        }
+    }
+
+done:
+    tcsetattr(STDIN_FILENO, TCSANOW, &old_tio);
+}
+
+/* ---- Resolve path against cwd ---- */
+
+void resolve_path(const char *arg, char *out, size_t len)
+{
+    if (!arg || !arg[0]) {
+        strncpy(out, cwd, len);
+    } else if (arg[0] == '/') {
+        strncpy(out, arg, len);
+    } else {
+        size_t cwdlen = strlen(cwd);
+        if (cwdlen == 1)
+            snprintf(out, len, "/%s", arg);
+        else
+            snprintf(out, len, "%s/%s", cwd, arg);
+    }
+    out[len - 1] = '\0';
+}
+
+/* ---- Local commands (operate on the OS-mounted "Fantasi" FAT) ----
+ *
+ * fat_mount() puts the device in MSC mode (switch-mode on PM3), waits for the
+ * kernel to expose the Fantasi block device, and mounts it via udisksctl.
+ * fat_path() maps a device path ("/apps/x") to the host mountpoint
+ * ("<g_mnt>/apps/x"); the file ops are then plain stdio against that path.
+ * The synthetic FAT commits writes synchronously, so no explicit sync is
+ * needed - but we fsync the mount before returning so the device sees the
+ * data before any subsequent eject. */
+
+const char *fat_path(const char *vpath)
+{
+    static char host[512];
+    /* vpath is already absolute ("/...") or empty (root). */
+    if (!vpath || !vpath[0] || strcmp(vpath, "/") == 0)
+        snprintf(host, sizeof(host), "%s", g_mnt);
+    else
+        snprintf(host, sizeof(host), "%s%s", g_mnt, vpath);
+    return host;
+}
+
+void fat_sync(void)
+{
+    if (g_mnt[0]) sync();
+}
+
+/* ---- Command dispatch ---- */
+
+static const char *skip_word(const char *s)
+{
+    while (*s && *s != ' ' && *s != '\t') s++;
+    while (*s == ' ' || *s == '\t') s++;
+    return s;
+}
+
+/* Match the first word of `line` to a command registered in the local_cmd
+ * section (see cli_internal.h / cli/commands/). */
+const local_cmd_t *cli_local_match(const char *line)
+{
+    for (const local_cmd_t *c = __start_local_cmd; c < __stop_local_cmd; c++) {
+        size_t len = strlen(c->name);
+        if (strncmp(line, c->name, len) == 0 &&
+            (line[len] == 0 || line[len] == ' '))
+            return c;
+    }
+    return NULL;
+}
+
+#ifdef HAS_BLE
+bool     use_ble;       /* talking to the device over BLE rather than USB/MSC */
+uint32_t ble_req_id;    /* monotonic protobuf request id */
+#endif
+
+static bool handle_local(const char *line)
+{
+    const local_cmd_t *c = cli_local_match(line);
+    if (!c) return true;
+    if (c->fn == cmd_exit) return false;
+    const char *arg = skip_word(line);
+    if (!*arg) arg = NULL;
+
+#ifdef HAS_BLE
+    if ((use_ble || use_usb) && c->ble_fn) {
+        c->ble_fn(arg);
+        return true;
+    }
+#endif
+
+    c->fn(arg);
+    return true;
+}
+
+/* ---- Auto-detect ---- */
+
+static bool find_fantasi_device(char *ser_path, size_t ser_len,
+                                char *blk_path, size_t blk_len)
+{
+    glob_t g;
+    ser_path[0] = blk_path[0] = '\0';
+
+    if (glob("/sys/bus/usb/devices/[0-9]*", 0, NULL, &g) != 0)
+        return false;
+
+    for (size_t i = 0; i < g.gl_pathc; i++) {
+        char vpath[512], ppath[512];
+        snprintf(vpath, sizeof(vpath), "%s/idVendor", g.gl_pathv[i]);
+        snprintf(ppath, sizeof(ppath), "%s/idProduct", g.gl_pathv[i]);
+
+        FILE *fv = fopen(vpath, "r"), *fp = fopen(ppath, "r");
+        if (!fv || !fp) { if (fv) fclose(fv); if (fp) fclose(fp); continue; }
+
+        char vid[8], pid[8];
+        if (!fgets(vid, sizeof(vid), fv) || !fgets(pid, sizeof(pid), fp)) {
+            fclose(fv); fclose(fp); continue;
+        }
+        fclose(fv); fclose(fp);
+        vid[strcspn(vid, "\n")] = '\0';
+        pid[strcspn(pid, "\n")] = '\0';
+
+        if (strcmp(vid, "1209") != 0 || strcmp(pid, "0001") != 0) continue;
+
+        /* Found Fantasi device - scan for tty and block device */
+        char pattern[512];
+        snprintf(pattern, sizeof(pattern), "%s/*/tty/ttyACM*", g.gl_pathv[i]);
+        glob_t tg;
+        if (glob(pattern, 0, NULL, &tg) == 0 && tg.gl_pathc > 0) {
+            const char *base = strrchr(tg.gl_pathv[0], '/');
+            if (base) snprintf(ser_path, ser_len, "/dev%s", base);
+            globfree(&tg);
+        }
+
+        snprintf(pattern, sizeof(pattern), "%s/*/host*/target*/*:*:*:*/block/sd*",
+                 g.gl_pathv[i]);
+        glob_t bg;
+        if (glob(pattern, 0, NULL, &bg) == 0 && bg.gl_pathc > 0) {
+            const char *base = strrchr(bg.gl_pathv[0], '/');
+            if (base) snprintf(blk_path, blk_len, "/dev%s", base);
+            globfree(&bg);
+        }
+        break;
+    }
+    globfree(&g);
+    return ser_path[0] != '\0';
+}
+
+/* ---- MSC mode switching (for platforms like PM3 that lack composite CDC+MSC) ---- */
+
+static bool wait_for_fantasi_block(char *out, size_t len, int timeout_s)
+{
+    for (int i = 0; i < timeout_s * 4; i++) {
+        glob_t g;
+        if (glob("/sys/bus/usb/devices/[0-9]*", 0, NULL, &g) != 0) {
+            usleep(250000);
+            continue;
+        }
+        for (size_t j = 0; j < g.gl_pathc; j++) {
+            char vpath[512], ppath[512];
+            snprintf(vpath, sizeof(vpath), "%s/idVendor", g.gl_pathv[j]);
+            snprintf(ppath, sizeof(ppath), "%s/idProduct", g.gl_pathv[j]);
+            FILE *fv = fopen(vpath, "r"), *fp = fopen(ppath, "r");
+            if (!fv || !fp) { if (fv) fclose(fv); if (fp) fclose(fp); continue; }
+            char vid[8], pid[8];
+            if (!fgets(vid, sizeof(vid), fv) || !fgets(pid, sizeof(pid), fp)) {
+                fclose(fv); fclose(fp); continue;
+            }
+            fclose(fv); fclose(fp);
+            vid[strcspn(vid, "\n")] = '\0';
+            pid[strcspn(pid, "\n")] = '\0';
+            if (strcmp(vid, "1209") != 0 || strcmp(pid, "0001") != 0) continue;
+
+            char pattern[512];
+            snprintf(pattern, sizeof(pattern),
+                     "%s/*/host*/target*/*:*:*:*/block/sd*", g.gl_pathv[j]);
+            glob_t bg;
+            if (glob(pattern, 0, NULL, &bg) == 0 && bg.gl_pathc > 0) {
+                const char *base = strrchr(bg.gl_pathv[0], '/');
+                if (base) {
+                    snprintf(out, len, "/dev%s", base);
+                    globfree(&bg);
+                    globfree(&g);
+                    return true;
+                }
+                globfree(&bg);
+            }
+        }
+        globfree(&g);
+        usleep(250000);
+    }
+    return false;
+}
+
+static bool wait_for_fantasi_serial(char *out, size_t len, int timeout_s)
+{
+    int iterations = timeout_s * 4;
+    if (iterations < 1) iterations = 1;
+    for (int i = 0; i < iterations; i++) {
+        glob_t g;
+        if (glob("/sys/bus/usb/devices/[0-9]*", 0, NULL, &g) != 0) {
+            usleep(250000);
+            continue;
+        }
+        for (size_t j = 0; j < g.gl_pathc; j++) {
+            char vpath[512], ppath[512];
+            snprintf(vpath, sizeof(vpath), "%s/idVendor", g.gl_pathv[j]);
+            snprintf(ppath, sizeof(ppath), "%s/idProduct", g.gl_pathv[j]);
+            FILE *fv = fopen(vpath, "r"), *fp = fopen(ppath, "r");
+            if (!fv || !fp) { if (fv) fclose(fv); if (fp) fclose(fp); continue; }
+            char vid[8], pid[8];
+            if (!fgets(vid, sizeof(vid), fv) || !fgets(pid, sizeof(pid), fp)) {
+                fclose(fv); fclose(fp); continue;
+            }
+            fclose(fv); fclose(fp);
+            vid[strcspn(vid, "\n")] = '\0';
+            pid[strcspn(pid, "\n")] = '\0';
+            if (strcmp(vid, "1209") != 0 || strcmp(pid, "0001") != 0) continue;
+
+            char pattern[512];
+            snprintf(pattern, sizeof(pattern), "%s/*/tty/ttyACM*", g.gl_pathv[j]);
+            glob_t tg;
+            if (glob(pattern, 0, NULL, &tg) == 0 && tg.gl_pathc > 0) {
+                const char *base = strrchr(tg.gl_pathv[0], '/');
+                if (base) {
+                    snprintf(out, len, "/dev%s", base);
+                    globfree(&tg);
+                    globfree(&g);
+                    return true;
+                }
+                globfree(&tg);
+            }
+        }
+        globfree(&g);
+        if (i + 1 < iterations) usleep(250000);
+    }
+    return false;
+}
+
+/* Mount the block device (whole-disk superfloppy FAT) via udisksctl and
+ * report where the OS put it. Handles the "already mounted" case too. */
+static bool udisks_mountpoint(const char *blk, char *out, size_t len)
+{
+    out[0] = '\0';
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "udisksctl mount -b %s 2>&1", blk);
+    FILE *p = popen(cmd, "r");
+    if (p) {
+        char line[512];
+        while (fgets(line, sizeof(line), p)) {
+            /* "Mounted <dev> at <path>" or "...already mounted at `<path>`." */
+            char *at = strstr(line, " at ");
+            if (!at) continue;
+            char *m = at + 4;
+            while (*m == '`' || *m == '\'' || *m == '"' || *m == ' ') m++;
+            size_t k = 0;
+            while (m[k] && m[k] != '`' && m[k] != '\'' && m[k] != '"' &&
+                   m[k] != '\n') k++;
+            /* udisksctl ends the "already mounted" form with a '.' */
+            if (k > 0 && m[k - 1] == '.') k--;
+            m[k] = '\0';
+            snprintf(out, len, "%s", m);
+        }
+        pclose(p);
+    }
+    if (out[0]) return true;
+
+    /* Fall back to the current mountpoint (e.g. auto-mounted by the desktop). */
+    snprintf(cmd, sizeof(cmd), "findmnt -n -o TARGET %s 2>/dev/null", blk);
+    p = popen(cmd, "r");
+    if (!p) return false;
+    if (fgets(out, len, p)) out[strcspn(out, "\n")] = '\0';
+    pclose(p);
+    return out[0] != '\0';
+}
+
+bool fat_mount(void)
+{
+    if (g_mnt[0]) return true;   /* already mounted */
+
+    char blk[64];
+    /* Composite devices (FZ/CU) expose the MSC block device alongside CDC, so
+     * it is already present. Switch-mode devices (PM3) reuse the CDC endpoints
+     * for MSC and must be told to switch with the `msc` command first. */
+    if (!wait_for_fantasi_block(blk, sizeof(blk), 1)) {
+        if (!ser_connected) { fprintf(stderr, "  not connected\n"); return false; }
+
+        printf("  switching to MSC mode...\n");
+        /* Send `msc` with retries. A CDC ACM enumeration quirk can inject a
+         * stray byte that corrupts the first command; if the port doesn't go
+         * away (device didn't switch), flush and retry. */
+        for (int attempt = 0; attempt < 3; attempt++) {
+            ser_write("\r\n", 2);
+            usleep(150000);
+            ser_drain();
+            ser_write("msc\r\n", 5);
+
+            struct pollfd pfd = { .fd = ser_fd, .events = POLLIN | POLLERR | POLLHUP };
+            bool switched = false;
+            for (int i = 0; i < 20; i++) {
+                int r = poll(&pfd, 1, 200);
+                if (r > 0 && (pfd.revents & (POLLERR | POLLHUP))) { switched = true; break; }
+                if (r > 0 && (pfd.revents & POLLIN)) {
+                    char d[256];
+                    ssize_t n = read(ser_fd, d, sizeof(d));
+                    if (n <= 0) { switched = true; break; }
+                }
+            }
+            if (switched) break;
+        }
+        ser_close();
+        ser_connected = false;
+        g_switched = true;
+
+        if (!wait_for_fantasi_block(blk, sizeof(blk), 10)) {
+            fprintf(stderr, "  block device did not appear\n");
+            if (wait_for_fantasi_serial(g_ser_path, sizeof(g_ser_path), 5))
+                ser_open(g_ser_path);
+            return false;
+        }
+    }
+
+    snprintf(g_blk, sizeof(g_blk), "%s", blk);
+    usleep(500000);   /* let the kernel settle on the new block device */
+
+    /* udev/udisks needs a moment to register a freshly-enumerated device, so the
+     * first mount attempt often races and fails - retry for a few seconds. */
+    for (int i = 0; i < 12; i++) {
+        if (udisks_mountpoint(blk, g_mnt, sizeof(g_mnt))) {
+            msc_active = true;
+            return true;
+        }
+        usleep(500000);
+    }
+    fprintf(stderr, "  mount failed: %s\n", blk);
+    g_mnt[0] = '\0';
+    return false;
+}
+
+void fat_unmount(void)
+{
+    if (!g_mnt[0]) return;
+
+    sync();
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "udisksctl unmount -b %s 2>/dev/null", g_blk);
+    (void)system(cmd);
+    g_mnt[0] = '\0';
+    msc_active = false;
+
+    /* Switch-mode devices (PM3) must be SCSI-ejected so the firmware leaves MSC
+     * and re-enumerates as CDC. Composite devices (FZ/CU) keep both interfaces,
+     * so there is nothing to switch back. */
+    if (g_switched) {
+        snprintf(cmd, sizeof(cmd), "eject %s 2>/dev/null", g_blk);
+        (void)system(cmd);
+        g_switched = false;
+
+        printf("  ejected, waiting for serial...\n");
+        char new_ser[64];
+        if (wait_for_fantasi_serial(new_ser, sizeof(new_ser), 10)) {
+            usleep(500000);
+            snprintf(g_ser_path, sizeof(g_ser_path), "%s", new_ser);
+            if (ser_open(g_ser_path)) {
+                usleep(200000);
+                ser_drain();
+                ser_connected = true;
+                printf("  reconnected: %s\n", g_ser_path);
+            } else {
+                fprintf(stderr, "  cannot reopen %s\n", g_ser_path);
+            }
+        } else {
+            fprintf(stderr, "  serial port did not reappear\n");
+        }
+    }
+    g_blk[0] = '\0';
+}
+
+#ifdef HAS_USB_VENDOR
+/* Re-establish the WebUSB session after the device dropped. Returns true once
+ * reconnected. A device that came back already in vendor mode (forced-composite
+ * --usb, or a warm re-enumeration) is picked up directly; a switch-mode device
+ * (PM3) boots to CDC after a reset, so we reopen serial and switch it back to
+ * the vendor pipe with `webusb`, mirroring the initial upgrade. */
+static bool usb_reconnect(void)
+{
+    if (usb_transport_open() == 0) return true;   /* back already in vendor mode */
+
+    if (g_switch_mode) {
+        char path[64];
+        if (!wait_for_fantasi_serial(path, sizeof(path), 0)) return false;
+        if (!ser_open(path)) return false;
+        snprintf(g_ser_path, sizeof(g_ser_path), "%s", path);
+        ser_write("\r\n", 2);          /* clear the CDC enumeration-quirk stray byte */
+        usleep(100000);
+        ser_drain();
+        ser_write("webusb\r\n", 8);
+        usleep(300000);                /* let the reply drain before CDC tears down */
+        ser_close();
+        if (usb_transport_open() == 0) return true;
+    }
+    return false;
+}
+#endif
+
+/* ---- Readline event hook: detect disconnect/reconnect while idle ---- */
+
+static int rl_poll_serial(void)
+{
+    /* Switch-mode MSC (PM3): CDC is gone (ser_fd < 0) and the MSC transfer path
+     * does its own disconnect handling - skip. Composite devices (FZ/CU) keep a
+     * persistent MSC mount but leave CDC open (ser_fd >= 0), so we must still
+     * poll it here or a real disconnect (POLLHUP) is never noticed and the
+     * prompt never goes red. */
+    if (msc_active && ser_fd < 0) return 0;
+
+#ifdef HAS_BLE
+    if (use_ble) {
+        if (ser_connected) {
+            ble_transport_process();
+            if (!ble_transport_connected()) {
+                ser_connected = false;
+                rl_set_prompt(
+                    "\001" C_RED "\002" "fantasi" "\001" C_RESET "\002" "> ");
+                rl_redisplay();
+            }
+        } else {
+            /* Throttle reconnect attempts to ~1/s (the hook fires ~10/s). */
+            static int throttle;
+            if (++throttle >= 10) {
+                throttle = 0;
+                if (ble_transport_reconnect()) {
+                    ser_connected = true;
+                    printf("\n  reconnected over BLE\n");
+                    rl_set_prompt("fantasi> ");
+                    rl_redisplay();
+                }
+            }
+        }
+        return 0;
+    }
+#endif
+
+#ifdef HAS_USB_VENDOR
+    if (use_usb) {
+        if (ser_connected) {
+            /* No bulk traffic at idle to surface a removal, so actively probe
+             * EP0 a couple times a second (the hook fires ~10/s). */
+            static int probe;
+            if (++probe >= 5) {
+                probe = 0;
+                if (!usb_transport_alive()) {
+                    ser_connected = false;
+                    rl_set_prompt(
+                        "\001" C_RED "\002" "fantasi" "\001" C_RESET "\002" "> ");
+                    rl_redisplay();
+                }
+            }
+        } else {
+            /* Throttle reconnect attempts to ~1/s. */
+            static int uthrottle;
+            if (++uthrottle >= 10) {
+                uthrottle = 0;
+                if (usb_reconnect()) {
+                    ser_connected = true;
+                    printf("\n  reconnected over USB\n");
+                    rl_set_prompt("fantasi> ");
+                    rl_redisplay();
+                }
+            }
+        }
+        return 0;
+    }
+#endif
+
+    if (ser_connected && ser_fd >= 0) {
+        struct pollfd pfd = { .fd = ser_fd, .events = 0 };
+        if (poll(&pfd, 1, 0) > 0 && (pfd.revents & (POLLERR | POLLHUP))) {
+            ser_mark_disconnected();
+            /* The MSC mount (if any) died with the device. Drop it so the
+             * reconnect below isn't blocked by the stale msc_active + ser_fd<0
+             * early-return, and so a later file command re-mounts the fresh
+             * block device (fat_mount re-detects it). */
+            if (msc_active) fat_unmount();
+            rl_set_prompt(
+                "\001" C_RED "\002" "fantasi" "\001" C_RESET "\002" "> ");
+            rl_redisplay();
+        }
+    } else if (!ser_connected) {
+        if (ser_try_reconnect()) {
+            printf("\n  reconnected: %s\n", g_ser_path);
+            rl_set_prompt("fantasi> ");
+            rl_redisplay();
+        }
+    }
+    return 0;
+}
+
+/* ---- Main ---- */
+
+static volatile bool running = true;
+
+static void sigint_handler(int sig) { (void)sig; running = false; }
+
+#ifdef HAS_BLE
+
+static uint8_t ble_rx_accum[65536];
+size_t  ble_rx_len;
+
+static volatile sig_atomic_t ble_stream_interrupted;
+
+#ifdef HAS_USB_VENDOR
+/* Same framed protobuf over the USB vendor bulk pipe (libusb). The device runs
+ * the identical engine, so requests/responses are byte-for-byte the BLE ones. */
+static uint8_t usb_rx_accum[4096];
+static size_t  usb_rx_len;
+
+static int usb_write_req(CliRequest *req)
+{
+    uint8_t buf[2 + CliRequest_size];
+    pb_ostream_t stream = pb_ostream_from_buffer(buf + 2, sizeof(buf) - 2);
+    if (!pb_encode(&stream, CliRequest_fields, req)) return -1;
+    uint16_t len = (uint16_t)stream.bytes_written;
+    buf[0] = (uint8_t)(len & 0xFF);
+    buf[1] = (uint8_t)(len >> 8);
+    return (usb_transport_write(buf, 2 + len) == (ssize_t)(2 + len)) ? 0 : -1;
+}
+
+static int usb_send_proto(CliRequest *req)
+{
+    uint8_t d[512];
+    while (usb_transport_read(d, sizeof(d)) > 0) {}   /* drain stale */
+    usb_rx_len = 0;
+    return usb_write_req(req);
+}
+
+static int usb_recv_proto(CliResponse *resp)
+{
+    for (int idle = 0; idle < 200; idle++) {
+        if (ble_stream_interrupted) return -1;         /* ^C during a stream */
+        if (!usb_transport_connected()) return -1;
+        uint8_t chunk[512];
+        ssize_t n = usb_transport_read(chunk, sizeof(chunk));
+        if (n < 0) return -1;
+        if (n > 0) {
+            idle = 0;
+            size_t copy = (size_t)n;
+            if (usb_rx_len + copy > sizeof(usb_rx_accum)) copy = sizeof(usb_rx_accum) - usb_rx_len;
+            memcpy(usb_rx_accum + usb_rx_len, chunk, copy);
+            usb_rx_len += copy;
+        }
+        if (usb_rx_len >= 2) {
+            uint16_t msg_len = (uint16_t)usb_rx_accum[0] | ((uint16_t)usb_rx_accum[1] << 8);
+            if (usb_rx_len >= 2u + msg_len) {
+                pb_istream_t stream = pb_istream_from_buffer(usb_rx_accum + 2, msg_len);
+                *resp = (CliResponse){0};
+                bool ok = pb_decode(&stream, CliResponse_fields, resp);
+                size_t consumed = 2 + msg_len;
+                usb_rx_len -= consumed;
+                if (usb_rx_len > 0) memmove(usb_rx_accum, usb_rx_accum + consumed, usb_rx_len);
+                return ok ? 0 : -1;
+            }
+        }
+    }
+    return -1;
+}
+#endif /* HAS_USB_VENDOR */
+
+/* Encode + write a request without touching the receive side. The pipelined
+ * upload uses this so it doesn't drain pending acks between sends. */
+int ble_write_req(CliRequest *req)
+{
+#ifdef HAS_USB_VENDOR
+    if (use_usb) return usb_write_req(req);
+#endif
+    uint8_t buf[2 + CliRequest_size];
+    pb_ostream_t stream = pb_ostream_from_buffer(buf + 2, sizeof(buf) - 2);
+    if (!pb_encode(&stream, CliRequest_fields, req)) return -1;
+    uint16_t len = (uint16_t)stream.bytes_written;
+    buf[0] = (uint8_t)(len & 0xFF);
+    buf[1] = (uint8_t)(len >> 8);
+    return (ble_transport_write(buf, 2 + len) > 0) ? 0 : -1;
+}
+
+int ble_send_proto(CliRequest *req)
+{
+#ifdef HAS_USB_VENDOR
+    if (use_usb) return usb_send_proto(req);
+#endif
+    /* Drain stale data from both transport and accumulator */
+    ble_transport_process();
+    char d[256]; while (ble_transport_read(d, sizeof(d)) > 0) {}
+    ble_rx_len = 0;
+
+    return ble_write_req(req);
+}
+
+int ble_recv_proto(CliResponse *resp)
+{
+#ifdef HAS_USB_VENDOR
+    if (use_usb) return usb_recv_proto(resp);
+#endif
+
+    for (int idle = 0; idle < 200; idle++) {
+        if (ble_stream_interrupted) return -1;
+        /* If the device dropped (e.g. a reboot), stop waiting for a response
+         * that will never come - checked periodically (the query isn't free). */
+        if ((idle % 10) == 9 && !ble_transport_connected()) return -1;
+        int bfd = ble_transport_fd();
+        if (bfd >= 0) {
+            struct pollfd pfd = { .fd = bfd, .events = POLLIN };
+            poll(&pfd, 1, ble_rx_len > 0 ? 1 : 50);
+        }
+        ble_transport_process();
+        /* Drain the transport ring COMPLETELY each iteration so it can never
+         * back up and overflow (a dropped byte desyncs the 2-byte framing and
+         * truncates the transfer). Regression risk: reading a fixed amount per
+         * iteration lets the ring grow whenever a burst delivers more than one
+         * read removes, until it overflows and drops bytes. */
+        uint8_t chunk[1024];
+        ssize_t n;
+        while ((n = ble_transport_read(chunk, sizeof(chunk))) > 0) {
+            idle = 0;
+            size_t copy = (size_t)n;
+            if (ble_rx_len + copy > sizeof(ble_rx_accum))
+                copy = sizeof(ble_rx_accum) - ble_rx_len;
+            memcpy(&ble_rx_accum[ble_rx_len], chunk, copy);
+            ble_rx_len += copy;
+            if (ble_rx_len == sizeof(ble_rx_accum)) break;
+        }
+
+        if (ble_rx_len > 0 && ble_rx_accum[0] == 0) {
+            size_t skip = 0;
+            while (skip < ble_rx_len && ble_rx_accum[skip] == 0) skip++;
+            ble_rx_len -= skip;
+            if (ble_rx_len > 0)
+                memmove(ble_rx_accum, &ble_rx_accum[skip], ble_rx_len);
+        }
+
+        if (ble_rx_len >= 2) {
+            uint16_t msg_len = (uint16_t)ble_rx_accum[0] |
+                               ((uint16_t)ble_rx_accum[1] << 8);
+            if (ble_rx_len >= 2u + msg_len) {
+                pb_istream_t stream = pb_istream_from_buffer(
+                    &ble_rx_accum[2], msg_len);
+                *resp = (CliResponse){0};
+                bool ok = pb_decode(&stream, CliResponse_fields, resp);
+                size_t consumed = 2 + msg_len;
+                ble_rx_len -= consumed;
+                if (ble_rx_len > 0)
+                    memmove(ble_rx_accum,
+                            &ble_rx_accum[consumed], ble_rx_len);
+                return ok ? 0 : -1;
+            }
+        }
+    }
+    return -1;
+}
+
+void ble_send_cmd(const char *cmd)
+{
+    CliRequest req = CliRequest_init_zero;
+    req.id = ++ble_req_id;
+    req.which_payload = CliRequest_command_tag;
+    strncpy(req.payload.command, cmd, sizeof(req.payload.command) - 1);
+    ble_send_proto(&req);
+}
+
+static void ble_stream_sigint(int sig) { (void)sig; ble_stream_interrupted = 1; }
+
+static void ble_read_response(bool forward_stdin)
+{
+    ble_stream_interrupted = 0;
+    struct sigaction sa = { .sa_handler = ble_stream_sigint };
+    sigaction(SIGINT, &sa, NULL);
+
+    CliResponse resp;
+    bool got_data = false;
+
+    for (;;) {
+        if (ble_stream_interrupted) break;
+
+        if (ble_recv_proto(&resp) < 0) break;
+        got_data = true;
+        if (resp.which_payload == CliResponse_output_tag && resp.payload.output[0])
+            printf("%s", resp.payload.output);
+        else if (resp.which_payload == CliResponse_error_tag)
+            fprintf(stderr, "error: %s\n", resp.payload.error.message);
+        fflush(stdout);
+        if (!resp.has_next) goto done;
+
+        /* Only a launch treats stdin as app I/O: a piped/non-tty ^C arrives as a
+         * literal 0x03 byte (an interactive tty delivers SIGINT, handled above),
+         * and forwarding it stops the app. Other streaming commands (ps, log)
+         * must NOT read stdin - it holds the next scripted command. */
+        if (forward_stdin) {
+            struct pollfd sin = { .fd = STDIN_FILENO, .events = POLLIN };
+            if (poll(&sin, 1, 0) > 0 && (sin.revents & POLLIN)) {
+                char c;
+                if (read(STDIN_FILENO, &c, 1) > 0 && c == 0x03) break;
+            }
+        }
+    }
+
+    /* Streaming exit: tell the device to stop. Route the raw stop byte to the
+     * active transport - ble_transport_write only speaks BLE, so over WebUSB it
+     * silently failed and a launched app was never killed. */
+    if (got_data) {
+        uint8_t ctrl_c = 0x03;
+#ifdef HAS_USB_VENDOR
+        if (use_usb) usb_transport_write(&ctrl_c, 1);
+        else
+#endif
+        ble_transport_write(&ctrl_c, 1);
+        CliResponse drain;
+        for (int i = 0; i < 20; i++) {
+            if (ble_recv_proto(&drain) < 0) break;
+            if (!drain.has_next) break;
+        }
+    }
+
+done:
+    signal(SIGINT, sigint_handler);
+}
+
+
+/* Read & discard any pending BLE notifications until the link goes quiet, then
+ * reset the protobuf framing accumulator. Used before re-requesting a download
+ * range so stale bytes from the aborted stream can't desync the new one. */
+void ble_drain_quiet(void)
+{
+    uint8_t tmp[1024];
+    int quiet = 0;
+    while (quiet < 6) {
+        ble_transport_process();
+        if (ble_transport_read(tmp, sizeof(tmp)) > 0) { quiet = 0; continue; }
+        struct pollfd pfd = { .fd = ble_transport_fd(), .events = POLLIN };
+        if (ble_transport_fd() >= 0) poll(&pfd, 1, 3);
+        quiet++;
+    }
+    ble_rx_len = 0;   /* discard partial frame */
+}
+
+#endif /* HAS_BLE */
+
+#ifdef HAS_USB_VENDOR
+/* Read the device id ("PM3"/"FZ"/"CU") over the open serial CLI. */
+static void query_device_id(char *out, size_t len)
+{
+    out[0] = '\0';
+    ser_drain();
+    ser_write("device\r\n", 8);
+    char buf[256]; int pos = 0;
+    for (int i = 0; i < 20 && pos < (int)sizeof(buf) - 1; i++) {
+        struct pollfd p = { .fd = ser_fd, .events = POLLIN };
+        if (poll(&p, 1, 100) > 0) {
+            ssize_t n = read(ser_fd, buf + pos, sizeof(buf) - 1 - pos);
+            if (n > 0) pos += n;
+        }
+    }
+    buf[pos] = '\0';
+    if      (strstr(buf, "PM3")) snprintf(out, len, "PM3");
+    else if (strstr(buf, "CU"))  snprintf(out, len, "CU");
+    else if (strstr(buf, "FZ"))  snprintf(out, len, "FZ");
+}
+
+/* Connect straight to the WebUSB vendor pipe with no serial. Used when the CDC
+ * port is gone because a switch-mode device (PM3) is already in WebUSB mode -
+ * e.g. a previous fantasi invocation upgraded it and never switched back. Since
+ * usb_transport_open() finds the vendor device over libusb (independent of any
+ * serial port), this lets repeated invocations keep working over WebUSB. */
+static bool connect_webusb_direct(void)
+{
+    if (usb_transport_open() != 0) return false;
+    use_usb = true;
+    ser_connected = true;
+    g_switch_mode = true;   /* only a switch-mode device (PM3) loses its CDC port */
+    printf("transport: WebUSB protobuf - device already in WebUSB mode\n");
+    return true;
+}
+
+/* Move file/CLI traffic onto the USB vendor (WebUSB) protobuf pipe. On switch-mode
+ * devices (PM3) this sends `webusb` and re-opens over libusb; on composite devices
+ * the vendor interface is already there. `force` upgrades any device; otherwise
+ * only switch-mode devices auto-upgrade (composite ones keep serial + MSC). */
+static bool try_webusb_upgrade(bool force)
+{
+    char id[8];
+    query_device_id(id, sizeof(id));
+    bool switch_mode = (strcmp(id, "PM3") == 0);
+    if (!force && !switch_mode) return false;
+
+    if (switch_mode) {
+        ser_write("webusb\r\n", 8);
+        usleep(300000);          /* let the reply drain before CDC tears down */
+        ser_close();
+    }
+    for (int i = 0; i < 40; i++) {
+        if (usb_transport_open() == 0) { use_usb = true; break; }
+        usleep(150000);
+    }
+    if (!use_usb) {
+        fprintf(stderr, "WebUSB upgrade failed (libusb permission, or no vendor interface)\n");
+        return false;
+    }
+    g_switch_mode = switch_mode;   /* PM3: pace uploads (SAM7S dual-bank OUT) */
+    printf("transport: WebUSB protobuf - %s\n",
+           switch_mode ? "PM3 switched from serial" : "composite vendor interface");
+    return true;
+}
+#endif /* HAS_USB_VENDOR */
+
+int main(int argc, char **argv)
+{
+    char blk_path[64] = "";
+
+    bool force_ble = false;
+    bool force_usb = false;
+    (void)force_usb;
+    for (int i = 1; i < argc; i++) {
+        if (strncmp(argv[i], "/dev/tty", 8) == 0)
+            strncpy(g_ser_path, argv[i], sizeof(g_ser_path) - 1);
+        else if (strncmp(argv[i], "/dev/sd", 7) == 0)
+            strncpy(blk_path, argv[i], sizeof(blk_path) - 1);
+        else if (strcmp(argv[i], "--ble") == 0)
+            force_ble = true;
+        else if (strcmp(argv[i], "--usb") == 0)
+            force_usb = true;
+#ifdef HAS_BLE
+        else if (strncmp(argv[i], "--ble-addr=", 11) == 0) {
+            force_ble = true;
+            ble_transport_set_addr(argv[i] + 11);
+        }
+#endif
+        else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            printf("usage: fantasi [--ble[=ADDR]] [--usb] [/dev/ttyACMx] [/dev/sdX]\n");
+            return 0;
+        }
+    }
+
+#ifdef HAS_BLE
+    if (force_ble) {
+        if (ble_transport_open() == 0) {
+            use_ble = true;
+            ser_connected = true;
+        } else {
+            fprintf(stderr, "BLE connection failed\n");
+            return 1;
+        }
+    }
+    if (!use_ble)
+#endif
+    if (!g_ser_path[0]) {
+        if (!find_fantasi_device(g_ser_path, sizeof(g_ser_path),
+                                 blk_path[0] ? NULL : blk_path,
+                                 sizeof(blk_path))) {
+#ifdef HAS_USB_VENDOR
+            /* No CDC serial found - a switch-mode device (PM3) already in WebUSB
+               mode exposes only the vendor interface; connect to it directly. */
+            if (!connect_webusb_direct())
+#endif
+            {
+#ifdef HAS_BLE
+            if (ble_transport_open() == 0) {
+                use_ble = true;
+                ser_connected = true;
+            } else {
+                fprintf(stderr, "no Fantasi device found (USB or BLE)\n");
+                return 1;
+            }
+#else
+            fprintf(stderr, "no Fantasi device found\n");
+            return 1;
+#endif
+            }
+        }
+    }
+
+#ifdef HAS_BLE
+    if (!use_ble)
+#endif
+      if (!use_usb) {   /* skip if case B already connected over the vendor pipe */
+#ifdef HAS_USB_VENDOR
+        /* A switch-mode device (PM3) already in WebUSB mode has no CDC port
+           (e.g. a previous fantasi invocation upgraded it and didn't switch
+           back). If the serial port is absent, talk to the vendor pipe directly
+           rather than failing to open it. */
+        if (access(g_ser_path, F_OK) != 0 && connect_webusb_direct()) {
+            printf("storage: on-demand (FAT auto-mount)\n");
+        } else
+#endif
+        {
+        printf("serial: %s\n", g_ser_path);
+        if (!ser_open(g_ser_path)) return 1;
+
+        if (blk_path[0]) {
+            snprintf(g_blk, sizeof(g_blk), "%s", blk_path);
+            if (udisks_mountpoint(g_blk, g_mnt, sizeof(g_mnt))) {
+                msc_active = true;
+                printf("storage: %s at %s\n", g_blk, g_mnt);
+            } else {
+                fprintf(stderr, "storage: cannot mount %s\n", g_blk);
+                g_mnt[0] = '\0';
+            }
+        } else {
+            printf("storage: on-demand (FAT auto-mount)\n");
+        }
+
+        usleep(500000);
+        ser_write("\r\n", 2);
+        ser_drain();
+        ser_connected = true;
+
+#ifdef HAS_USB_VENDOR
+        /* Auto-upgrade switch-mode devices (PM3) to the WebUSB protobuf pipe so
+         * file/CLI traffic uses a dedicated channel with no MSC attach/detach
+         * churn. --usb forces it for any device. */
+        try_webusb_upgrade(force_usb);
+#endif
+        }
+      }
+
+    signal(SIGINT, sigint_handler);
+    rl_bind_key('\t', rl_insert);
+    /* The idle-reconnect hook is only useful for an interactive session. With
+     * piped (non-TTY) input a non-NULL rl_event_hook keeps readline's read loop
+     * alive at EOF instead of returning NULL, so a script that doesn't end in
+     * `exit` (e.g. one ending in a streaming `launch`, which swallows trailing
+     * lines as app input) would hang. Only install it on a real terminal. */
+    if (isatty(STDIN_FILENO))
+        rl_event_hook = rl_poll_serial;
+
+    #define PROMPT_LIVE    "fantasi> "
+    #define PROMPT_DEAD    "\001" C_RED "\002" "fantasi" "\001" C_RESET "\002" "> "
+
+    while (running) {
+        const char *prompt = ser_connected ? PROMPT_LIVE : PROMPT_DEAD;
+        char *rl = readline(prompt);
+        if (!rl) break;
+        if (!rl[0]) { free(rl); continue; }
+        add_history(rl);
+
+        char line[256];
+        strncpy(line, rl, sizeof(line) - 1);
+        line[sizeof(line) - 1] = '\0';
+        free(rl);
+
+        if (cli_local_match(line)) {
+            if (!handle_local(line))
+                break;
+        } else {
+#ifdef HAS_BLE
+            if (use_ble || use_usb) {
+                /* Only a launch turns stdin into app I/O (so a piped ^C reaches
+                 * the app). Other streaming commands (ps, log, …) must NOT eat
+                 * stdin - that's the next scripted command. */
+                bool is_launch = strncmp(line, "launch", 6) == 0 &&
+                                 (line[6] == '\0' || line[6] == ' ');
+                ble_send_cmd(line);
+                ble_read_response(is_launch);
+                /* A command like `reboot` drops the link; reflect it now so
+                 * the prompt goes red and the idle hook starts reconnecting.
+                 * Covers both transports - over USB the failed transfer has
+                 * already marked usb_transport_connected() false. */
+                if ((use_ble && !ble_transport_connected()) ||
+                    (use_usb && !usb_transport_connected()))
+                    ser_connected = false;
+            } else
+#endif
+            {
+                /* Switch-mode devices (PM3) share USB endpoints between MSC and
+                 * CDC: fat_mount() closed the serial port (ser_fd < 0) while
+                 * mounted, so a serial command must leave MSC first. Composite
+                 * devices (FZ/CU) keep CDC live alongside MSC (ser_fd stays
+                 * open) and handle concurrent access, so don't unmount - that
+                 * churned the OS mount on every serial/storage switch. */
+                if (ser_fd < 0 && msc_active)
+                    fat_unmount();
+                if (ser_fd >= 0) {
+                    ser_send_cmd(line);
+                    ser_read_response();
+                } else if (!ser_connected) {
+                    fprintf(stderr, "device disconnected\n");
+                }
+            }
+        }
+    }
+
+    if (msc_active) fat_unmount();
+    ser_close();
+#ifdef HAS_BLE
+    if (use_ble) ble_transport_close();
+#endif
+#ifdef HAS_USB_VENDOR
+    if (use_usb) usb_transport_close();
+#endif
+    printf("\n");
+    return 0;
+}

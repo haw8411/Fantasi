@@ -1,0 +1,28 @@
+/* Host-side transport for the device's USB vendor (WebUSB) interface, over
+ * libusb. Carries the same framed protobuf as the BLE transport, so the file/CLI
+ * commands work over it unchanged - used for the Proxmark3 (switch-mode) so file
+ * data flows over a dedicated pipe instead of churning the MSC mount. */
+#ifndef FANTASI_USB_TRANSPORT_H
+#define FANTASI_USB_TRANSPORT_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <sys/types.h>
+
+/* Find the Fantasi device, claim its vendor (class 0xFF) interface, and resolve
+ * its bulk endpoints. Returns 0 on success, -1 if not found / not in vendor mode. */
+int  usb_transport_open(void);
+void usb_transport_close(void);
+bool usb_transport_connected(void);
+
+/* Active liveness probe (a GET_STATUS on EP0). Returns false and marks the
+ * transport disconnected once the device is unplugged. Use to detect an idle
+ * disconnect, where there's no bulk traffic to surface the removal. */
+bool usb_transport_alive(void);
+
+/* Bulk transfers. read returns 0 on timeout (not an error); both return -1 on a
+ * hard error (e.g. device unplugged). */
+ssize_t usb_transport_read(void *buf, size_t len);
+ssize_t usb_transport_write(const void *buf, size_t len);
+
+#endif

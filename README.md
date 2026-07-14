@@ -146,7 +146,7 @@ fantasi> help
   rm          delete a file
   rmdir       remove empty directory
   scan        scan for BLE devices
-  settings    show saved settings
+  settings    manage saved settings
   shutdown    power the device off
   unpair      remove BLE bond(s)
   upload      copy host file to device

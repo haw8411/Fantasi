@@ -29,6 +29,7 @@ message FileWriteChunk {
   required uint32 offset = 2;
   required bytes data = 3 [(nanopb).max_size = 512];
   required bool last = 4;
+  optional uint32 total = 5;   // full file size hint; lets ramfs reserve once
 }
 
 message FileReadRequest {

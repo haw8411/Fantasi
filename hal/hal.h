@@ -139,6 +139,34 @@ int hal_enter_msc_mode(void);
 int hal_enter_webusb_mode(void);
 int hal_enter_cdc_mode(void);
 
+/* ---- USB HID keyboard emulation (app-driven; weak-default to unsupported
+ * in core/app_run.c, real implementation per platform) ---- */
+/* Arm the keyboard for use (on=1) or release held keys (on=0). On the composite
+ * targets the keyboard is a persistent interface, so this is just a readiness
+ * wait; the endpoint-scarce PM3 re-enumerates as a HID-only device here (and
+ * back to CDC on on=0). Returns 0, or -1 if HID isn't supported / no host. */
+int      hal_hid_enable(int on);
+/* Send one keyboard report: `modifiers` held with up to `n` (<=6) key usages.
+ * n=0 releases all keys. Waits for the endpoint to drain. Returns 0, or -1. */
+int      hal_hid_send(uint8_t modifiers, const uint8_t *keys, uint8_t n);
+/* Host hint bits (keyboard-LED output report + mount state); 0 when unknown. */
+uint32_t hal_hid_host(void);
+
+/* Select the composite HID mode (true = persistent, false = switch). Applied to
+ * the descriptor before enumeration (read from the `hid` setting at boot) and on
+ * a live change from the settings menu. No-op where HID isn't supported. */
+void     hal_hid_set_persistent(bool persistent);
+
+/* Enable/disable the USB mass-storage interface (true = present, the default).
+ * Applied to the descriptor before enumeration (read from the `msc` setting at
+ * boot) and on a live change. No-op where MSC isn't supported. */
+void     hal_msc_set_enabled(bool enabled);
+
+/* Request the USB device task to re-enumerate (tud_disconnect + reconnect) so a
+ * descriptor change - switch-mode arming, or a mode change - takes effect.
+ * Implemented in the shared TinyUSB serial task (FZ/CU). */
+void     hal_usb_reenumerate(void);
+
 /* BLE scan callback - called for each discovered device.
  * addr is 6 bytes, name may be empty (""). */
 typedef void (*hal_ble_scan_cb_t)(const uint8_t *addr, uint8_t addr_type,
@@ -194,8 +222,13 @@ int hal_settings_get(const char *key, char *buf, int len);
 /* Write a key=value pair to settings.cfg. Returns 0 on success. */
 int hal_settings_set(const char *key, const char *value);
 
-/* Read the entire settings.cfg into buf. Returns bytes read or -1. */
-int hal_settings_dump(char *buf, int len);
+/* Remove a key from settings.cfg (no-op if absent). Returns 0 on success. */
+int hal_settings_unset(const char *key);
+
+/* Iterate settings line by line (streamed - no whole-file buffer), calling
+ * cb(line, ctx) for each non-empty "key=value" line. Returns 0, or -1 if
+ * storage is unavailable. */
+int hal_settings_foreach(void (*cb)(const char *line, void *ctx), void *ctx);
 
 /* True if the BLE stack is initialised and active. */
 bool hal_ble_is_active(void);

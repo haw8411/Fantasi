@@ -98,7 +98,9 @@ def main():
 
     # Channel A (CDC serial): launch spin and let it stream.
     print("  [launch spin over CDC, kill from WebUSB]")
-    a = subprocess.Popen([CLI_BIN, cdc], stdin=subprocess.PIPE,
+    # --serial pins this channel to CDC so it doesn't claim the WebUSB vendor
+    # interface (the default transport now) - channel B (webusb_send) needs it.
+    a = subprocess.Popen([CLI_BIN, "--serial", cdc], stdin=subprocess.PIPE,
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                          text=True, bufsize=1)
     ended = True

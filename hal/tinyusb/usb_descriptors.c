@@ -31,17 +31,12 @@ tusb_desc_device_t const desc_device = {
 
 uint8_t const *tud_descriptor_device_cb(void) { return (uint8_t const *)&desc_device; }
 
-enum {
-    ITF_NUM_CDC = 0,
-    ITF_NUM_CDC_DATA,
-#if CFG_TUD_MSC
-    ITF_NUM_MSC,
-#endif
-#if CFG_TUD_VENDOR
-    ITF_NUM_VENDOR,
-#endif
-    ITF_NUM_TOTAL
-};
+/* Interface order is fixed as CDC(0,1), vendor(2), then the optional MSC and
+ * HID. Keeping vendor before the optionals pins it at interface 2 regardless of
+ * whether MSC/HID are enumerated, so the MS OS 2.0 / WinUSB binding (which names
+ * the vendor interface number below) never has to change. */
+#define ITF_NUM_CDC       0
+#define ITF_NUM_VENDOR    2
 
 #define EPNUM_CDC_NOTIF   0x81
 #define EPNUM_CDC_OUT     0x02
@@ -50,31 +45,109 @@ enum {
 #define EPNUM_MSC_IN      0x83
 #define EPNUM_VENDOR_OUT  0x04
 #define EPNUM_VENDOR_IN   0x84
+#define EPNUM_HID_IN      0x85
 
 /* String descriptor indices (kept stable regardless of which classes are on). */
 #define STRID_CDC     4
 #define STRID_MSC     5
 #define STRID_VENDOR  6
+#define STRID_HID     7
 
-#define CONFIG_TOTAL_LEN  (TUD_CONFIG_DESC_LEN + TUD_CDC_DESC_LEN \
-                           + (CFG_TUD_MSC    ? TUD_MSC_DESC_LEN    : 0) \
-                           + (CFG_TUD_VENDOR ? TUD_VENDOR_DESC_LEN : 0))
-
-uint8_t const desc_fs_configuration[] = {
-    TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, 0, CONFIG_TOTAL_LEN, 0x00, 100),
-    TUD_CDC_DESCRIPTOR(ITF_NUM_CDC, STRID_CDC, EPNUM_CDC_NOTIF, 8, EPNUM_CDC_OUT, EPNUM_CDC_IN, 64),
-#if CFG_TUD_MSC
-    TUD_MSC_DESCRIPTOR(ITF_NUM_MSC, STRID_MSC, EPNUM_MSC_OUT, EPNUM_MSC_IN, 64),
-#endif
-#if CFG_TUD_VENDOR
-    TUD_VENDOR_DESCRIPTOR(ITF_NUM_VENDOR, STRID_VENDOR, EPNUM_VENDOR_OUT, EPNUM_VENDOR_IN, 64),
-#endif
+/* ---- HID keyboard report descriptor (boot-protocol keyboard) ---- */
+uint8_t const desc_hid_report[] = {
+    TUD_HID_REPORT_DESC_KEYBOARD()
 };
+
+uint8_t const *tud_hid_descriptor_report_cb(uint8_t instance)
+{
+    (void)instance;
+    return desc_hid_report;
+}
+
+/* Runtime interface toggles, shared with the platform HAL via the accessors.
+ *   MSC     - the mass-storage drive; `msc` setting, default on.
+ *   HID     - the keyboard; persistent (always present) or switch (only while an
+ *             app armed it, at the cost of a re-enumeration). `hid` setting.
+ * Changing any of these re-enumerates so the host re-reads the interface set.
+ * volatile: written from an app/gui task, read from the USB task/enumeration. */
+static volatile bool    s_msc_enabled = true;
+static volatile bool    s_hid_persistent = true;
+static volatile bool    s_hid_active;
+static volatile uint8_t s_hid_host_leds;
+
+void    usb_desc_set_msc_enabled(bool on)    { s_msc_enabled = on; }
+bool    usb_desc_msc_enabled(void)           { return s_msc_enabled; }
+void    usb_desc_set_hid_persistent(bool on) { s_hid_persistent = on; }
+bool    usb_desc_hid_persistent(void)        { return s_hid_persistent; }
+void    usb_desc_set_hid_active(bool on)     { s_hid_active = on; }
+bool    usb_desc_hid_active(void)            { return s_hid_active; }
+uint8_t usb_desc_hid_host_leds(void)         { return s_hid_host_leds; }
+
+/* Largest the configuration can get (every optional interface present). */
+#define CONFIG_MAX_LEN  (TUD_CONFIG_DESC_LEN + TUD_CDC_DESC_LEN \
+                         + TUD_VENDOR_DESC_LEN + TUD_MSC_DESC_LEN + TUD_HID_DESC_LEN)
+
+/* The configuration descriptor is assembled per enumeration from whichever
+ * interfaces are currently enabled, with sequential interface numbers. The
+ * inputs (the flags above) don't change during a single enumeration, so the
+ * bytes are stable across the host's repeated GET_DESCRIPTOR calls. */
+static uint8_t s_cfg_desc[CONFIG_MAX_LEN];
 
 uint8_t const *tud_descriptor_configuration_cb(uint8_t index)
 {
     (void)index;
-    return desc_fs_configuration;
+    bool msc = false, hid = false;
+#if CFG_TUD_MSC
+    msc = s_msc_enabled;
+#endif
+#if CFG_TUD_HID
+    hid = s_hid_persistent || s_hid_active;
+#endif
+
+    uint8_t *p = s_cfg_desc + TUD_CONFIG_DESC_LEN;   /* header written last */
+    uint8_t itf = 0;
+
+    { uint8_t d[] = { TUD_CDC_DESCRIPTOR(ITF_NUM_CDC, STRID_CDC, EPNUM_CDC_NOTIF, 8,
+                                         EPNUM_CDC_OUT, EPNUM_CDC_IN, 64) };
+      memcpy(p, d, sizeof d); p += sizeof d; itf += 2; }
+#if CFG_TUD_VENDOR
+    { uint8_t d[] = { TUD_VENDOR_DESCRIPTOR(ITF_NUM_VENDOR, STRID_VENDOR,
+                                            EPNUM_VENDOR_OUT, EPNUM_VENDOR_IN, 64) };
+      memcpy(p, d, sizeof d); p += sizeof d; itf += 1; }
+#endif
+#if CFG_TUD_MSC
+    if (msc) { uint8_t d[] = { TUD_MSC_DESCRIPTOR(itf, STRID_MSC, EPNUM_MSC_OUT, EPNUM_MSC_IN, 64) };
+      memcpy(p, d, sizeof d); p += sizeof d; itf += 1; }
+#endif
+#if CFG_TUD_HID
+    if (hid) { uint8_t d[] = { TUD_HID_DESCRIPTOR(itf, STRID_HID, HID_ITF_PROTOCOL_KEYBOARD,
+                                                  sizeof(desc_hid_report), EPNUM_HID_IN,
+                                                  CFG_TUD_HID_EP_BUFSIZE, 5) };
+      memcpy(p, d, sizeof d); p += sizeof d; itf += 1; }
+#endif
+
+    uint16_t total = (uint16_t)(p - s_cfg_desc);
+    uint8_t hdr[] = { TUD_CONFIG_DESCRIPTOR(1, itf, 0, total, 0x00, 100) };
+    memcpy(s_cfg_desc, hdr, sizeof hdr);
+    return s_cfg_desc;
+}
+
+/* ---- HID class callbacks ---- */
+uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id,
+                               hid_report_type_t report_type, uint8_t *buffer, uint16_t reqlen)
+{
+    (void)instance; (void)report_id; (void)report_type; (void)buffer; (void)reqlen;
+    return 0;   /* no input reports fetched over the control pipe */
+}
+
+void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
+                           hid_report_type_t report_type, uint8_t const *buffer, uint16_t bufsize)
+{
+    (void)instance; (void)report_id;
+    /* Host's keyboard-LED output report - the cheap host-present / caps-lock
+     * signal BadUSB surfaces through api->hid_host(). */
+    if (report_type == HID_REPORT_TYPE_OUTPUT && bufsize >= 1)
+        s_hid_host_leds = buffer[0];
 }
 
 /* ---- WebUSB BOS descriptor + MS OS 2.0 (Windows WinUSB auto-bind) ---- */
@@ -155,6 +228,7 @@ static char const *string_desc_arr[] = {
     "Fantasi CLI CDC",               /* 4: CDC interface   */
     "Fantasi Storage",               /* 5: MSC interface   */
     "Fantasi Data",                  /* 6: Vendor (protobuf) interface */
+    "Fantasi Keyboard",              /* 7: HID keyboard interface */
 };
 
 static uint16_t _desc_str[32];

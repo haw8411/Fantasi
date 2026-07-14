@@ -88,10 +88,13 @@ int main(void)
 #endif
 
 #ifdef FANTASI_ENABLE_WEBUSB
-    /* USB vendor/WebUSB protobuf transport. Stack must cover the LittleFS write
-     * path (deep). Default x4 like the BLE proto task; targets with a small heap
-     * (PM3, 32 KB) override WEBUSB_PROTO_STACK - 8 KB there matches cli_task,
-     * which already runs the same lfs/app path. */
+    /* WebUSB protobuf transport. This and the BLE proto task below both default
+     * to x4 (16 KB), sized for the Chameleon: there the LittleFS write path nests
+     * SoftDevice flash SVCs (plus BLE event pumping, for blecli) and x2 tripped
+     * the stack-overflow hook during uploads. Platforms without a SoftDevice run
+     * that path shallow and sequential (the Flipper measured usbproto at 1312 B
+     * and blecli at 1368 B under full transfers), so their Makefiles override these
+     * stacks down e.g. with -DWEBUSB_PROTO_STACK=1024 and -DBLE_PROTO_STACK=1024. */
 #ifndef WEBUSB_PROTO_STACK
 #define WEBUSB_PROTO_STACK (CLI_TASK_STACK * 4)
 #endif
@@ -105,10 +108,11 @@ int main(void)
     ble_cli_ctx.transport.connected = ble_serial_connected;
     ble_cli_ctx.transport.poll      = ble_serial_poll;
     ble_cli_ctx.transport.ctx       = NULL;
-    /* x4 (16 KB): the proto task runs the LittleFS write path (deep) plus
-     * SoftDevice flash SVCs and BLE event pumping nested inside it; x2
-     * overflowed and tripped the stack-overflow hook during uploads. */
-    xTaskCreate(ble_proto_task, "blecli", CLI_TASK_STACK * 4,
+    /* Defaults to x4; see WEBUSB_PROTO_STACK above for the shared sizing rationale. */
+#ifndef BLE_PROTO_STACK
+#define BLE_PROTO_STACK (CLI_TASK_STACK * 4)
+#endif
+    xTaskCreate(ble_proto_task, "blecli", BLE_PROTO_STACK,
                 &ble_cli_ctx, tskIDLE_PRIORITY + 1, NULL);
 #endif
 
@@ -135,3 +139,4 @@ void vApplicationMallocFailedHook(void) { }
 
 /* A stack overflow, unlike OOM, is unrecoverable memory corruption - reset. */
 void vApplicationStackOverflowHook(TaskHandle_t t, char *n) { (void)t; (void)n; fantasi_reset(); }
+

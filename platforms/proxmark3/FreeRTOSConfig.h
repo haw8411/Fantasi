@@ -18,7 +18,17 @@
  * matches the upstream AT91SAM7S demo and leaves headroom for nested
  * tick-during-SWI. */
 #define configMINIMAL_STACK_SIZE        ((unsigned short)256)
-#define configTOTAL_HEAP_SIZE           ((size_t)(40 * 1024))
+/* Elastic app heap. ucHeap (heap_4.c) is aliased onto the linker ._user_heap
+ * region, and this size is its runtime span - end of .bss to the stack - so the
+ * FreeRTOS heap uses every free byte of the 64 KB SRAM with nothing stranded.
+ * newlib malloc - including float  * printf's dtoa - is wrapped onto this same
+ * heap (core/newlib_malloc.c + the --wrap flags in the Makefile), so there is
+ * no separate newlib _sbrk arena. */
+#ifndef __ASSEMBLER__
+extern unsigned char __heap_start__, __heap_end__;   /* linker heap region bounds */
+#endif
+#define configAPPLICATION_ALLOCATED_HEAP  1
+#define configTOTAL_HEAP_SIZE           ((size_t)(&__heap_end__ - &__heap_start__))
 #define configMAX_TASK_NAME_LEN         12
 #define configUSE_TRACE_FACILITY        1
 #define configUSE_16_BIT_TICKS          0
@@ -33,7 +43,11 @@
 #define configUSE_NEWLIB_REENTRANT      0
 #define configSUPPORT_STATIC_ALLOCATION 0
 
-#define configUSE_TIMERS                1
+/* Software timers off: nothing on the PM3 creates one (only the Flipper's BLE
+ * adv_timer uses xTimer*), so leaving them on would spawn the timer daemon task
+ * to service nothing - ~2 KB of heap wasted out of the 64 KB SRAM. Set back to 1 if
+ * a future PM3 feature needs a timer or xTimerPendFunctionCall. */
+#define configUSE_TIMERS                0
 #define configTIMER_TASK_PRIORITY       3
 #define configTIMER_QUEUE_LENGTH        10
 #define configTIMER_TASK_STACK_DEPTH    (configMINIMAL_STACK_SIZE * 2)
@@ -45,7 +59,7 @@
 #define INCLUDE_vTaskDelayUntil         1
 #define INCLUDE_vTaskDelay              1
 #define INCLUDE_xTaskGetSchedulerState  1
-#define INCLUDE_xTimerPendFunctionCall  1
+#define INCLUDE_xTimerPendFunctionCall  0   /* needs the timer daemon; unused on PM3 (configUSE_TIMERS 0) */
 
 /* ARM7 port: tick comes from PIT via AIC. Nothing here about Cortex-M
  * priority bits - AT91's AIC has 8 priority levels, handled by the

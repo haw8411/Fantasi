@@ -23,7 +23,10 @@
 #define CFG_TUD_ENDPOINT0_SIZE  8
 
 #define CFG_TUD_CDC             1
-#define CFG_TUD_HID             0
+/* HID keyboard (BadUSB). Switch-mode only: the SAM7S's 4 endpoints can't host it
+ * alongside CDC, so it re-enumerates as a HID-only device (pm3_usb_mode 3). */
+#define CFG_TUD_HID             1
+#define CFG_TUD_HID_EP_BUFSIZE  16
 #define CFG_TUD_MIDI            0
 
 /* Vendor interface (WebUSB protobuf), reached via switch-mode (see hal.c). Small

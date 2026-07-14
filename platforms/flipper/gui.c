@@ -49,19 +49,20 @@
 
 static QueueHandle_t btn_q;
 
-typedef enum { ST_SPLASH, ST_MAIN, ST_APPS, ST_SETTINGS } gui_state_t;
+typedef enum { ST_SPLASH, ST_MAIN, ST_APPS, ST_SHORTCUTS, ST_SETTINGS } gui_state_t;
 static gui_state_t state;
 
 /* One shared item table; rebuilt on every menu entry. item_value is drawn
  * right-aligned in the row when non-empty (settings state: [on]/[off]). */
 static char item_label[GUI_MAX_ITEMS][GUI_LABEL_MAX];
-static char item_value[GUI_MAX_ITEMS][8];
+static char item_value[GUI_MAX_ITEMS][12];
 static char item_path[GUI_MAX_ITEMS][GUI_PATH_MAX];   /* apps menu only */
 static int  item_count;
 
 /* Per-menu cursor, so Apps keeps its selection across launches and re-entry. */
 static int sel_main, top_main;
 static int sel_apps, top_apps;
+static int sel_sc,   top_sc;
 static int sel_set,  top_set;
 
 /* ---- ISR side ---- */
@@ -179,8 +180,33 @@ static void main_scan(void)
 {
     memset(item_value, 0, sizeof(item_value));
     strcpy(item_label[0], "Apps");
-    strcpy(item_label[1], "Settings");
-    item_count = 2;
+    strcpy(item_label[1], "Shortcuts");
+    strcpy(item_label[2], "Settings");
+    item_count = 3;
+}
+
+/* Shortcut slots 0-7: each is an app path saved in settings.cfg as "scN=<path>"
+ * (also settable with the `shortcut` CLI command / used by the LED+button
+ * launcher on the screenless targets). Lists all eight slots; OK runs the
+ * assigned app, empty slots do nothing. */
+static void shortcuts_scan(void)
+{
+    memset(item_value, 0, sizeof(item_value));
+    for (int i = 0; i < 8; i++) {
+        char key[4] = { 's', 'c', (char)('0' + i), 0 };
+        char path[GUI_PATH_MAX];
+        int r = hal_settings_get(key, path, sizeof(path));
+        if (r > 0) {
+            snprintf(item_path[i], sizeof(item_path[0]), "%s", path);
+            const char *base = strrchr(path, '/');
+            base = base ? base + 1 : path;
+            snprintf(item_label[i], sizeof(item_label[0]), "%d %s", i, base);
+        } else {
+            item_path[i][0] = '\0';
+            snprintf(item_label[i], sizeof(item_label[0]), "%d -", i);
+        }
+    }
+    item_count = 8;
 }
 
 static void apps_add(const char *name, uint32_t size, bool is_dir, void *vctx)
@@ -211,41 +237,50 @@ static char set_key[SET_MAX][SET_KEY_MAX];
 static bool set_on[SET_MAX];
 static int  set_count;
 
+/* Fold one "key=value" line into the toggle list (hal_settings_foreach cb). */
+static void settings_scan_line(const char *line, void *ctx)
+{
+    (void)ctx;
+    const char *eq = strchr(line, '=');
+    if (!eq || eq == line) return;
+    int klen = (int)(eq - line);
+    if (klen >= SET_KEY_MAX) return;              /* key too long to track */
+    char key[SET_KEY_MAX];
+    memcpy(key, line, klen);
+    key[klen] = '\0';
+    const char *val = eq + 1;
+    /* "hid" carries a string value (persistent/switch); everything else is 0/1. */
+    bool on = (strcmp(key, "hid") == 0) ? (strcmp(val, "switch") == 0) : (val[0] == '1');
+    for (int i = 0; i < set_count; i++)
+        if (strcmp(set_key[i], key) == 0) { set_on[i] = on; return; }
+    if (set_count < SET_MAX) {
+        strcpy(set_key[set_count], key);
+        set_on[set_count] = on;
+        set_count++;
+    }
+}
+
 static void settings_scan(void)
 {
     /* Defaults first (must mirror what the firmware assumes when the key is
-     * absent - hal_post_init treats missing "ble" as on). */
+     * absent - hal_post_init treats missing "ble" as on; HID defaults to the
+     * persistent keyboard). For "hid", set_on == "switch mode". */
     strcpy(set_key[0], "ble");
     set_on[0] = true;
-    set_count = 1;
+    strcpy(set_key[1], "hid");
+    set_on[1] = false;   /* persistent */
+    strcpy(set_key[2], "msc");
+    set_on[2] = true;    /* drive present */
+    set_count = 3;
 
-    char buf[256];
-    int n = hal_settings_dump(buf, sizeof(buf));
-    if (n > 0) {
-        char *p = buf;
-        while (*p) {
-            char *line = p;
-            while (*p && *p != '\n') p++;
-            if (*p == '\n') *p++ = '\0';
-            char *eq = strchr(line, '=');
-            if (!eq || eq == line) continue;
-            *eq = '\0';
-            bool on = (eq[1] == '1');
-            int i;
-            for (i = 0; i < set_count; i++)
-                if (strcmp(set_key[i], line) == 0) { set_on[i] = on; break; }
-            if (i == set_count && set_count < SET_MAX &&
-                strlen(line) < SET_KEY_MAX) {
-                strcpy(set_key[set_count], line);
-                set_on[set_count] = on;
-                set_count++;
-            }
-        }
-    }
+    hal_settings_foreach(settings_scan_line, NULL);
 
     for (int i = 0; i < set_count; i++) {
         snprintf(item_label[i], sizeof(item_label[0]), "%s", set_key[i]);
-        strcpy(item_value[i], set_on[i] ? "[on]" : "[off]");
+        if (strcmp(set_key[i], "hid") == 0)
+            strcpy(item_value[i], set_on[i] ? "[switch]" : "[persist]");
+        else
+            strcpy(item_value[i], set_on[i] ? "[on]" : "[off]");
     }
     item_count = set_count;
 }
@@ -264,6 +299,17 @@ static void settings_toggle(int idx)
         char a0[] = "ble", on_s[] = "on", off_s[] = "off";
         char *argv[] = { a0, on ? on_s : off_s };
         if (cmd) cmd->fn(2, argv);
+    } else if (strcmp(set_key[idx], "hid") == 0) {
+        /* on == switch mode. Persist the string value and apply live - the mode
+         * change re-enumerates so the host re-reads the interface set. */
+        hal_settings_set("hid", on ? "switch" : "persistent");
+        hal_hid_set_persistent(!on);
+        hal_usb_reenumerate();
+    } else if (strcmp(set_key[idx], "msc") == 0) {
+        /* on == drive present. Persist and apply live (re-enumerate). */
+        hal_settings_set("msc", on ? "1" : "0");
+        hal_msc_set_enabled(on);
+        hal_usb_reenumerate();
     } else {
         hal_settings_set(set_key[idx], on ? "1" : "0");
     }
@@ -276,10 +322,11 @@ static void settings_toggle(int idx)
 static void draw_state(void)
 {
     switch (state) {
-    case ST_MAIN:     draw_menu("Main Menu", sel_main, top_main); break;
-    case ST_APPS:     draw_menu("Apps",      sel_apps, top_apps); break;
-    case ST_SETTINGS: draw_menu("Settings",  sel_set,  top_set);  break;
-    case ST_SPLASH:   break;   /* hal.c's display_refresh owns this screen */
+    case ST_MAIN:      draw_menu("Main Menu", sel_main, top_main); break;
+    case ST_APPS:      draw_menu("Apps",      sel_apps, top_apps); break;
+    case ST_SHORTCUTS: draw_menu("Shortcuts", sel_sc,   top_sc);   break;
+    case ST_SETTINGS:  draw_menu("Settings",  sel_set,  top_set);  break;
+    case ST_SPLASH:    break;   /* hal.c's display_refresh owns this screen */
     }
 }
 
@@ -301,6 +348,22 @@ static void launch_selected(void)
     xQueueReset(btn_q);   /* drop presses queued during the app's teardown */
     apps_scan();          /* the app may have changed /ramfs or /apps */
     clamp(&sel_apps, &top_apps);
+}
+
+static void launch_shortcut(void)
+{
+    if (item_count == 0 || !item_path[sel_sc][0]) return;   /* empty slot */
+
+    display_lock();
+    display_clear();
+    display_flush();
+    display_unlock();
+
+    app_run(item_path[sel_sc]);
+
+    xQueueReset(btn_q);
+    shortcuts_scan();
+    clamp(&sel_sc, &top_sc);
 }
 
 static void gui_task(void *arg)
@@ -353,6 +416,10 @@ static void gui_task(void *arg)
                     state = ST_APPS;
                     apps_scan();
                     clamp(&sel_apps, &top_apps);
+                } else if (sel_main == 1) {
+                    state = ST_SHORTCUTS;
+                    shortcuts_scan();
+                    clamp(&sel_sc, &top_sc);
                 } else {
                     state = ST_SETTINGS;
                     settings_scan();
@@ -369,6 +436,17 @@ static void gui_task(void *arg)
                 clamp(&sel_main, &top_main);
             } else if (b == FANTASI_BTN_OK) {
                 launch_selected();
+            }
+            break;
+
+        case ST_SHORTCUTS:
+            nav(b, &sel_sc, &top_sc);
+            if (b == FANTASI_BTN_BACK) {
+                state = ST_MAIN;
+                main_scan();
+                clamp(&sel_main, &top_main);
+            } else if (b == FANTASI_BTN_OK) {
+                launch_shortcut();
             }
             break;
 

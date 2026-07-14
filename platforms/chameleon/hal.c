@@ -15,6 +15,12 @@
 #include "hal_storage.h"
 #include "tusb.h"
 #include "FreeRTOS.h"
+#include "task.h"
+#include "app_api.h"   /* FANTASI_HID_* bits for hal_hid_host */
+#ifdef FANTASI_ENABLE_APPS
+#include "cli.h"
+#include "app_run.h"   /* shortcut_run for the A-button launcher */
+#endif
 
 /* Declared in TinyUSB's portable/nordic/nrf5x/dcd_nrf5x.c. Forward-
  * declared here so this file doesn't need to reach into TinyUSB's
@@ -42,6 +48,10 @@ static void gpio_output_high(NRF_GPIO_Type *port, uint32_t pin)
                        | (GPIO_PIN_CNF_INPUT_Disconnect << GPIO_PIN_CNF_INPUT_Pos);
     port->OUTSET = (1UL << pin);
 }
+
+#ifdef FANTASI_ENABLE_APPS
+void cu_launcher_init(void);   /* A-button shortcut launcher, defined below */
+#endif
 
 void hal_init(void)
 {
@@ -79,7 +89,24 @@ void hal_init(void)
 
     hal_storage_init();
 
+    /* Apply the USB interface toggles before USB comes up so the device
+     * enumerates correctly the first time. Defaults (missing keys): HID
+     * persistent, MSC on. */
+    {
+        char hv[12] = "persistent";
+        hal_settings_get("hid", hv, sizeof(hv));
+        hal_hid_set_persistent(hv[0] != 's');   /* "switch" -> non-persistent */
+
+        char mv[4] = "1";
+        hal_settings_get("msc", mv, sizeof(mv));
+        hal_msc_set_enabled(mv[0] != '0');
+    }
+
     tusb_init();
+
+#ifdef FANTASI_ENABLE_APPS
+    cu_launcher_init();   /* A-button shortcut launcher (owns the position LEDs) */
+#endif
 }
 
 void USBD_IRQHandler(void) { tud_int_handler(0); }
@@ -230,6 +257,168 @@ int hal_enter_msc_mode(void) { return -1; }
 int hal_enter_webusb_mode(void) { return -1; }
 int hal_enter_cdc_mode(void) { return -1; }
 
+/* ---- USB HID keyboard emulation ----
+ * Persistent by default (keyboard always enumerated with CDC/MSC/vendor),
+ * switch mode re-enumerates. All TinyUSB-generic. State lives in
+ * usb_descriptors.c. */
+void    usb_desc_set_hid_persistent(bool on);
+bool    usb_desc_hid_persistent(void);
+void    usb_desc_set_hid_active(bool on);
+bool    usb_desc_hid_active(void);
+uint8_t usb_desc_hid_host_leds(void);
+void    usb_desc_set_msc_enabled(bool on);
+
+static void hid_release_keys(void)
+{
+    uint8_t empty[6] = { 0 };
+    if (tud_hid_ready()) tud_hid_keyboard_report(0, 0, empty);
+}
+
+int hal_hid_enable(int on)
+{
+    if (usb_desc_hid_persistent()) {
+        if (!on) { hid_release_keys(); return 0; }
+    } else {
+        if ((bool)on != usb_desc_hid_active()) {
+            if (!on) hid_release_keys();
+            usb_desc_set_hid_active(on);
+            hal_usb_reenumerate();
+        }
+        if (!on) return 0;
+    }
+    for (int i = 0; i < 3000; i++) {
+        if (tud_mounted() && tud_hid_ready()) return 0;
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    return tud_mounted() ? 0 : -1;
+}
+
+int hal_hid_send(uint8_t modifiers, const uint8_t *keys, uint8_t n)
+{
+    if (!tud_mounted()) return -1;
+
+    uint8_t report[6] = { 0 };
+    for (uint8_t i = 0; i < n && i < 6; i++) report[i] = keys[i];
+
+    for (int i = 0; i < 200 && !tud_hid_ready(); i++) vTaskDelay(pdMS_TO_TICKS(1));
+    if (!tud_hid_ready()) return -1;
+
+    return tud_hid_keyboard_report(0, modifiers, report) ? 0 : -1;
+}
+
+uint32_t hal_hid_host(void)
+{
+    uint32_t bits = usb_desc_hid_host_leds();
+    if (tud_mounted()) bits |= FANTASI_HID_HOST_MOUNTED;
+    return bits;
+}
+
+void hal_hid_set_persistent(bool persistent)
+{
+    usb_desc_set_hid_persistent(persistent);
+    if (!persistent) usb_desc_set_hid_active(false);
+}
+
+void hal_msc_set_enabled(bool enabled)
+{
+    usb_desc_set_msc_enabled(enabled);
+}
+
+/* ---- A-button shortcut launcher (screenless slot selection) ----
+ * The CU has no screen, so app shortcuts (scN=<path> in settings.cfg, slots 0-7)
+ * are chosen with the A button and shown on the 8 position LEDs:
+ *   - LED_8 stays lit at all times; it also marks slot 0 (slot 0 = LED_8 only).
+ *   - Slots 1..7 additionally light LED_1..LED_7, so a short-press "walk" shows
+ *     which slot you're on. A short press advances the selection (wraps 7->0).
+ *   - Holding A for CU_HOLD_MS launches the app in the selected slot.
+ * Button A = the Ultra's BUTTON_2 (P0.26, active-high with an on-die pull-down);
+ * the shutdown button (P1.02) is Button B. LEDs are all blue (shared rail). */
+#ifdef FANTASI_ENABLE_APPS
+
+#define CU_BUTTON_A_PORT  NRF_P0
+#define CU_BUTTON_A_PIN   26
+#define CU_HOLD_MS        600
+
+/* LED_1..LED_8 slot pins (index 0..7); mirrors the boot setup in hal_init. */
+static const struct { NRF_GPIO_Type *port; uint8_t pin; } cu_slot_led[8] = {
+    { NRF_P0, 20 }, { NRF_P0, 17 }, { NRF_P0, 15 }, { NRF_P0, 13 },
+    { NRF_P0, 12 }, { NRF_P1,  9 }, { NRF_P0,  8 }, { NRF_P0,  6 },
+};
+
+/* Light blue on the slots set in `mask` (bit i -> LED_(i+1)); the rest off. */
+static void cu_leds_show(uint8_t mask)
+{
+    gpio_output_high(NRF_P0, 24);   /* R off */
+    gpio_output_high(NRF_P0, 22);   /* G off */
+    gpio_output_low (NRF_P1,  0);   /* B on  */
+    for (int i = 0; i < 8; i++) {
+        if (mask & (1u << i)) gpio_output_high(cu_slot_led[i].port, cu_slot_led[i].pin);
+        else                  gpio_output_low (cu_slot_led[i].port, cu_slot_led[i].pin);
+    }
+}
+
+static bool cu_button_a_down(void)
+{
+    return (CU_BUTTON_A_PORT->IN & (1UL << CU_BUTTON_A_PIN)) != 0;   /* active-high */
+}
+
+/* Discarding CLI session so app_run() works from this task (like the Flipper's
+ * gui task). No abort channel here - launcher-run apps run to completion (or are
+ * stopped with `kill` over USB/BLE). */
+static cli_ctx_t cu_launcher_ctx;
+static size_t cu_tp_write(const uint8_t *b, size_t n, void *c) { (void)b; (void)c; return n; }
+static size_t cu_tp_read(uint8_t *b, size_t n, void *c) { (void)b; (void)n; (void)c; return 0; }
+static bool   cu_tp_connected(void *c) { (void)c; return true; }
+
+static void cu_launcher_task(void *arg)
+{
+    (void)arg;
+
+    CU_BUTTON_A_PORT->PIN_CNF[CU_BUTTON_A_PIN] =
+        (GPIO_PIN_CNF_DIR_Input     << GPIO_PIN_CNF_DIR_Pos)   |
+        (GPIO_PIN_CNF_INPUT_Connect << GPIO_PIN_CNF_INPUT_Pos) |
+        (GPIO_PIN_CNF_PULL_Pulldown << GPIO_PIN_CNF_PULL_Pos);
+
+    cu_launcher_ctx.transport.write     = cu_tp_write;
+    cu_launcher_ctx.transport.read      = cu_tp_read;
+    cu_launcher_ctx.transport.connected = cu_tp_connected;
+    cli_bind_ctx(&cu_launcher_ctx);
+
+    int sel = 0;
+    bool prev = false, launched = false;
+    TickType_t press_start = 0;
+
+    for (;;) {
+        /* LED_8 is always on and doubles as the position-0 marker; slots 1..7
+         * additionally light LED_1..LED_7. So slot 0 = LED_8 only. */
+        uint8_t mask = 1u << 7;
+        if (sel > 0) mask |= 1u << (sel - 1);
+        cu_leds_show(mask);
+
+        bool now = cu_button_a_down();
+        TickType_t t = xTaskGetTickCount();
+
+        if (now && !prev) { press_start = t; launched = false; }        /* press edge */
+        if (now && !launched && (t - press_start) >= pdMS_TO_TICKS(CU_HOLD_MS)) {
+            launched = true;                 /* fire once per hold */
+            cu_leds_show(0xFF);              /* brief all-on = launching */
+            shortcut_run(sel);               /* blocks until the app exits */
+            cli_bind_ctx(&cu_launcher_ctx);  /* app_run rebinds the ctx; restore ours */
+        }
+        if (!now && prev && !launched) sel = (sel + 1) & 7;             /* short press */
+        prev = now;
+
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+void cu_launcher_init(void)
+{
+    xTaskCreate(cu_launcher_task, "sclaunch", configMINIMAL_STACK_SIZE * 8,
+                NULL, tskIDLE_PRIORITY + 1, NULL);
+}
+#endif /* FANTASI_ENABLE_APPS */
+
 int hal_ble_pair_setup(uint8_t io_cap)
 { return ble_pair_setup_security(io_cap); }
 void hal_ble_pair_begin(void) { ble_pair_set_manual(true); }
@@ -267,10 +456,12 @@ int hal_mem_regions(hal_mem_region_t *out, int max)
 {
     int n = 0;
     if (n < max) {
-        uint32_t unalloc = (uint32_t)&__heap_end__ - (uint32_t)&__heap_start__;
+        /* The FreeRTOS heap spans all app RAM (ucHeap is aliased onto the linker
+         * heap region), so free RAM is the free heap - there is no separate
+         * unallocated newlib arena to add in. */
         out[n].name  = "RAM";
         out[n].total = (uint32_t)&_ram_end - (uint32_t)&_ram_start;
-        out[n].free  = (uint32_t)hal_free_heap_bytes() + unalloc;
+        out[n].free  = (uint32_t)hal_free_heap_bytes();
         out[n].note  = NULL;
         n++;
     }
@@ -279,14 +470,12 @@ int hal_mem_regions(hal_mem_region_t *out, int max)
 
 int hal_test_regions(hal_test_region_t *out, int max)
 {
-    int n = 0;
-    if (n < max) {
-        out[n].name = "RAM";
-        out[n].addr = (uint32_t)&__heap_start__;
-        out[n].size = (uint32_t)&__heap_end__ - (uint32_t)&__heap_start__;
-        n++;
-    }
-    return n;
+    (void)out; (void)max;
+    /* Nothing to memtest: the RAM region (__heap_start__..__heap_end__) is now
+     * the live FreeRTOS heap, and everything below it is either static .bss or
+     * the SoftDevice's reservation - none of it can be safely pattern-tested
+     * while in use. */
+    return 0;
 }
 
 void hal_reboot(void)
@@ -372,4 +561,31 @@ bool hal_shutdown_button_held(void)
         cfg = true;
     }
     return (NRF_P1->IN & (1UL << CU_BUTTON_B_PIN)) != 0;
+}
+
+/* App-facing button read for the Berry `hardware` module (overrides the weak
+ * default in core/app_run.c). The CU has two physical buttons: A -> OK, B ->
+ * BACK. Both are active-high with on-die pull-downs; reading IN is
+ * non-destructive, so this coexists with the launcher (which owns A, but is
+ * blocked in shortcut_run while an app runs) and the power path (which owns B
+ * for wake/System-OFF). Pins are configured input+pull-down idempotently in case
+ * an app reads them before either owner's init has run. */
+uint32_t hal_app_buttons(void)
+{
+    static bool cfg;
+    if (!cfg) {
+        CU_BUTTON_A_PORT->PIN_CNF[CU_BUTTON_A_PIN] =
+            (GPIO_PIN_CNF_DIR_Input     << GPIO_PIN_CNF_DIR_Pos)   |
+            (GPIO_PIN_CNF_INPUT_Connect << GPIO_PIN_CNF_INPUT_Pos) |
+            (GPIO_PIN_CNF_PULL_Pulldown << GPIO_PIN_CNF_PULL_Pos);
+        NRF_P1->PIN_CNF[CU_BUTTON_B_PIN] =
+            (GPIO_PIN_CNF_DIR_Input     << GPIO_PIN_CNF_DIR_Pos)   |
+            (GPIO_PIN_CNF_INPUT_Connect << GPIO_PIN_CNF_INPUT_Pos) |
+            (GPIO_PIN_CNF_PULL_Pulldown << GPIO_PIN_CNF_PULL_Pos);
+        cfg = true;
+    }
+    uint32_t m = 0;
+    if (CU_BUTTON_A_PORT->IN & (1UL << CU_BUTTON_A_PIN)) m |= FANTASI_BTN_OK;
+    if (NRF_P1->IN & (1UL << CU_BUTTON_B_PIN))           m |= FANTASI_BTN_BACK;
+    return m;
 }

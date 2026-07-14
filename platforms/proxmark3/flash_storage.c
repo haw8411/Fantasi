@@ -1,18 +1,19 @@
 /* AT91SAM7S512 flash driver for LittleFS storage.
  *
- * Storage occupies flash plane 1 (0x140000-0x17FFFF, 256 KB).
- * Only available on the S512 variant - S256 has one plane and no
- * room for storage.
+ * Storage occupies the top 128 KB of flash plane 1 (STORAGE_BASE=0x160000 ..
+ * 0x180000), above the app - see flash_storage.h. Only the S512 variant has a
+ * plane 1; S256 is rejected below.
  *
- * AT91SAM7S flash pages are 256 bytes. The WP (Write Page) command
- * auto-erases the page before programming, so erase and program are
- * both implemented as full-page writes via EFC1. */
+ * AT91SAM7S flash pages are 256 bytes. The WP (Write Page) command auto-erases
+ * the page before programming, so erase and program are both full-page writes
+ * via EFC1. EFC1 page numbers are relative to the plane-1 hardware base
+ * (PLANE1_BASE=0x140000), which is independent of where the filesystem sits. */
 
 #include "flash_storage.h"
 #include "at91sam7s512.h"
 #include <string.h>
 
-#define PLANE1_BASE      0x00140000U
+#define PLANE1_BASE      0x00140000U   /* EFC1 hardware plane base (page numbering) */
 #define EFC1_KEY         (0x5AU << 24)
 
 static uint32_t s_base;
@@ -24,7 +25,7 @@ int storage_flash_init(void)
     if (nvpsiz != 10)
         return -1;
 
-    s_base = PLANE1_BASE;
+    s_base = STORAGE_BASE;
     return 0;
 }
 

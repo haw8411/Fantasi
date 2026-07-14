@@ -8,7 +8,16 @@
 #define configTICK_RATE_HZ              ((TickType_t)1000)
 #define configMAX_PRIORITIES            5
 #define configMINIMAL_STACK_SIZE        ((unsigned short)128)
-#define configTOTAL_HEAP_SIZE           ((size_t)(112 * 1024))
+/* Elastic app heap. ucHeap (heap_4.c) is aliased onto the linker heap region,
+ * and this size is its runtime span - end of .bss to the stack - so the FreeRTOS
+ * heap uses all free SRAM1 with nothing stranded. newlib malloc (float printf's
+ * dtoa) is wrapped onto this same heap (core/newlib_malloc.c + the --wrap flags
+ * in the Makefile), so there is no separate newlib arena. */
+#ifndef __ASSEMBLER__
+extern unsigned char __heap_start__, __heap_end__;   /* linker heap region bounds */
+#endif
+#define configAPPLICATION_ALLOCATED_HEAP  1
+#define configTOTAL_HEAP_SIZE           ((size_t)(&__heap_end__ - &__heap_start__))
 #define configMAX_TASK_NAME_LEN         12
 #define configUSE_TRACE_FACILITY        1
 #define configUSE_16_BIT_TICKS          0

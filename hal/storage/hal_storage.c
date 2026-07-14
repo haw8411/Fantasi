@@ -113,13 +113,20 @@ bool hal_storage_mounted(void)
     return mounted;
 }
 
+/* Per-open-file cache buffers (lfs_file_config.buffer). Two of them so one read
+ * and one write file can be open at once (the settings rewrite streams the old
+ * config into a temp file). Shared by all the file helpers and the settings KV -
+ * storage access is serialized, so there's no aliasing. Word-aligned for the
+ * same reason as lfs_prog_buf (SoftDevice flash source alignment). */
+static uint8_t s_rcache[STORAGE_CACHE_SIZE] __attribute__((aligned(4)));
+static uint8_t s_wcache[STORAGE_CACHE_SIZE] __attribute__((aligned(4)));
+
 int hal_storage_read_file(const char *path, void *buf, uint32_t max_len)
 {
     if (!mounted) hal_storage_mount();
     if (!mounted) return -1;
 
-    static uint8_t file_cache[STORAGE_CACHE_SIZE] __attribute__((aligned(4)));
-    struct lfs_file_config fcfg = { .buffer = file_cache };
+    struct lfs_file_config fcfg = { .buffer = s_rcache };
 
     lfs_file_t f;
     if (lfs_file_opencfg(&lfs, &f, path, LFS_O_RDONLY, &fcfg) < 0)
@@ -135,8 +142,7 @@ int hal_storage_write_file(const char *path, const void *buf, uint32_t len)
     if (!mounted) return -1;
     fatrd_invalidate();   /* settings.cfg / ble_bond.bin appear in the FAT model */
 
-    static uint8_t file_cache_w[STORAGE_CACHE_SIZE] __attribute__((aligned(4)));
-    struct lfs_file_config fcfg = { .buffer = file_cache_w };
+    struct lfs_file_config fcfg = { .buffer = s_wcache };
 
     lfs_file_t f;
     int rc = lfs_file_opencfg(&lfs, &f, path,
@@ -157,86 +163,154 @@ struct lfs *hal_storage_lfs(void)
 /* ---- Settings KV (key=value\n text in /settings.cfg) ---- */
 
 #define SETTINGS_PATH "/settings.cfg"
-#define SETTINGS_MAX  256
+#define SETTINGS_TMP  "/settings.tmp"
 
+/* Buffered byte reader over an lfs file: a 64-byte window so the settings parser
+ * never holds the whole config in RAM. Returns the next byte, or -1 at EOF/error.
+ * Uses the module-global `lfs`. */
+typedef struct { lfs_file_t *f; uint8_t buf[64]; int pos, n; } cfg_reader;
+static int cfg_getc(cfg_reader *r)
+{
+    if (r->pos >= r->n) {
+        lfs_ssize_t g = lfs_file_read(&lfs, r->f, r->buf, sizeof r->buf);
+        if (g <= 0) return -1;
+        r->n = (int)g;
+        r->pos = 0;
+    }
+    return r->buf[r->pos++];
+}
+
+/* Scan /settings.cfg line by line for "key=" and copy its value (up to the
+ * newline) into buf, NUL-terminated. Returns the value length, or -1 if the key
+ * is not set. Streamed through cfg_getc, so the config size is unbounded. */
 int hal_settings_get(const char *key, char *buf, int len)
 {
-    char raw[SETTINGS_MAX];
-    int n = hal_storage_read_file(SETTINGS_PATH, raw, SETTINGS_MAX - 1);
-    if (n < 0) return -1;
-    raw[n] = '\0';
+    if (!mounted) hal_storage_mount();
+    if (!mounted || len < 1) return -1;
 
     int klen = 0;
     while (key[klen]) klen++;
 
-    char *p = raw;
-    while (*p) {
-        if (memcmp(p, key, klen) == 0 && p[klen] == '=') {
-            char *v = p + klen + 1;
-            int vlen = 0;
-            while (v[vlen] && v[vlen] != '\n') vlen++;
-            if (vlen >= len) vlen = len - 1;
-            memcpy(buf, v, vlen);
-            buf[vlen] = '\0';
-            return vlen;
+    struct lfs_file_config fcfg = { .buffer = s_rcache };
+    lfs_file_t f;
+    if (lfs_file_opencfg(&lfs, &f, SETTINGS_PATH, LFS_O_RDONLY, &fcfg) < 0)
+        return -1;
+
+    cfg_reader r = { &f, {0}, 0, 0 };
+    int result = -1;
+    int c = cfg_getc(&r);
+    while (c >= 0) {
+        int i = 0;                                     /* match key at line start */
+        while (i < klen && c == (uint8_t)key[i]) { i++; c = cfg_getc(&r); }
+        if (i == klen && c == '=') {
+            int o = 0;
+            while ((c = cfg_getc(&r)) >= 0 && c != '\n')
+                if (o < len - 1) buf[o++] = (char)c;
+            buf[o] = '\0';
+            result = o;
+            break;
         }
-        while (*p && *p != '\n') p++;
-        if (*p == '\n') p++;
+        while (c >= 0 && c != '\n') c = cfg_getc(&r);   /* skip to the next line */
+        if (c == '\n') c = cfg_getc(&r);
     }
-    return -1;
+
+    lfs_file_close(&lfs, &f);
+    return result;
 }
 
-int hal_settings_set(const char *key, const char *value)
+/* Rewrite /settings.cfg: stream it into a temp file dropping the existing "key="
+ * line, optionally append "key=value" (value != NULL), then atomically rename
+ * over the original. value == NULL removes the key (unset). Only the read window
+ * and one output byte are buffered, so the config is unbounded. Returns 0/-1. */
+static int settings_rewrite(const char *key, const char *value)
 {
-    char raw[SETTINGS_MAX];
-    int n = hal_storage_read_file(SETTINGS_PATH, raw, SETTINGS_MAX - 1);
-    if (n < 0) n = 0;
-    raw[n] = '\0';
+    if (!mounted) hal_storage_mount();
+    if (!mounted) return -1;
 
     int klen = 0;
     while (key[klen]) klen++;
 
-    char out[SETTINGS_MAX];
-    int olen = 0;
-    char *p = raw;
-    while (*p) {
-        char *line = p;
-        while (*p && *p != '\n') p++;
-        int llen = (int)(p - line);
-        if (*p == '\n') p++;
-        if (memcmp(line, key, klen) == 0 && line[klen] == '=')
-            continue;
-        bool has_eq = false;
-        for (int j = 0; j < llen; j++)
-            if (line[j] == '=') { has_eq = true; break; }
-        if (!has_eq) continue;
-        if (olen + llen + 1 < SETTINGS_MAX) {
-            memcpy(out + olen, line, llen);
-            olen += llen;
-            out[olen++] = '\n';
+    struct lfs_file_config fw = { .buffer = s_wcache };
+    lfs_file_t dst;
+    if (lfs_file_opencfg(&lfs, &dst, SETTINGS_TMP,
+                         LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC, &fw) < 0)
+        return -1;
+
+    /* Copy every line of the old config except the one that sets `key`. */
+    struct lfs_file_config fr = { .buffer = s_rcache };
+    lfs_file_t src;
+    if (lfs_file_opencfg(&lfs, &src, SETTINGS_PATH, LFS_O_RDONLY, &fr) >= 0) {
+        cfg_reader r = { &src, {0}, 0, 0 };
+        int c = cfg_getc(&r);
+        while (c >= 0) {
+            int i = 0;                                 /* match key at line start */
+            while (i < klen && c == (uint8_t)key[i]) { i++; c = cfg_getc(&r); }
+            if (i == klen && c == '=') {
+                while (c >= 0 && c != '\n') c = cfg_getc(&r);   /* drop old line */
+                if (c == '\n') c = cfg_getc(&r);
+            } else {
+                if (i) lfs_file_write(&lfs, &dst, key, i);       /* matched prefix */
+                while (c >= 0 && c != '\n') {
+                    uint8_t ch = (uint8_t)c;
+                    lfs_file_write(&lfs, &dst, &ch, 1);
+                    c = cfg_getc(&r);
+                }
+                uint8_t nl = '\n';
+                lfs_file_write(&lfs, &dst, &nl, 1);              /* terminate line */
+                if (c == '\n') c = cfg_getc(&r);
+            }
         }
+        lfs_file_close(&lfs, &src);
     }
 
-    int vlen = 0;
-    while (value[vlen]) vlen++;
-    if (olen + klen + 1 + vlen + 1 < SETTINGS_MAX) {
-        memcpy(out + olen, key, klen);
-        olen += klen;
-        out[olen++] = '=';
-        memcpy(out + olen, value, vlen);
-        olen += vlen;
-        out[olen++] = '\n';
+    /* Append the new key=value (unless unsetting). */
+    if (value) {
+        int vlen = 0;
+        while (value[vlen]) vlen++;
+        uint8_t eq = '=', nl = '\n';
+        lfs_file_write(&lfs, &dst, key, klen);
+        lfs_file_write(&lfs, &dst, &eq, 1);
+        lfs_file_write(&lfs, &dst, value, vlen);
+        lfs_file_write(&lfs, &dst, &nl, 1);
     }
 
-    return (hal_storage_write_file(SETTINGS_PATH, out, olen) >= 0) ? 0 : -1;
+    if (lfs_file_close(&lfs, &dst) < 0) return -1;
+    if (lfs_rename(&lfs, SETTINGS_TMP, SETTINGS_PATH) < 0) return -1;
+    fatrd_invalidate();   /* settings.cfg changed in the synthetic FAT model */
+    return 0;
 }
 
-int hal_settings_dump(char *buf, int len)
+int hal_settings_set(const char *key, const char *value) { return settings_rewrite(key, value); }
+int hal_settings_unset(const char *key)                  { return settings_rewrite(key, NULL); }
+
+int hal_settings_foreach(void (*cb)(const char *line, void *ctx), void *ctx)
 {
-    int n = hal_storage_read_file(SETTINGS_PATH, buf, len - 1);
-    if (n < 0) return -1;
-    buf[n] = '\0';
-    return n;
+    if (!mounted) hal_storage_mount();
+    if (!mounted) return -1;
+
+    struct lfs_file_config fcfg = { .buffer = s_rcache };
+    lfs_file_t f;
+    if (lfs_file_opencfg(&lfs, &f, SETTINGS_PATH, LFS_O_RDONLY, &fcfg) < 0)
+        return 0;   /* no config yet = no lines */
+
+    /* Stream line by line: only one line is buffered (256 B, ample for a key
+     * plus a filesystem path), so the config itself is unbounded. */
+    cfg_reader r = { &f, {0}, 0, 0 };
+    char line[256];
+    int o = 0, c;
+    while ((c = cfg_getc(&r)) >= 0) {
+        if (c == '\n') {
+            line[o] = '\0';
+            if (o) cb(line, ctx);              /* skip empty lines */
+            o = 0;
+        } else if (o < (int)sizeof(line) - 1) {
+            line[o++] = (char)c;
+        }
+    }
+    if (o) { line[o] = '\0'; cb(line, ctx); }   /* last line, no trailing newline */
+
+    lfs_file_close(&lfs, &f);
+    return 0;
 }
 
 /* The MSC LUN is the synthetic FAT (msc_device.c → fatrd_*); reads/writes go

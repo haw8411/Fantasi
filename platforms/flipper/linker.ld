@@ -97,7 +97,10 @@ SECTIONS {
         . = ALIGN(4);
         _ebss = .;
         __bss_end__ = .;
-        end = .;                    /* newlib _sbrk anchor (unused; no malloc) */
+        end = .;                    /* _sbrk anchor. The ._user_heap_stack region
+                                     * below is the FreeRTOS app heap: ucHeap is
+                                     * aliased onto __heap_start__ and newlib malloc
+                                     * is wrapped onto it, so _sbrk stays unused. */
         PROVIDE(_end = .);
     } >RAM1
 

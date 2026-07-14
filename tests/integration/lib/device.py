@@ -78,11 +78,20 @@ CLI_WEBUSB_SENTINEL = "/dev/ttyFANTASI_WEBUSB"
 
 def find_cdc_port(usb_dev=None):
     if usb_dev is None:
-        usb_dev = find_usb_device(USB_VID, USB_PID)
+        # A switch-mode device (PM3) briefly drops off /sys while it re-enumerates
+        # between CDC and WebUSB; wait for it to reappear rather than racing the
+        # next test's discovery. Composite devices are always present, so this is
+        # a no-op there.
+        usb_dev = find_usb_device(USB_VID, USB_PID) or wait_for_usb(USB_VID, USB_PID, timeout=15)
     if usb_dev is None:
         return None
-    for tty in glob.glob(f"{usb_dev}/*/tty/ttyACM*"):
-        return "/dev/" + os.path.basename(tty)
+    # The USB device can show up in /sys a beat before its CDC tty node, so poll
+    # briefly - otherwise a device re-enumerating into CDC mode is mistaken for
+    # WebUSB-only and routed to the vendor pipe (which re-switches it, churning).
+    for _ in range(12):
+        for tty in glob.glob(f"{usb_dev}/*/tty/ttyACM*"):
+            return "/dev/" + os.path.basename(tty)
+        time.sleep(0.25)
     # Device present but no CDC tty: a switch-mode device already in WebUSB mode.
     # Hand the CLI a non-existent serial path so it uses the vendor pipe directly.
     return CLI_WEBUSB_SENTINEL

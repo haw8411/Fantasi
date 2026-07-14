@@ -24,6 +24,11 @@
 #include "FreeRTOS.h"
 #include "task.h"
 #include "tusb.h"
+#include "app_api.h"   /* FANTASI_HID_* bits for hal_hid_host */
+#ifdef FANTASI_ENABLE_APPS
+#include "cli.h"
+#include "app_run.h"   /* shortcut_run for the button launcher */
+#endif
 
 #ifndef GPIO_USB_PU
 #  define GPIO_USB_PU  AT91C_PIO_PA24
@@ -33,15 +38,29 @@
  * `subs pc, lr, #4` epilogue (restoring SPSR into CPSR on return).
  * A plain function would return with `bx lr`, which leaves the CPU
  * in IRQ mode with I=1. */
-static void udp_irq_trampoline(void) __attribute__((interrupt("IRQ")));
+/* Switching ISR, modelled on FreeRTOS's vPreemptiveTick. dcd_int_handler only
+ * queues USB events (notably a received SETUP) to the usbd task; it does not
+ * respond in ISR context. The control response must therefore be prepared by the
+ * usbd task within the xHCI control-transfer window (~150 us). A plain
+ * interrupt("IRQ") handler cannot context-switch, so the woken usbd task would
+ * not run until the next 1 ms tick - past the window. Saving the interrupted
+ * task's context and calling vTaskSwitchContext() here lets the higher-priority
+ * usbd task preempt immediately, the same pattern the tick ISR uses. */
+static void udp_irq_trampoline(void) __attribute__((naked));
 static void udp_irq_trampoline(void)
 {
+    portSAVE_CONTEXT();
     dcd_int_handler(0);
-    /* AIC End-of-Interrupt: allows the AIC to drive NIRQ for the next
-     * pending interrupt. Must be written before the IRQ epilogue so
-     * priority bookkeeping is correct. */
+    vTaskSwitchContext();               /* run the usbd task now if the DCD woke it */
+    /* AIC End-of-Interrupt: allows the AIC to drive NIRQ for the next pending
+     * interrupt. Written before the epilogue so priority bookkeeping is correct. */
     AT91C_BASE_AIC->AIC_EOICR = 0;
+    portRESTORE_CONTEXT();
 }
+
+#ifdef FANTASI_ENABLE_APPS
+void pm3_launcher_init(void);   /* button/LED shortcut launcher, defined below */
+#endif
 
 void hal_init(void)
 {
@@ -92,6 +111,10 @@ void hal_init(void)
 
     hal_storage_init();
 
+#ifdef FANTASI_ENABLE_APPS
+    pm3_launcher_init();   /* button/LED shortcut launcher (owns LED_A/B/C) */
+#endif
+
     /* tud_init() is intentionally NOT called here - deferred to the
      * USB task. See platform_usb_task comment below. */
 }
@@ -130,12 +153,183 @@ int hal_enter_cdc_mode(void)
     return 0;
 }
 
+/* ---- USB HID keyboard (switch-mode: HID-only, CDC dropped) ----
+ * The SAM7S's 4 endpoints can't host HID alongside CDC, so arming the keyboard
+ * re-enumerates as a HID-only device (mode 3) and disarming restores the prior
+ * personality (normally CDC). */
+extern volatile uint8_t pm3_hid_host_leds;
+static volatile uint8_t pm3_prev_mode;   /* personality to restore on disarm */
+
+int hal_hid_enable(int on)
+{
+    if (on) {
+        pm3_prev_mode   = pm3_usb_mode;   /* usually 0 (CDC) or 2 (vendor) */
+        pm3_mode_request = 3;             /* USB task re-enumerates as HID-only */
+        for (int i = 0; i < 4000; i++) {
+            if (pm3_usb_mode == 3 && tud_mounted() && tud_hid_ready()) return 0;
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+        return (pm3_usb_mode == 3 && tud_mounted()) ? 0 : -1;
+    }
+
+    /* Only switch USB back if we actually enumerated as HID (mode 3). app_run
+     * calls this after EVERY app as a safety net, including plain non-HID apps
+     * that never armed HID; for those pm3_usb_mode is still the CDC/vendor mode,
+     * and requesting a switch would needlessly re-enumerate the pipe - dropping
+     * the app's final `exit N`/`[killed]` line and churning the device. */
+    if (pm3_usb_mode != 3)
+        return 0;
+
+    uint8_t empty[6] = { 0 };
+    if (tud_hid_ready()) tud_hid_keyboard_report(0, 0, empty);   /* release keys */
+    pm3_mode_request = pm3_prev_mode;                            /* back to CDC/vendor */
+    return 0;
+}
+
+int hal_hid_send(uint8_t modifiers, const uint8_t *keys, uint8_t n)
+{
+    if (pm3_usb_mode != 3 || !tud_mounted()) return -1;
+
+    uint8_t report[6] = { 0 };
+    for (uint8_t i = 0; i < n && i < 6; i++) report[i] = keys[i];
+
+    for (int i = 0; i < 200 && !tud_hid_ready(); i++) vTaskDelay(pdMS_TO_TICKS(1));
+    if (!tud_hid_ready()) return -1;
+
+    return tud_hid_keyboard_report(0, modifiers, report) ? 0 : -1;
+}
+
+uint32_t hal_hid_host(void)
+{
+    uint32_t bits = pm3_hid_host_leds;
+    if (pm3_usb_mode == 3 && tud_mounted()) bits |= FANTASI_HID_HOST_MOUNTED;
+    return bits;
+}
+
+/* ---- Button shortcut launcher (screenless slot selection) ----
+ * The PM3 has one button (PA23, active-low) and 4 LEDs. App shortcuts (scN=<path>
+ * in settings.cfg, slots 0-7) are chosen by pressing the button to count up, with
+ * the slot shown in BINARY on the 3 non-blue LEDs (A=bit0, B=bit1, C=bit2; slot 0
+ * = all off .. slot 7 = all on). The blue LED_D stays lit throughout. Holding the
+ * button launches the app in the selected slot. LEDs are active-high (SODR=on). */
+#ifdef FANTASI_ENABLE_APPS
+
+#define PM3_LED_A     AT91C_PIO_PA0   /* binary bit 0 */
+#define PM3_LED_B     AT91C_PIO_PA2   /* binary bit 1 */
+#define PM3_LED_C     AT91C_PIO_PA9   /* binary bit 2 */
+#define PM3_LED_D     AT91C_PIO_PA8   /* blue, always on */
+#define PM3_BUTTON    AT91C_PIO_PA23  /* active-low (pull-up) */
+#define PM3_HOLD_MS   600
+
+static void pm3_leds_show(uint8_t slot)
+{
+    uint32_t set = PM3_LED_D, clr = 0;    /* blue always on */
+    if (slot & 1) set |= PM3_LED_A; else clr |= PM3_LED_A;
+    if (slot & 2) set |= PM3_LED_B; else clr |= PM3_LED_B;
+    if (slot & 4) set |= PM3_LED_C; else clr |= PM3_LED_C;
+    AT91C_BASE_PIOA->PIO_SODR = set;      /* drive high = on  */
+    AT91C_BASE_PIOA->PIO_CODR = clr;      /* drive low  = off */
+}
+
+static bool pm3_button_down(void)
+{
+    return (AT91C_BASE_PIOA->PIO_PDSR & PM3_BUTTON) == 0;   /* active-low */
+}
+
+/* App-facing button read for the Berry `hardware` module (overrides the weak
+ * default in core/app_run.c). The PM3 has a single button (PA23) -> OK. Reading
+ * PDSR is non-destructive, so this coexists with pm3_launcher_task (which owns
+ * the button); the pin is configured input+pull-up idempotently in case an app
+ * reads it before the launcher's init has run. There is no BACK button, so a
+ * hardware.loop() on the PM3 is exited with ^C (kill) rather than a button. */
+uint32_t hal_app_buttons(void)
+{
+    static bool cfg;
+    if (!cfg) {
+        AT91C_BASE_PIOA->PIO_PER   = PM3_BUTTON;   /* PIO controls the pin */
+        AT91C_BASE_PIOA->PIO_ODR   = PM3_BUTTON;   /* input */
+        AT91C_BASE_PIOA->PIO_PPUER = PM3_BUTTON;   /* pull-up */
+        cfg = true;
+    }
+    return (AT91C_BASE_PIOA->PIO_PDSR & PM3_BUTTON) == 0 ? FANTASI_BTN_OK : 0;
+}
+
+/* Discarding CLI session so app_run() works from this task. */
+static cli_ctx_t pm3_launcher_ctx;
+static size_t pm3_tp_write(const uint8_t *b, size_t n, void *c) { (void)b; (void)c; return n; }
+static size_t pm3_tp_read(uint8_t *b, size_t n, void *c) { (void)b; (void)n; (void)c; return 0; }
+static bool   pm3_tp_connected(void *c) { (void)c; return true; }
+
+/* Run the selected shortcut's app. Runs on the launcher task itself: on PM3's
+ * tight heap, spawning a separate worker task (its own stack on top of the app
+ * image + Berry VM) would OOM, so the app-runner is this baseline task allocated
+ * at boot. It hosts app_run()'s LittleFS/ELF-load path and button polling - see
+ * pm3_launcher_init for sizing. */
+static void pm3_launch(int slot)
+{
+    shortcut_run(slot);
+    cli_bind_ctx(&pm3_launcher_ctx);   /* app_run rebinds the ctx; restore ours */
+}
+
+static void pm3_launcher_task(void *arg)
+{
+    (void)arg;
+
+    /* LED_B as output (A/C/D already set up in hal_init); button as input+pull-up. */
+    AT91C_BASE_PIOA->PIO_PER   = PM3_LED_B | PM3_BUTTON;
+    AT91C_BASE_PIOA->PIO_OER   = PM3_LED_B;
+    AT91C_BASE_PIOA->PIO_ODR   = PM3_BUTTON;
+    AT91C_BASE_PIOA->PIO_PPUER = PM3_BUTTON;
+
+    pm3_launcher_ctx.transport.write     = pm3_tp_write;
+    pm3_launcher_ctx.transport.read      = pm3_tp_read;
+    pm3_launcher_ctx.transport.connected = pm3_tp_connected;
+    cli_bind_ctx(&pm3_launcher_ctx);
+
+    int sel = 0;
+    bool prev = false, launched = false;
+    TickType_t press_start = 0;
+
+    for (;;) {
+        pm3_leds_show((uint8_t)sel);
+
+        bool now = pm3_button_down();
+        TickType_t t = xTaskGetTickCount();
+
+        if (now && !prev) { press_start = t; launched = false; }        /* press edge */
+        if (now && !launched && (t - press_start) >= pdMS_TO_TICKS(PM3_HOLD_MS)) {
+            launched = true;                                            /* fire once per hold */
+            AT91C_BASE_PIOA->PIO_SODR = PM3_LED_A | PM3_LED_B | PM3_LED_C | PM3_LED_D;
+            pm3_launch(sel);
+        }
+        if (!now && prev && !launched) sel = (sel + 1) & 7;            /* short press -> next slot */
+        prev = now;
+
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+void pm3_launcher_init(void)
+{
+    /* 4 KB: this task hosts app_run()'s ELF-load path (pm3_launch). The app is
+     * run in a separately-spawned "app" task. Small enough so PM3's 40 KB heap
+     * has room for a Berry payload (~5 KB VM) alongside the ~9 KB app image. */
+    xTaskCreate(pm3_launcher_task, "sclaunch", configMINIMAL_STACK_SIZE * 4,
+                NULL, tskIDLE_PRIORITY + 1, NULL);
+}
+#endif /* FANTASI_ENABLE_APPS */
+
 void platform_usb_task(void *arg)
 {
     (void)arg;
     tud_init(0);
     for (;;) {
-        tud_task();
+        /* Bounded timeout (not the default block-forever tud_task()): with no USB
+         * traffic - e.g. an on-device button launch, where nothing is talking to
+         * the CDC/vendor pipe - a forever-blocking tud_task() would never return
+         * to check pm3_mode_request, so a mode switch requested by the app (arm
+         * HID) would never happen. Waking every 10 ms lets the switch run. */
+        tud_task_ext(10, false);
 
         if (pm3_mode_request != 0xFF) {
             uint8_t new_mode = pm3_mode_request;
@@ -247,10 +441,12 @@ int hal_mem_regions(hal_mem_region_t *out, int max)
 {
     int n = 0;
     if (n < max) {
-        uint32_t unalloc = (uint32_t)&__heap_end__ - (uint32_t)&__heap_start__;
+        /* The FreeRTOS heap spans all free RAM (ucHeap is aliased onto the linker
+         * heap region), so free RAM is the free heap - there is no separate
+         * unallocated newlib arena to add in. */
         out[n].name  = "RAM";
         out[n].total = (uint32_t)&_ram_end - (uint32_t)&_ram_start;
-        out[n].free  = (uint32_t)hal_free_heap_bytes() + unalloc;
+        out[n].free  = (uint32_t)hal_free_heap_bytes();
         out[n].note  = NULL;
         n++;
     }
@@ -259,14 +455,11 @@ int hal_mem_regions(hal_mem_region_t *out, int max)
 
 int hal_test_regions(hal_test_region_t *out, int max)
 {
-    int n = 0;
-    if (n < max) {
-        out[n].name = "RAM";
-        out[n].addr = (uint32_t)&__heap_start__;
-        out[n].size = (uint32_t)&__heap_end__ - (uint32_t)&__heap_start__;
-        n++;
-    }
-    return n;
+    (void)out; (void)max;
+    /* Nothing to memtest: the RAM region (__heap_start__..__heap_end__) is now
+     * the live FreeRTOS heap, and everything below it is static .bss - none of
+     * it can be safely pattern-tested while in use. */
+    return 0;
 }
 
 extern uint8_t _eflash;

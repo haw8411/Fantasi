@@ -85,11 +85,57 @@ static uint8_t const desc_vendor_configuration[] = {
 };
 #endif
 
+/* ---- HID configuration (keyboard-only, BadUSB) ---- */
+
+#if CFG_TUD_HID
+#define HID_CONFIG_TOTAL  (TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN)
+#define EPNUM_HID_IN      0x81
+#define STRID_HID         7
+
+uint8_t const desc_hid_report[] = {
+    TUD_HID_REPORT_DESC_KEYBOARD()
+};
+
+static uint8_t const desc_hid_configuration[] = {
+    TUD_CONFIG_DESCRIPTOR(1, 1, 0, HID_CONFIG_TOTAL, 0x00, 100),
+    TUD_HID_DESCRIPTOR(0, STRID_HID, HID_ITF_PROTOCOL_KEYBOARD,
+                       sizeof(desc_hid_report), EPNUM_HID_IN, CFG_TUD_HID_EP_BUFSIZE, 5),
+};
+
+uint8_t const *tud_hid_descriptor_report_cb(uint8_t instance)
+{
+    (void)instance;
+    return desc_hid_report;
+}
+
+/* Host keyboard-LED output report, surfaced through hal_hid_host(). */
+volatile uint8_t pm3_hid_host_leds;
+
+uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id,
+                               hid_report_type_t report_type, uint8_t *buffer, uint16_t reqlen)
+{
+    (void)instance; (void)report_id; (void)report_type; (void)buffer; (void)reqlen;
+    return 0;
+}
+
+void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
+                           hid_report_type_t report_type, uint8_t const *buffer, uint16_t bufsize)
+{
+    (void)instance; (void)report_id;
+    if (report_type == HID_REPORT_TYPE_OUTPUT && bufsize >= 1)
+        pm3_hid_host_leds = buffer[0];
+}
+#endif /* CFG_TUD_HID */
+
 /* ---- Configuration callback ---- */
 
 uint8_t const *tud_descriptor_configuration_cb(uint8_t index)
 {
     (void)index;
+#if CFG_TUD_HID
+    if (pm3_usb_mode == 3)
+        return desc_hid_configuration;
+#endif
 #if CFG_TUD_VENDOR
     if (pm3_usb_mode == 2)
         return desc_vendor_configuration;
@@ -176,6 +222,7 @@ static char const *string_desc_arr[] = {
     "Fantasi CLI CDC",
     "Fantasi Storage",
     "Fantasi Data",
+    "Fantasi Keyboard",   /* 7: HID keyboard (switch-mode) */
 };
 
 static uint16_t _desc_str[32];

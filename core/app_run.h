@@ -32,4 +32,11 @@ bool     app_kill_running(void);
  * verify a pid refers to the app before acting (system tasks aren't killable). */
 int      app_running_pid(void);
 
+/* App launch shortcuts (slots 0-7, persisted as scN=<path> in settings.cfg).
+ * Used by the Flipper Shortcuts menu, the `shortcut` command, and the screenless
+ * LED+button launchers. shortcut_get fills buf and returns its length (0 if the
+ * slot is empty); shortcut_run launches the slot's app (returns -1 if empty). */
+int      shortcut_get(int slot, char *buf, int len);
+int      shortcut_run(int slot);
+
 #endif /* CORE_APP_RUN_H */

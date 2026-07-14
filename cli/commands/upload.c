@@ -121,6 +121,10 @@ static void ble_cmd_upload(const char *args)
             memcpy(req.payload.file_write.data.bytes, chunk, n);
             req.payload.file_write.data.size = (pb_size_t)n;
             req.payload.file_write.last = (off + n >= (uint32_t)fsize);
+            /* Size hint so the device can pre-allocate (ramfs) instead of
+             * growing per chunk; harmless on flash targets that ignore it. */
+            req.payload.file_write.has_total = true;
+            req.payload.file_write.total = (uint32_t)fsize;
 
             if (ble_write_req(&req) < 0) {
                 fprintf(stderr, "send failed\n");

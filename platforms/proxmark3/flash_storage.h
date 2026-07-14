@@ -4,9 +4,18 @@
 #include <stdint.h>
 #include <stddef.h>
 
-/* AT91SAM7S512: 256 KB storage in flash plane 1 (0x140000).
- * Pages are 256 bytes with auto-erase-on-write via EFC1. */
-#define STORAGE_SIZE        (256U * 1024U)
+/* AT91SAM7S512 flash 0x100000-0x180000 (512 KB) layout:
+ *   0x100000-0x102000  bootloader (8 KB, preserved)
+ *   0x102000-0x160000  app / osimage (<=376 KB)     - must match linker.ld osimage
+ *   0x160000-0x180000  LittleFS storage (128 KB, fixed)
+ * Storage sits at a fixed base above the app (not at the plane-1 base 0x140000):
+ * a >256 KB firmware (e.g. with Berry linked) exceeds 0x140000, so storage
+ * there would overlap the image and the two would corrupt each other's writes.
+ * The fixed base above the app also leaves room for the firmware to grow (e.g. an
+ * NFC lib). Pages are 256 B, auto-erase-on-write via EFC1 (EFC1 page numbers are
+ * relative to the plane-1 hardware base 0x140000, see flash_storage.c). S512 only. */
+#define STORAGE_BASE        0x00160000U
+#define STORAGE_SIZE        (128U * 1024U)
 #define STORAGE_PAGE_SIZE   256U
 #define STORAGE_PAGE_COUNT  (STORAGE_SIZE / STORAGE_PAGE_SIZE)
 #define STORAGE_PROG_SIZE   4U   /* 32-bit word */

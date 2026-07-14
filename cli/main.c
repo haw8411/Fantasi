@@ -1027,20 +1027,25 @@ static bool connect_webusb_direct(void)
     use_usb = true;
     ser_connected = true;
     g_switch_mode = true;   /* only a switch-mode device (PM3) loses its CDC port */
-    printf("transport: WebUSB protobuf - device already in WebUSB mode\n");
+    printf("transport: WebUSB\n");
     return true;
 }
 
-/* Move file/CLI traffic onto the USB vendor (WebUSB) protobuf pipe. On switch-mode
- * devices (PM3) this sends `webusb` and re-opens over libusb; on composite devices
- * the vendor interface is already there. `force` upgrades any device; otherwise
- * only switch-mode devices auto-upgrade (composite ones keep serial + MSC). */
-static bool try_webusb_upgrade(bool force)
+/* Move file/CLI traffic onto the USB vendor (WebUSB) protobuf pipe - the default
+ * for every USB device. The vendor interface carries the whole CLI + files
+ * independent of the MSC drive, so file ops keep working even with mass-storage
+ * disabled, and there's no MSC attach/detach churn.
+ *
+ * Switch-mode devices (PM3) send `webusb` and re-open over libusb; composite
+ * devices (FZ/Kiisu/CU) already expose the vendor interface. On failure we fall
+ * back to the serial + MSC path: `required` (from --usb) makes that a hard error,
+ * otherwise it's a quiet fallback. A switch-mode device that already tore down
+ * CDC can't fall back, so its failure is always surfaced. */
+static bool try_webusb_upgrade(bool required)
 {
     char id[8];
     query_device_id(id, sizeof(id));
     bool switch_mode = (strcmp(id, "PM3") == 0);
-    if (!force && !switch_mode) return false;
 
     if (switch_mode) {
         ser_write("webusb\r\n", 8);
@@ -1052,12 +1057,14 @@ static bool try_webusb_upgrade(bool force)
         usleep(150000);
     }
     if (!use_usb) {
-        fprintf(stderr, "WebUSB upgrade failed (libusb permission, or no vendor interface)\n");
+        if (required || switch_mode)
+            fprintf(stderr, "WebUSB upgrade failed (libusb permission, or no vendor interface)\n");
+        else
+            printf("transport: Serial\n");
         return false;
     }
     g_switch_mode = switch_mode;   /* PM3: pace uploads (SAM7S dual-bank OUT) */
-    printf("transport: WebUSB protobuf - %s\n",
-           switch_mode ? "PM3 switched from serial" : "composite vendor interface");
+    printf("transport: WebUSB\n");
     return true;
 }
 #endif /* HAS_USB_VENDOR */
@@ -1068,6 +1075,7 @@ int main(int argc, char **argv)
 
     bool force_ble = false;
     bool force_usb = false;
+    bool force_serial = false;
     (void)force_usb;
     for (int i = 1; i < argc; i++) {
         if (strncmp(argv[i], "/dev/tty", 8) == 0)
@@ -1078,6 +1086,8 @@ int main(int argc, char **argv)
             force_ble = true;
         else if (strcmp(argv[i], "--usb") == 0)
             force_usb = true;
+        else if (strcmp(argv[i], "--serial") == 0)
+            force_serial = true;
 #ifdef HAS_BLE
         else if (strncmp(argv[i], "--ble-addr=", 11) == 0) {
             force_ble = true;
@@ -1085,9 +1095,14 @@ int main(int argc, char **argv)
         }
 #endif
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
-            printf("usage: fantasi [--ble[=ADDR]] [--usb] [/dev/ttyACMx] [/dev/sdX]\n");
+            printf("usage: fantasi [--ble[=ADDR]] [--usb|--serial] [/dev/ttyACMx] [/dev/sdX]\n");
             return 0;
         }
+    }
+
+    if (force_serial && force_usb) {
+        fprintf(stderr, "--serial and --usb are mutually exclusive\n");
+        return 1;
     }
 
 #ifdef HAS_BLE
@@ -1095,6 +1110,7 @@ int main(int argc, char **argv)
         if (ble_transport_open() == 0) {
             use_ble = true;
             ser_connected = true;
+            printf("transport: BLE\n");
         } else {
             fprintf(stderr, "BLE connection failed\n");
             return 1;
@@ -1116,6 +1132,7 @@ int main(int argc, char **argv)
             if (ble_transport_open() == 0) {
                 use_ble = true;
                 ser_connected = true;
+                printf("transport: BLE\n");
             } else {
                 fprintf(stderr, "no Fantasi device found (USB or BLE)\n");
                 return 1;
@@ -1138,24 +1155,22 @@ int main(int argc, char **argv)
            back). If the serial port is absent, talk to the vendor pipe directly
            rather than failing to open it. */
         if (access(g_ser_path, F_OK) != 0 && connect_webusb_direct()) {
-            printf("storage: on-demand (FAT auto-mount)\n");
+            /* connected over the vendor pipe - banner printed there */
         } else
 #endif
         {
-        printf("serial: %s\n", g_ser_path);
         if (!ser_open(g_ser_path)) return 1;
 
+        /* An explicitly-passed block device is mounted for the legacy MSC file
+         * path; the common case auto-mounts on demand and needs no notice. */
         if (blk_path[0]) {
             snprintf(g_blk, sizeof(g_blk), "%s", blk_path);
             if (udisks_mountpoint(g_blk, g_mnt, sizeof(g_mnt))) {
                 msc_active = true;
-                printf("storage: %s at %s\n", g_blk, g_mnt);
             } else {
                 fprintf(stderr, "storage: cannot mount %s\n", g_blk);
                 g_mnt[0] = '\0';
             }
-        } else {
-            printf("storage: on-demand (FAT auto-mount)\n");
         }
 
         usleep(500000);
@@ -1164,10 +1179,14 @@ int main(int argc, char **argv)
         ser_connected = true;
 
 #ifdef HAS_USB_VENDOR
-        /* Auto-upgrade switch-mode devices (PM3) to the WebUSB protobuf pipe so
-         * file/CLI traffic uses a dedicated channel with no MSC attach/detach
-         * churn. --usb forces it for any device. */
-        try_webusb_upgrade(force_usb);
+        /* Default to the WebUSB protobuf pipe for every USB device: file/CLI
+         * traffic then works regardless of the MSC drive's state and needs no
+         * mount. Falls back to this serial + MSC path if the vendor interface
+         * can't be opened. --usb makes a failure a hard error; --serial opts out
+         * of the upgrade entirely and stays on this CDC + MSC path (e.g. to leave
+         * the vendor interface free for a second, independent channel). */
+        if (!force_serial)
+            try_webusb_upgrade(force_usb);
 #endif
         }
       }

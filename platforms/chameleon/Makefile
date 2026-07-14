@@ -21,6 +21,7 @@ DEFS := -DNRF52840_XXAA \
         -DFANTASI_ENABLE_MSC \
         -DFANTASI_ENABLE_BLE_CLI \
         -DFANTASI_ENABLE_APPS \
+        -DFANTASI_ENABLE_BERRY \
         -DFANTASI_ENABLE_WEBUSB \
         -DFANTASI_ENABLE_PWR_BUTTON \
         -DFANTASI_FAT_STORAGE \
@@ -41,7 +42,9 @@ INCLUDES := \
     -I$(ROOT)/third_party/tinyusb/src \
     -I$(ROOT)/third_party/littlefs \
     -I$(ROOT)/third_party/nanopb \
-    -I$(ROOT)/proto
+    -I$(ROOT)/proto \
+    -I$(ROOT)/third_party/berry \
+    -I$(ROOT)/third_party/berry/src
 
 CFLAGS := $(MCU_FLAGS) $(DEFS) $(INCLUDES) \
           -Os -ffunction-sections -fdata-sections -fno-common \
@@ -52,7 +55,9 @@ LDSCRIPT := $(ROOT)/platforms/chameleon/linker.ld
 LDFLAGS := $(MCU_FLAGS) -T$(LDSCRIPT) \
            -Wl,--gc-sections \
            -Wl,-Map=$(BUILD)/$(TARGET).map \
-           -nostartfiles --specs=nano.specs --specs=nosys.specs
+           -Wl,--wrap=_malloc_r,--wrap=_free_r,--wrap=_calloc_r,--wrap=_realloc_r \
+           -nostartfiles --specs=nano.specs --specs=nosys.specs \
+           -u _printf_float -lm
 
 SRCS := \
     $(ROOT)/core/main.c \
@@ -66,6 +71,8 @@ SRCS := \
     $(ROOT)/core/elf_loader.c \
     $(ROOT)/core/app_run.c \
     $(ROOT)/core/log.c \
+    $(ROOT)/core/newlib_malloc.c \
+    $(ROOT)/core/berry_host.c \
     $(ROOT)/platforms/chameleon/startup.c \
     $(ROOT)/platforms/chameleon/system.c \
     $(ROOT)/platforms/chameleon/ble.c \
@@ -98,6 +105,7 @@ SRCS += \
     $(TUSB_DIR)/device/usbd_control.c \
     $(TUSB_DIR)/class/cdc/cdc_device.c \
     $(TUSB_DIR)/class/msc/msc_device.c \
+    $(TUSB_DIR)/class/hid/hid_device.c \
     $(TUSB_DIR)/class/vendor/vendor_device.c \
     $(TUSB_DIR)/portable/nordic/nrf5x/dcd_nrf5x.c
 endif
@@ -105,6 +113,12 @@ endif
 LFS_DIR := $(ROOT)/third_party/littlefs
 ifneq (,$(wildcard $(LFS_DIR)/lfs.c))
 SRCS += $(LFS_DIR)/lfs.c $(LFS_DIR)/lfs_util.c
+endif
+
+# Berry scripting VM. Vendored in third_party/berry/.
+BERRY_DIR := $(ROOT)/third_party/berry
+ifneq (,$(wildcard $(BERRY_DIR)/src/be_vm.c))
+SRCS += $(wildcard $(BERRY_DIR)/src/*.c)
 endif
 
 OBJS := $(patsubst $(ROOT)/%.c,$(BUILD)/%.o,$(SRCS))

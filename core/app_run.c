@@ -76,6 +76,11 @@ __attribute__((weak)) void hal_app_display_flush(void) {}
  * the normal screen. No-ops where unsupported; only invoked when has_display. */
 __attribute__((weak)) void hal_app_display_acquire(void) {}
 __attribute__((weak)) void hal_app_display_release(void) {}
+/* USB HID keyboard: default to "unsupported" so devices/platforms without it
+ * link cleanly and apps see -1 / 0 from the API. */
+__attribute__((weak)) int hal_hid_enable(int on) { (void)on; return -1; }
+__attribute__((weak)) int hal_hid_send(uint8_t modifiers, const uint8_t *keys, uint8_t n) { (void)modifiers; (void)keys; (void)n; return -1; }
+__attribute__((weak)) uint32_t hal_hid_host(void) { return 0; }
 
 /* ---- API callbacks (run on the app task) ---- */
 
@@ -120,6 +125,12 @@ static void api_free(void *p)
     vPortFree(h);
 }
 
+/* Read callback the ELF loader streams the app image through - ctx is the VFS path. */
+static int32_t app_elf_read(void *ctx, uint32_t off, void *dst, uint32_t len)
+{
+    return vfs_pread((const char *)ctx, off, dst, len);
+}
+
 static int32_t api_read_file(const char *path, void *buf, uint32_t max) { return vfs_read_file(path, buf, max); }
 static int     api_write_file(const char *path, const void *buf, uint32_t len) { return vfs_write_file(path, buf, len); }
 static int32_t api_file_size(const char *path) { return vfs_size(path); }
@@ -127,6 +138,31 @@ static int     api_remove(const char *path) { return vfs_remove(path); }
 static void    api_crit_enter(void) { taskENTER_CRITICAL(); }
 static void    api_crit_exit(void)  { taskEXIT_CRITICAL(); }
 static void    api_delay(uint32_t ms) { vTaskDelay(pdMS_TO_TICKS(ms)); }
+
+static int      api_hid_mode(int on) { return hal_hid_enable(on); }
+static int      api_hid_send(uint8_t mod, const uint8_t *keys, uint8_t n) { return hal_hid_send(mod, keys, n); }
+static uint32_t api_hid_host(void) { return hal_hid_host(); }
+
+/* Bridge the app's dirent callback (int is_dir) onto vfs_list's (bool is_dir). */
+typedef struct { fantasi_dirent_fn cb; void *ctx; } dir_adapt_t;
+static void app_dir_adapt(const char *name, uint32_t size, bool is_dir, void *vctx)
+{
+    dir_adapt_t *a = (dir_adapt_t *)vctx;
+    a->cb(name, size, is_dir ? 1 : 0, a->ctx);
+}
+static int api_list_dir(const char *path, fantasi_dirent_fn cb, void *ctx)
+{
+    if (!cb) return -1;
+    dir_adapt_t a = { cb, ctx };
+    vfs_list(path, app_dir_adapt, &a);
+    return 0;
+}
+static int api_mkdir(const char *path) { return vfs_mkdir(path); }
+
+/* Berry runner - weak default so non-Berry builds link; core/berry_host.c
+ * overrides it where the VM is compiled in. */
+__attribute__((weak)) int be_exec(const char *path) { (void)path; return -1; }
+static int api_be_exec(const char *path) { return be_exec(path); }
 
 /* ---- App task ---- */
 
@@ -171,16 +207,18 @@ int app_run(const char *path)
         return -1;
     }
 
-    const uint8_t *data; uint32_t len; bool owned;
-    if (vfs_read_all(path, &data, &len, &owned) != 0) {
+    int32_t total = vfs_size(path);
+    if (total < 0) {
         cli_printf("launch: not found: %s\r\n", path);
         launch_busy = false;
         return -1;
     }
 
+    /* Stream the ELF through app_elf_read (vfs_pread): the loader holds only the
+     * loaded image plus small metadata, never the whole file, so large apps fit
+     * in the PM3's heap for instance. */
     static app_image_t img;
-    int lr = app_load(data, len, &img);
-    if (owned) vfs_free(data);
+    int lr = app_load(app_elf_read, (void *)path, (uint32_t)total, &img);
     if (lr != 0) {
         cli_printf("launch: load failed: %s\r\n", app_load_error());
         launch_busy = false;
@@ -207,6 +245,9 @@ int app_run(const char *path)
             .display_flush = hal_app_has_display() ? hal_app_display_flush : NULL,
             .critical_enter = api_crit_enter, .critical_exit = api_crit_exit,
             .delay = api_delay,
+            .hid_mode = api_hid_mode, .hid_send = api_hid_send, .hid_host = api_hid_host,
+            .list_dir = api_list_dir, .mkdir = api_mkdir,
+            .be_exec = api_be_exec,
         };
         actx.api = &api;
     }
@@ -257,6 +298,13 @@ int app_run(const char *path)
 
     /* App is done - give the screen back to the platform (restores status/splash). */
     if (owns_display) hal_app_display_release();
+
+    /* Safety net for HID apps: release any key the app left held (a payload
+     * killed mid-keypress would otherwise stick a key down on the host) and, in
+     * switch mode, disarm the keyboard if the app didn't. A no-op when HID is
+     * unsupported, idle, or already disarmed - so it never re-enumerates for a
+     * plain (non-HID) app. */
+    hal_hid_enable(0);
 
     /* Reclaim everything the app used - even if it leaked or was killed. */
     for (app_alloc_t *a = actx.allocs; a; ) { app_alloc_t *nx = a->next; vPortFree(a); a = nx; }

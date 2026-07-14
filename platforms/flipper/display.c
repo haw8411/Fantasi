@@ -288,7 +288,6 @@ void display_print_inv(int col, int row, const char *str)
     uint8_t *page0 = &fb[row * DISPLAY_WIDTH];
     uint8_t *page1 = (row + 1 < DISPLAY_PAGES) ? &fb[(row + 1) * DISPLAY_WIDTH] : NULL;
 
-    int start_col = col;
     while (*str && col >= 0 && col < DISPLAY_WIDTH) {
         uint8_t c = (uint8_t)*str++;
         if (c < 32 || c > 128) c = '?';

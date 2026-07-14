@@ -15,10 +15,17 @@ typedef struct {
     uint32_t entry;                   /* app_main runtime address (Thumb bit set) */
 } app_image_t;
 
-/* Load `elf` (length `len`) into freshly allocated RAM. Returns 0 on success
- * with *img populated, or a negative error code. The source buffer is not
- * retained (sections are copied), so the caller may free it after loading. */
-int  app_load(const uint8_t *elf, uint32_t len, app_image_t *img);
+/* Random-access read of the ELF image: copy `len` bytes at `off` into `dst`.
+ * Returns bytes read (== len on success) or <0 on error. The loader reads the
+ * image through this callback (backed by vfs_pread), so peak load RAM is the
+ * loaded image plus small metadata - not the entire ELF file in RAM. */
+typedef int32_t (*app_read_fn)(void *ctx, uint32_t off, void *dst, uint32_t len);
+
+/* Load the ELF read via (read, ctx), total size `total`, into freshly allocated
+ * RAM. Returns 0 on success with *img populated, or a negative error code. Only
+ * the loadable sections are retained; the loader buffers just the small metadata
+ * (section headers, symtab, strtab) during the load and frees it before return. */
+int  app_load(app_read_fn read, void *ctx, uint32_t total, app_image_t *img);
 
 /* Free every allocation made by app_load. */
 void app_unload(app_image_t *img);

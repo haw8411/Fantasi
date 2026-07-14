@@ -244,6 +244,12 @@ static void handle_file_write(cli_ctx_t *ctx, CliRequest *req)
         if (fw->offset == 0 && ramfs_truncate(leaf) != 0) {
             send_error(ctx, req->id, "create failed"); return;
         }
+        /* Reserve the whole file up front from the host's size hint, so the
+         * write sequence is one allocation rather than a realloc-per-chunk grow
+         * that needs ~2x the file live at once - which overflows a tight heap. */
+        if (fw->offset == 0 && fw->has_total && ramfs_reserve(leaf, fw->total) != 0) {
+            send_error(ctx, req->id, "no space"); return;
+        }
         if (ramfs_write_at(leaf, fw->offset, fw->data.bytes, fw->data.size) != 0) {
             send_error(ctx, req->id, "write failed"); return;
         }

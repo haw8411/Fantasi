@@ -28,7 +28,7 @@ TUSB_TAG    := 0.17.0
 TUSB_DIR    := third_party/tinyusb
 TUSB_MARKER := $(TUSB_DIR)/src/tusb.c
 
-# Our tracked modifications to the (gitignored, fetched) TinyUSB tree - see
+# Fantasi modifications to the (gitignored, fetched) TinyUSB tree - see
 # third_party/tinyusb_patches/README.md. check-tinyusb re-applies them after the
 # clone, idempotently and non-destructively:
 #   *.patch          edits to upstream files, applied via `git apply` with a
@@ -50,7 +50,7 @@ LFS_MARKER  := $(LFS_DIR)/lfs.c
 # lives elsewhere: `make proto NANOPB=/path/to/nanopb_generator`.
 NANOPB ?= nanopb_generator
 
-.PHONY: all cli app launch flash storage test test-unit proto clean help $(PLATFORM) check-tinyusb check-littlefs check-toolchain
+.PHONY: all cli app launch flash storage test test-unit proto berry clean help $(PLATFORM) check-tinyusb check-littlefs check-toolchain
 
 all:
 	@if [ "$(PLATFORM)" = "help" ]; then \
@@ -104,7 +104,7 @@ check-tinyusb:
 	    rm -rf $(TUSB_DIR); exit 1; \
 	  }; \
 	fi
-	@# Re-apply our tracked TinyUSB modifications (idempotent; see the var block).
+	@# Re-apply fantasi TinyUSB modifications (idempotently).
 	@if ! command -v git >/dev/null 2>&1; then \
 	  echo "warning: git not found - cannot apply TinyUSB patches in $(TUSB_DIR)." >&2; \
 	else \
@@ -212,6 +212,13 @@ test-unit:
 # committed sources drift from the .proto.
 proto:
 	$(NANOPB) proto/fantasi.proto -I proto -I third_party/nanopb -D proto
+
+# Regenerate Berry's precompiled const tables (third_party/berry/generate/) with
+# its `coc` codegen, from the source + fantasi's berry_conf.h. tests/unit/test_berry_sync
+# guards drift.
+BERRY_DIR := third_party/berry
+berry:
+	python3 $(BERRY_DIR)/tools/coc/coc -o $(BERRY_DIR)/generate $(BERRY_DIR)/src -c $(BERRY_DIR)/berry_conf.h
 
 clean:
 	@if [ "$(PLATFORM)" = "help" ]; then \

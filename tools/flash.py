@@ -143,6 +143,17 @@ def send_serial_cmd(port, cmd):
         os.close(fd)
 
 
+def send_webusb_cmd(cli_bin, cmd):
+    """Send a CLI command over the USB vendor (WebUSB) protobuf transport, for a
+    device that has no CDC port because it's in WebUSB mode (e.g. a switch-mode
+    PM3 a prior CLI session upgraded). This is how `dfu` reaches such a device."""
+    try:
+        subprocess.run([cli_bin, "--usb"], input=f"{cmd}\nexit\n".encode(),
+                       capture_output=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 # Every platform's `device` id, longest first so a short id (FZ) can't shadow a
 # longer one that would contain it. Derived from PLATFORMS so adding a board
 # here is the only place its id needs to live.
@@ -586,19 +597,34 @@ def main():
                  f"flash. Connect only the target device.")
     dfu_dev = dfu_devs[0] if dfu_devs else None
 
-    # Nothing matched: neither a running Fantasi of this platform nor its DFU
-    # device is present. Refuse rather than fall through to a wrong target.
-    if not dfu_dev and not cdc_port:
+    # A running Fantasi may be reachable only over WebUSB (vendor mode) with no
+    # CDC port - e.g. a switch-mode PM3 a prior CLI session upgraded. Note its
+    # presence so we can still enter DFU by sending `dfu` over the vendor pipe.
+    fantasi_present = find_usb_device(USB_VID, USB_PID) is not None
+
+    # Nothing matched: neither a running Fantasi nor its DFU device is present.
+    if not dfu_dev and not cdc_port and not fantasi_present:
         sys.exit(f"error: no {plat} device ({cfg['id']}) found - connect it "
                  f"(running Fantasi or already in DFU) and retry.")
 
-    # The `dfu` CDC command is occasionally missed when sent immediately after a
-    # large MSC write (the device USB stack is still draining), so retry a few
-    # times rather than failing on a single 15 s wait.
+    # Enter the bootloader by sending `dfu`: over CDC when we have a serial port,
+    # otherwise over the WebUSB/vendor transport (the device is in WebUSB mode).
+    # The command is occasionally missed right after a large MSC write (the USB
+    # stack is still draining), so retry a few times.
     if not dfu_dev and cdc_port:
         for attempt in range(3):
             print(f"Sending DFU command via {cdc_port} (attempt {attempt + 1})...")
             send_serial_cmd(cdc_port, "dfu")
+            print(f"Waiting for DFU device ({cfg['dfu_vid']}:{cfg['dfu_pid']})...")
+            dfu_dev = wait_for_usb(cfg["dfu_vid"], cfg["dfu_pid"])
+            if dfu_dev:
+                break
+    elif not dfu_dev and fantasi_present:
+        cli_bin = ensure_cli()
+        for attempt in range(3):
+            print(f"Sending DFU command over WebUSB (attempt {attempt + 1})...")
+            if cli_bin:
+                send_webusb_cmd(cli_bin, "dfu")
             print(f"Waiting for DFU device ({cfg['dfu_vid']}:{cfg['dfu_pid']})...")
             dfu_dev = wait_for_usb(cfg["dfu_vid"], cfg["dfu_pid"])
             if dfu_dev:

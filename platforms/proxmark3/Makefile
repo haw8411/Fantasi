@@ -21,6 +21,7 @@ GIT_HASH := $(shell git rev-parse --short=7 HEAD 2>/dev/null || echo unknown)$(s
 DEFS := -DCFG_TUSB_MCU=OPT_MCU_AT91SAM7S \
         -DFANTASI_ENABLE_MSC \
         -DFANTASI_ENABLE_APPS \
+        -DFANTASI_ENABLE_BERRY \
         -DFANTASI_ENABLE_WEBUSB \
         -DFANTASI_FAT_STORAGE \
         -DLFS_NO_MALLOC \
@@ -46,7 +47,9 @@ INCLUDES := \
     -I$(ROOT)/third_party/FreeRTOS-Kernel/portable/GCC/ARM7_AT91SAM7S \
     -I$(ROOT)/third_party/littlefs \
     -I$(ROOT)/third_party/nanopb \
-    -I$(ROOT)/proto
+    -I$(ROOT)/proto \
+    -I$(ROOT)/third_party/berry \
+    -I$(ROOT)/third_party/berry/src
 
 # ARM mode only for ISR-adjacent code. Core + CLI use ARM by default
 # (safer; Thumb would need -mthumb flag and interwork).
@@ -61,7 +64,9 @@ LDSCRIPT := $(ROOT)/platforms/proxmark3/linker.ld
 LDFLAGS := $(MCU_FLAGS) -T$(LDSCRIPT) \
            -Wl,--gc-sections \
            -Wl,-Map=$(BUILD)/$(TARGET).map \
-           -nostartfiles --specs=nano.specs --specs=nosys.specs
+           -Wl,--wrap=_malloc_r,--wrap=_free_r,--wrap=_calloc_r,--wrap=_realloc_r \
+           -nostartfiles --specs=nano.specs --specs=nosys.specs \
+           -u _printf_float -lm
 
 FRTOS_PORT := $(ROOT)/third_party/FreeRTOS-Kernel/portable/GCC/ARM7_AT91SAM7S
 TUSB_DIR := $(ROOT)/third_party/tinyusb/src
@@ -71,12 +76,14 @@ SRCS_C := \
     $(ROOT)/core/cli.c \
     $(wildcard $(ROOT)/core/commands/*.c) \
     $(ROOT)/core/log.c \
+    $(ROOT)/core/newlib_malloc.c \
     $(ROOT)/platforms/proxmark3/hal.c \
     $(ROOT)/platforms/proxmark3/flash_storage.c \
     $(ROOT)/core/ramfs.c \
     $(ROOT)/core/vfs.c \
     $(ROOT)/core/elf_loader.c \
     $(ROOT)/core/app_run.c \
+    $(ROOT)/core/berry_host.c \
     $(ROOT)/core/usb_proto.c \
     $(ROOT)/core/ble_proto.c \
     $(ROOT)/core/ble_pipe.c \
@@ -94,6 +101,7 @@ SRCS_C := \
     $(TUSB_DIR)/device/usbd_control.c \
     $(TUSB_DIR)/class/cdc/cdc_device.c \
     $(TUSB_DIR)/class/msc/msc_device.c \
+    $(TUSB_DIR)/class/hid/hid_device.c \
     $(TUSB_DIR)/class/vendor/vendor_device.c \
     $(TUSB_DIR)/portable/microchip/at91sam7s/dcd_at91sam7s.c \
     $(ROOT)/third_party/FreeRTOS-Kernel/tasks.c \
@@ -108,6 +116,12 @@ SRCS_C := \
 
 LFS_DIR := $(ROOT)/third_party/littlefs
 SRCS_C += $(LFS_DIR)/lfs.c $(LFS_DIR)/lfs_util.c
+
+# Berry scripting VM. Vendored in third_party/berry/.
+BERRY_DIR := $(ROOT)/third_party/berry
+ifneq (,$(wildcard $(BERRY_DIR)/src/be_vm.c))
+SRCS_C += $(wildcard $(BERRY_DIR)/src/*.c)
+endif
 
 SRCS_S := $(ROOT)/platforms/proxmark3/startup.S
 

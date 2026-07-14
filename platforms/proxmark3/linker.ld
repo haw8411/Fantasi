@@ -2,10 +2,11 @@
  *
  * The PM3 bootloader owns 0x100000-0x102000 and must be preserved -
  * it is the only USB recovery path without a JTAG adapter. We link
- * our app starting at 0x102000, matching the stock `osimage` region.
- * Size is capped at 0x7E000 which is safe for both S256 (0x40000
- * total flash) and S512 (0x80000 total flash); the build will fail
- * at link time rather than silently corrupt the bootloader.
+ * our app at 0x102000. Flash map (S512 only, 0x100000-0x180000):
+ *   0x102000-0x160000  app / osimage (376 KB, LENGTH 0x5E000 below)
+ *   0x160000-0x180000  LittleFS storage (128 KB, see flash_storage.h)
+ * The app is capped below the filesystem so a >256 KB image (with Berry)
+ * can't overlap and corrupt it. An overflow is a link error.
  *
  * RAM starts at 0x200000 but the first 64 bytes are reserved for the
  * ARM exception vector table we copy in at startup (see startup.S
@@ -27,7 +28,7 @@ vectors_size = 0x40;     /* ARM exception table + literal pool */
 commonarea_size = 0x20;  /* PM3 bootloader communication region */
 
 MEMORY {
-    osimage    : ORIGIN = 0x00102000, LENGTH = 0x7E000
+    osimage    : ORIGIN = 0x00102000, LENGTH = 0x5E000   /* ends at 0x160000 = storage base */
     ram_vec    : ORIGIN = 0x00200000, LENGTH = vectors_size
     ram        : ORIGIN = 0x00200000 + vectors_size,
                  LENGTH = 64K - vectors_size - commonarea_size
@@ -44,15 +45,35 @@ SECTIONS {
         KEEP(*(.startos))
     } >osimage :text
 
+    /* Flash-plane ordering: the AT91SAM7S has two 256 KB planes and reads from the
+     * second (>=0x140000) are slower. During enumeration the host must get the USB
+     * descriptors back within the ~170us xhci SETUP window, so they have to stay in
+     * the fast first plane. Once Berry is linked (~90 KB of const tables) the image
+     * exceeds 256 KB, so force usb_descriptors' code+rodata to the very front to
+     * keep it in plane 0 - otherwise it exceeds 0x140000 and enumeration fails with
+     * EPROTO. Everything after it may land in plane 1, which is fine for Berry (only
+     * touched at script runtime). */
     .text : {
+        *usb_descriptors.o(.rodata .rodata.* .text .text.*)
+        . = ALIGN(4);
         *(.text .text.*)
         *(.glue_7) *(.glue_7t)
         *(.eh_frame)
+        *(.rodata .rodata.*)
         . = ALIGN(4);
     } >osimage :text
 
-    .rodata : {
-        *(.rodata .rodata.*)
+    /* ARM exception unwind tables. Pulled in by libm / _printf_float (unwind-arm.c
+     * references __exidx_start/__exidx_end); without these the link fails. */
+    .ARM.extab : {
+        *(.ARM.extab* .gnu.linkonce.armextab.*)
+        . = ALIGN(4);
+    } >osimage :text
+
+    .ARM.exidx : {
+        __exidx_start = .;
+        *(.ARM.exidx* .gnu.linkonce.armexidx.*)
+        __exidx_end = .;
         . = ALIGN(4);
     } >osimage :text
 
@@ -74,7 +95,10 @@ SECTIONS {
         *(.bss .bss.*) *(COMMON)
         . = ALIGN(4);
         __bss_end__ = .;
-        end = .;                    /* newlib _sbrk anchor (unused; no malloc) */
+        end = .;                    /* _sbrk anchor. The ._user_heap region below
+                                     * is the FreeRTOS app heap: ucHeap is aliased
+                                     * onto __heap_start__ and newlib malloc is
+                                     * wrapped onto it, so _sbrk stays unused. */
         PROVIDE(_end = .);
     } >ram AT>ram :bss
 

@@ -250,6 +250,19 @@ void hal_init(void)
 
     hal_storage_init();
 
+    /* Apply the USB interface toggles before USB comes up so the device
+     * enumerates correctly the first time (no boot re-enumeration). Defaults
+     * (missing keys): HID persistent, MSC on. */
+    {
+        char hv[12] = "persistent";
+        hal_settings_get("hid", hv, sizeof(hv));
+        hal_hid_set_persistent(strcmp(hv, "switch") != 0);
+
+        char mv[4] = "1";
+        hal_settings_get("msc", mv, sizeof(mv));
+        hal_msc_set_enabled(mv[0] != '0');
+    }
+
     tusb_init();
 
     display_init();
@@ -455,6 +468,83 @@ int hal_enter_msc_mode(void) { return -1; }
 int hal_enter_webusb_mode(void) { return -1; }
 int hal_enter_cdc_mode(void) { return -1; }
 
+/* ---- USB HID keyboard emulation ----
+ * Two modes, selected by the `hid` setting (state in usb_descriptors.c):
+ *   persistent (default): the keyboard is always enumerated with CDC/MSC/vendor,
+ *     so nothing re-enumerates - enable is a readiness wait, disable releases
+ *     held keys.
+ *   switch: the keyboard appears only while armed, so enable/disable each
+ *     re-enumerate the bus (CDC blips). Stealthier at rest; opt-in per device. */
+void    usb_desc_set_hid_persistent(bool on);
+bool    usb_desc_hid_persistent(void);
+void    usb_desc_set_hid_active(bool on);
+bool    usb_desc_hid_active(void);
+uint8_t usb_desc_hid_host_leds(void);
+void    usb_desc_set_msc_enabled(bool on);
+
+static void hid_release_keys(void)
+{
+    uint8_t empty[6] = { 0 };
+    if (tud_hid_ready()) tud_hid_keyboard_report(0, 0, empty);
+}
+
+int hal_hid_enable(int on)
+{
+    if (usb_desc_hid_persistent()) {
+        if (!on) { hid_release_keys(); return 0; }
+    } else {
+        /* Switch mode: add/remove the interface and re-enumerate. */
+        if ((bool)on != usb_desc_hid_active()) {
+            if (!on) hid_release_keys();
+            usb_desc_set_hid_active(on);
+            hal_usb_reenumerate();
+        }
+        if (!on) return 0;
+    }
+
+    /* Wait for a host to have (re)enumerated and mounted the keyboard. */
+    for (int i = 0; i < 3000; i++) {
+        if (tud_mounted() && tud_hid_ready()) return 0;
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    return tud_mounted() ? 0 : -1;
+}
+
+int hal_hid_send(uint8_t modifiers, const uint8_t *keys, uint8_t n)
+{
+    if (!tud_mounted()) return -1;
+
+    uint8_t report[6] = { 0 };
+    for (uint8_t i = 0; i < n && i < 6; i++) report[i] = keys[i];
+
+    /* Wait for the previous report to drain off the interrupt IN endpoint. */
+    for (int i = 0; i < 200 && !tud_hid_ready(); i++) vTaskDelay(pdMS_TO_TICKS(1));
+    if (!tud_hid_ready()) return -1;
+
+    return tud_hid_keyboard_report(0, modifiers, report) ? 0 : -1;
+}
+
+uint32_t hal_hid_host(void)
+{
+    uint32_t bits = usb_desc_hid_host_leds();
+    if (tud_mounted()) bits |= FANTASI_HID_HOST_MOUNTED;
+    return bits;
+}
+
+/* Apply the persistent/switch mode. In switch mode the keyboard must start
+ * absent (armed only on demand); persistent keeps it present. Called at boot
+ * (before enumeration) and on a live settings change. */
+void hal_hid_set_persistent(bool persistent)
+{
+    usb_desc_set_hid_persistent(persistent);
+    if (!persistent) usb_desc_set_hid_active(false);
+}
+
+void hal_msc_set_enabled(bool enabled)
+{
+    usb_desc_set_msc_enabled(enabled);
+}
+
 /* ---- memory region reporting ---- */
 
 extern uint8_t _ram1_start, _ram1_end;
@@ -482,10 +572,12 @@ int hal_mem_regions(hal_mem_region_t *out, int max)
     int n = 0;
 
     if (n < max) {
-        uint32_t unalloc = (uint32_t)&__heap_end__ - (uint32_t)&__heap_start__;
+        /* The FreeRTOS heap spans all free SRAM1 (ucHeap is aliased onto the
+         * linker heap region), so free SRAM1 is the free heap - there is no
+         * separate unallocated newlib arena to add in. */
         out[n].name  = "SRAM1";
         out[n].total = (uint32_t)&_ram1_end - (uint32_t)&_ram1_start;
-        out[n].free  = (uint32_t)hal_free_heap_bytes() + unalloc;
+        out[n].free  = (uint32_t)hal_free_heap_bytes();
         out[n].note  = NULL;
         n++;
     }
@@ -513,13 +605,9 @@ int hal_test_regions(hal_test_region_t *out, int max)
 {
     int n = 0;
 
-    if (n < max) {
-        out[n].name = "SRAM1";
-        out[n].addr = (uint32_t)&__heap_start__;
-        out[n].size = (uint32_t)&__heap_end__ - (uint32_t)&__heap_start__;
-        n++;
-    }
-
+    /* SRAM1: the heap region (__heap_start__..__heap_end__) contains live
+     * FreeRTOS allocations, so writing test patterns over it would corrupt
+     * them. Only the idle SRAM2b shared zone is tested. */
     if (n < max) {
         out[n].name = "SRAM2b";
         out[n].addr = SRAM2B_BASE;

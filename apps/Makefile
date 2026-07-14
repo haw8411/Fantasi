@@ -22,7 +22,8 @@ LD    := $(CROSS)ld
 # address references (data and calls) through relocated literals, so the loader
 # only ever sees R_ARM_ABS32 (plus R_ARM_V4BX on ARMv4T, which it ignores).
 COMMON := -Os -ffreestanding -fno-common -mword-relocations -mlong-calls \
-          -ffunction-sections -fdata-sections -nostdlib -Wall -I$(ROOT)/apps
+          -ffunction-sections -fdata-sections -nostdlib -Wall -I$(ROOT)/apps \
+          -I$(ROOT)/third_party/berry -I$(ROOT)/third_party/berry/src
 
 # Per-core flags. Cortex-M is Thumb-2 + hard FP; ARM7TDMI is ARM-mode + interwork.
 CM4_FLAGS  := -mcpu=cortex-m4 -mthumb -mfloat-abi=hard -mfpu=fpv4-sp-d16

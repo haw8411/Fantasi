@@ -43,7 +43,7 @@ _arm_start:
      * The FIRST IRQ (FreeRTOS's 1 ms PIT tick) pushes onto IRQ-banked
      * SP → writes to unmapped memory → data abort → spin in
      * __fantasi_unhandled. USB enumeration starts briefly before the
-     * first tick fires, which is why we saw "enumerate OK then die".
+     * first tick fires.
      *
      * Carve the top of the ram region into four sub-stacks. FIQ /
      * Abort / Undefined are only needed for fault safety but cost 64
@@ -82,6 +82,19 @@ _arm_start:
      * table in SRAM. */
     ldr     r0, =0xFFFFFF00
     mov     r1, #1
+    str     r1, [r0]
+
+    /* Configure the SECOND flash plane's wait states (EFC1). The AT91SAM7S512
+     * has two 256 KB planes, each with its own MC Flash Mode Register: EFC0 at
+     * 0xFFFFFF60 (plane 0) and EFC1 at 0xFFFFFF70 (plane 1). The PM3 bootloader
+     * only sets EFC0 - firmware images below 256 KB fit entirely in plane 0.
+     * A firmware >256 KB (Fantasi with Berry linked) places code and data
+     * above 0x140000, so give EFC1 the same FMCN/FWS as EFC0 rather than relying
+     * on its reset default. (A time-critical method for USB enumeration is the
+     * linker keeping the descriptors in plane 0 - see linker.ld.) */
+    ldr     r0, =0xFFFFFF60         @ AT91C_EFC0_FMR (plane 0, set by bootloader)
+    ldr     r1, [r0]
+    ldr     r0, =0xFFFFFF70         @ AT91C_EFC1_FMR (plane 1)
     str     r1, [r0]
 
     /* Copy .data from LMA (flash) to VMA (RAM). Symbols come from the

@@ -16,6 +16,8 @@ typedef struct _FileWriteChunk {
     uint32_t offset;
     FileWriteChunk_data_t data;
     bool last;
+    bool has_total;
+    uint32_t total; /* full file size hint; lets ramfs reserve once */
 } FileWriteChunk;
 
 typedef struct _FileReadRequest {
@@ -86,7 +88,7 @@ extern "C" {
 /* Initializer values for message structs */
 #define CliRequest_init_default                  {0, 0, {""}}
 #define CliResponse_init_default                 {0, 0, 0, {""}}
-#define FileWriteChunk_init_default              {"", 0, {0, {0}}, 0}
+#define FileWriteChunk_init_default              {"", 0, {0, {0}}, 0, false, 0}
 #define FileReadRequest_init_default             {"", 0, 0}
 #define FileReadChunk_init_default               {0, {0, {0}}, 0}
 #define ErrorResponse_init_default               {""}
@@ -96,7 +98,7 @@ extern "C" {
 #define MkdirRequest_init_default                {""}
 #define CliRequest_init_zero                     {0, 0, {""}}
 #define CliResponse_init_zero                    {0, 0, 0, {""}}
-#define FileWriteChunk_init_zero                 {"", 0, {0, {0}}, 0}
+#define FileWriteChunk_init_zero                 {"", 0, {0, {0}}, 0, false, 0}
 #define FileReadRequest_init_zero                {"", 0, 0}
 #define FileReadChunk_init_zero                  {0, {0, {0}}, 0}
 #define ErrorResponse_init_zero                  {""}
@@ -110,6 +112,7 @@ extern "C" {
 #define FileWriteChunk_offset_tag                2
 #define FileWriteChunk_data_tag                  3
 #define FileWriteChunk_last_tag                  4
+#define FileWriteChunk_total_tag                 5
 #define FileReadRequest_path_tag                 1
 #define FileReadRequest_offset_tag               2
 #define FileReadRequest_size_tag                 3
@@ -171,7 +174,8 @@ X(a, STATIC,   ONEOF,    MESSAGE,  (payload,dir_entry,payload.dir_entry),   6)
 X(a, STATIC,   REQUIRED, STRING,   path,              1) \
 X(a, STATIC,   REQUIRED, UINT32,   offset,            2) \
 X(a, STATIC,   REQUIRED, BYTES,    data,              3) \
-X(a, STATIC,   REQUIRED, BOOL,     last,              4)
+X(a, STATIC,   REQUIRED, BOOL,     last,              4) \
+X(a, STATIC,   OPTIONAL, UINT32,   total,             5)
 #define FileWriteChunk_CALLBACK NULL
 #define FileWriteChunk_DEFAULT NULL
 
@@ -240,7 +244,7 @@ extern const pb_msgdesc_t MkdirRequest_msg;
 #define MkdirRequest_fields &MkdirRequest_msg
 
 /* Maximum encoded size of messages (where known) */
-#define CliRequest_size                          597
+#define CliRequest_size                          603
 #define CliResponse_size                         534
 #define DirEntry_size                            73
 #define DirListRequest_size                      65
@@ -249,7 +253,7 @@ extern const pb_msgdesc_t MkdirRequest_msg;
 #define FileDeleteRequest_size                   65
 #define FileReadChunk_size                       523
 #define FileReadRequest_size                     77
-#define FileWriteChunk_size                      588
+#define FileWriteChunk_size                      594
 #define MkdirRequest_size                        65
 
 #ifdef __cplusplus

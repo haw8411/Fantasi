@@ -14,9 +14,14 @@
 /* Endpoint 0 size - 64 works on all USB-FS peripherals we target. */
 #define CFG_TUD_ENDPOINT0_SIZE  64
 
-/* Enable only the CDC class. More can be added later. */
+/* CDC (the CLI) is always enumerated. HID is the BadUSB keyboard: compiled in and
+ * enumerated by default (persistent mode), staying inert until an app drives it.
+ * The opt-in `hid=switch` setting instead adds/removes the HID interface on the
+ * fly, so it only appears while a payload has it armed (the config descriptor is
+ * assembled per-enumeration in usb_descriptors.c). */
 #define CFG_TUD_CDC             1
-#define CFG_TUD_HID             0
+#define CFG_TUD_HID             1
+#define CFG_TUD_HID_EP_BUFSIZE  16
 #define CFG_TUD_MIDI            0
 
 /* Vendor interface carries the protobuf transport (WebUSB). Always present on

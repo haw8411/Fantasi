@@ -3,7 +3,8 @@
  * Files are stored verbatim in contiguous heap buffers (no wear-leveling, no
  * block structure), so an uploaded image is already a contiguous in-RAM blob the
  * app loader can read directly. The store grows and shrinks with its contents:
- * each file's buffer is sized exactly to the file, and removing a file frees it.
+ * a file's buffer is sized to the file (or to a reserved capacity, see
+ * ramfs_reserve), and removing a file frees it.
  * It is flat (no subdirectories) and empty at boot. Names are leaf names (the
  * VFS strips the "/ramfs/" prefix) and may not contain spaces or slashes. */
 #ifndef CORE_RAMFS_H
@@ -24,6 +25,12 @@ int      ramfs_truncate(const char *name);
  * gap) as needed. Creates the file if absent. Returns 0 on success, -1 on OOM or
  * a full table. */
 int      ramfs_write_at(const char *name, uint32_t off, const void *data, uint32_t len);
+
+/* Pre-grow a file's buffer to `cap` bytes without changing its logical size,
+ * creating it if absent. A following write sequence up to `cap` then needs no
+ * per-chunk reallocation - one allocation instead of a grow-by-copy that would
+ * need ~2x the file live at once. Returns 0, -1 on OOM or a full table. */
+int      ramfs_reserve(const char *name, uint32_t cap);
 
 /* Copy up to len bytes from off into buf. Returns bytes copied, or -1 if absent. */
 int32_t  ramfs_read(const char *name, uint32_t off, void *buf, uint32_t len);

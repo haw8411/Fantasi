@@ -39,12 +39,28 @@ size_t hal_min_ever_free_heap_bytes(void)
     return (size_t)xPortGetMinimumEverFreeHeapSize();
 }
 
+/* Set by hal_usb_reenumerate() when a descriptor change (switch-mode HID arming,
+ * or an hid persistent/switch mode change) needs the host to re-read the config.
+ * The USB task performs the actual bus bounce. */
+static volatile bool s_reenum_req;
+
+void hal_usb_reenumerate(void)
+{
+    s_reenum_req = true;
+}
+
 /* The USB device task that core/main.c creates via the weak symbol. */
 void platform_usb_task(void *arg)
 {
     (void)arg;
     for (;;) {
         tud_task();
+        if (s_reenum_req) {
+            s_reenum_req = false;
+            tud_disconnect();
+            vTaskDelay(pdMS_TO_TICKS(300));
+            tud_connect();
+        }
         /* Yield so lower-priority tasks (the CLI) can run. tud_task()
          * is already event-driven internally. */
         vTaskDelay(pdMS_TO_TICKS(1));

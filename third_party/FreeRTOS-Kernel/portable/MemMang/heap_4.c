@@ -85,9 +85,13 @@
 /* Allocate the memory for the heap. */
 #if ( configAPPLICATION_ALLOCATED_HEAP == 1 )
 
-/* The application writer has already defined the array used for the RTOS
-* heap - probably so it can be placed in a special segment or address. */
-    extern uint8_t ucHeap[ configTOTAL_HEAP_SIZE ];
+/* Fantasi: alias ucHeap onto the linker heap region (__heap_start__, declared
+ * in FreeRTOSConfig.h) instead of a fixed-size array. The heap then spans every
+ * byte between the end of .bss and the stack - configTOTAL_HEAP_SIZE is that
+ * span, computed at runtime - so nothing is stranded, and newlib malloc (wrapped
+ * onto this same heap) needs no separate arena. ucHeap is only ever used as a
+ * base pointer below, so a pointer works in place of the array. */
+    uint8_t * ucHeap = &__heap_start__;
 #else
     PRIVILEGED_DATA static uint8_t ucHeap[ configTOTAL_HEAP_SIZE ];
 #endif /* configAPPLICATION_ALLOCATED_HEAP */

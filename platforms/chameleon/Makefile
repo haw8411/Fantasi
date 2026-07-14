@@ -26,6 +26,7 @@ DEFS := -DNRF52840_XXAA \
         -DFANTASI_ENABLE_PWR_BUTTON \
         -DFANTASI_FAT_STORAGE \
         -DLFS_NO_MALLOC \
+        -DLFS_NO_DEBUG -DLFS_NO_WARN -DLFS_NO_ERROR \
         -DFANTASI_GIT_HASH=\"$(GIT_HASH)\"
 
 INCLUDES := \
@@ -49,15 +50,16 @@ INCLUDES := \
 CFLAGS := $(MCU_FLAGS) $(DEFS) $(INCLUDES) \
           -Os -ffunction-sections -fdata-sections -fno-common \
           -Wall -Wextra -Wno-unused-parameter \
-          -std=gnu11 -g3
+          -std=gnu11 -g3 \
+          --specs=picolibc.specs
 
 LDSCRIPT := $(ROOT)/platforms/chameleon/linker.ld
 LDFLAGS := $(MCU_FLAGS) -T$(LDSCRIPT) \
            -Wl,--gc-sections \
            -Wl,-Map=$(BUILD)/$(TARGET).map \
-           -Wl,--wrap=_malloc_r,--wrap=_free_r,--wrap=_calloc_r,--wrap=_realloc_r \
-           -nostartfiles --specs=nano.specs --specs=nosys.specs \
-           -u _printf_float -lm
+           -Wl,--wrap=malloc,--wrap=free,--wrap=calloc,--wrap=realloc \
+           -Wl,--defsym=vfprintf=__d_vfprintf -Wl,--defsym=vfscanf=__d_vfscanf \
+           -nostartfiles --specs=picolibc.specs
 
 SRCS := \
     $(ROOT)/core/main.c \
@@ -71,7 +73,7 @@ SRCS := \
     $(ROOT)/core/elf_loader.c \
     $(ROOT)/core/app_run.c \
     $(ROOT)/core/log.c \
-    $(ROOT)/core/newlib_malloc.c \
+    $(ROOT)/core/libc_glue.c \
     $(ROOT)/core/berry_host.c \
     $(ROOT)/platforms/chameleon/startup.c \
     $(ROOT)/platforms/chameleon/system.c \

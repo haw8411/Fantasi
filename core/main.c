@@ -125,7 +125,7 @@ int main(void)
 }
 
 /* FreeRTOS hooks referenced by configASSERT / stack-check / heap-fail.
- * Reset on failure so the device self-recovers instead of hard-wedging
+ * Reset on failure so the device self-recovers instead of hard-stalling
  * (a spin here needs a physical power-cycle). Platforms provide
  * fantasi_reset(); the weak fallback spins for platforms that don't. */
 __attribute__((weak)) void fantasi_reset(void) { for (;;); }

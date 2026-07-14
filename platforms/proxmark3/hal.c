@@ -443,7 +443,7 @@ int hal_mem_regions(hal_mem_region_t *out, int max)
     if (n < max) {
         /* The FreeRTOS heap spans all free RAM (ucHeap is aliased onto the linker
          * heap region), so free RAM is the free heap - there is no separate
-         * unallocated newlib arena to add in. */
+         * unallocated libc arena to add in. */
         out[n].name  = "RAM";
         out[n].total = (uint32_t)&_ram_end - (uint32_t)&_ram_start;
         out[n].free  = (uint32_t)hal_free_heap_bytes();
@@ -566,6 +566,16 @@ static void pm3_reset_now(void)
 }
 
 void hal_reboot(void)
+{
+    pm3_reset_now();
+}
+
+/* Strong fantasi_reset() for the PM3; the weak core/main.c fallback only spins.
+ * libc_glue.c routes assert()/_exit() here and LFS_ASSERT is live on the PM3, so
+ * this must actually reset the part: a spin would hang the faulting task with the
+ * filesystem left mid-operation, recoverable only by a physical replug. The
+ * Cortex-M platforms define theirs in startup.c. */
+void fantasi_reset(void)
 {
     pm3_reset_now();
 }

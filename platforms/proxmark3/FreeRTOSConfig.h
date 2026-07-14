@@ -21,9 +21,9 @@
 /* Elastic app heap. ucHeap (heap_4.c) is aliased onto the linker ._user_heap
  * region, and this size is its runtime span - end of .bss to the stack - so the
  * FreeRTOS heap uses every free byte of the 64 KB SRAM with nothing stranded.
- * newlib malloc - including float  * printf's dtoa - is wrapped onto this same
- * heap (core/newlib_malloc.c + the --wrap flags in the Makefile), so there is
- * no separate newlib _sbrk arena. */
+ * libc malloc - including float printf's conversion buffers - is wrapped onto
+ * this same heap (core/libc_glue.c + the --wrap flags in the Makefile), so there
+ * is no separate arena. */
 #ifndef __ASSEMBLER__
 extern unsigned char __heap_start__, __heap_end__;   /* linker heap region bounds */
 #endif

@@ -99,7 +99,7 @@ SECTIONS {
         __bss_end__ = .;
         end = .;                    /* _sbrk anchor. The ._user_heap_stack region
                                      * below is the FreeRTOS app heap: ucHeap is
-                                     * aliased onto __heap_start__ and newlib malloc
+                                     * aliased onto __heap_start__ and libc malloc
                                      * is wrapped onto it, so _sbrk stays unused. */
         PROVIDE(_end = .);
     } >RAM
@@ -115,3 +115,9 @@ SECTIONS {
 
     /DISCARD/ : { *(.ARM.attributes) *(.comment) *(.note.GNU-stack) }
 }
+
+/* The picolibc TLS segment (errno, rand state, localtime buffer) must fit in
+ * core/libc_glue.c's fantasi_tls_block[128] minus the 8-byte ARM EABI TCB. Fail
+ * the build if a new TLS consumer outgrows it instead of corrupting .bss. */
+ASSERT(SIZEOF(.tdata) + SIZEOF(.tbss) <= 120,
+       "picolibc TLS segment exceeds fantasi_tls_block (core/libc_glue.c)")

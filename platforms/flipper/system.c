@@ -1,40 +1,28 @@
 /* Fantasi / Flipper Zero (STM32WB55) system bring-up
  *
- * Minimal clock config: switch SYSCLK from MSI (4 MHz default) to
- * HSI16 (16 MHz internal RC), turn on HSI48 for the USB 48 MHz
- * domain, and let the CRS peripheral trim HSI48 against the USB SOF.
- * No HSE, no PLL, no voltage-scaling change - 16 MHz is the ceiling
- * for VOS Range 2, so we stay in reset-default low-power mode and
- * can't mis-sequence a speed/VOS dependency.
+ * Clock config: switch SYSCLK from MSI (4 MHz default) to the 32 MHz HSE
+ * crystal, turn on HSI48 for the USB 48 MHz domain, and let CRS trim HSI48
+ * against the USB SOF.
  *
- * Why 16 MHz and not 4: the USB peripheral accesses its PMA via the
- * AHB bus at SYSCLK frequency. At 4 MHz AHB can't keep up with the
- * 12 Mbps FS packet rate - USB_ISTR raises PMAOVR on every packet
- * and enumeration stalls before SET_ADDRESS.
+ * Why HSE 32 MHz: the CPU2 wireless stack switches SYSCLK to HSE when BLE comes
+ * up, so CPU1 owns HSE here, before the scheduler sizes SysTick, to keep one
+ * constant frequency that configCPU_CLOCK_HZ matches. CPU2's later switch is then
+ * a no-op, and the FreeRTOS tick stays a true 1 kHz.
  *
- * Why not HSE+PLL (what the stock Flipper firmware does for 64 MHz):
- * that path needs HSE cap-tuning, VOS Range 1, flash latency 3WS,
- * and PLLSAI1 - every one of which has to be right before the first
- * instruction after the PLL switch. For a CLI we don't need the
- * speed, and fewer sequencing dependencies = less to go wrong on
- * bring-up. CRS on the SOF pulse brings HSI48 inside USB-FS spec
- * (±0.25%) so enumeration is reliable.
+ * Sequence raises voltage and latency before frequency: VOS Range 1 (the reset
+ * default; Range 2 caps at 16 MHz), flash 1 WS (needed 18-36 MHz), HSE with the
+ * Flipper's 0x26 cap-tune, then switch SYSCLK. USB is on the separate HSI48
+ * domain, and CRS on the SOF pulse trims it inside USB-FS spec.
  *
- * If you later need 64 MHz: enable PWR, set VOS Range 1 + wait for
- * VOSF, set flash 3WS, start HSE (HSECR cap-tune 0x26), bring up
- * PLL, then switch SYSCLK. Nothing here precludes that. */
+ * 32 MHz needs no PLL; the stock 64 MHz path (HSE+PLL) would add flash 3WS and
+ * PLLSAI1 sequencing for speed a CLI does not need. */
 
 #include "stm32wbxx.h"
 
 #include <stdint.h>
 
-/* SYSCLK is HSI16 (16 MHz internal RC). FreeRTOSConfig.h's
- * configCPU_CLOCK_HZ must match. MSI (4 MHz default) is too slow for
- * the USB peripheral's PMA access over AHB - we hit PMAOVR errors
- * during enumeration. 16 MHz is the minimum reliable SYSCLK for
- * STM32WB USB FS and stays within VOS Range 2, so no voltage
- * scaling change is needed. */
-uint32_t SystemCoreClock = 16000000u;
+/* SYSCLK is the 32 MHz HSE crystal; configCPU_CLOCK_HZ must match it. */
+uint32_t SystemCoreClock = 32000000u;
 
 void SystemInit(void)
 {
@@ -42,17 +30,24 @@ void SystemInit(void)
     SCB->CPACR |= ((3U << (10*2)) | (3U << (11*2)));
     __DSB(); __ISB();
 
-    /* Start HSI16 (internal 16 MHz RC). After reset HSION is already
-     * set and HSI16 is ready, but we explicitly (re)enable and wait
-     * to keep the sequence explicit. */
-    RCC->CR |= RCC_CR_HSION;
-    while ((RCC->CR & RCC_CR_HSIRDY) == 0) { }
+    /* Make the 32 MHz HSE the SYSCLK (the comment in the header above covers why
+     * HSE). Order is load-bearing: raise voltage (VOS Range 1) and flash latency
+     * (1 WS) before the frequency, then enable HSE with the Flipper's 0x26
+     * cap-tune and switch. */
+    PWR->CR1 = (PWR->CR1 & ~PWR_CR1_VOS) | (1U << PWR_CR1_VOS_Pos);
+    while (PWR->SR2 & PWR_SR2_VOSF) { }
 
-    /* Switch SYSCLK from MSI to HSI16 (SW field = 0b01). */
-    RCC->CFGR = (RCC->CFGR & ~RCC_CFGR_SW) | (1U << RCC_CFGR_SW_Pos);
-    while (((RCC->CFGR & RCC_CFGR_SWS) >> RCC_CFGR_SWS_Pos) != 1U) { }
+    FLASH->ACR = (FLASH->ACR & ~FLASH_ACR_LATENCY) | FLASH_ACR_LATENCY_1WS;
+    while ((FLASH->ACR & FLASH_ACR_LATENCY) != FLASH_ACR_LATENCY_1WS) { }
 
-    /* Flash: 0 wait states is fine up to 18 MHz in Range 2. No change needed. */
+    RCC->HSECR = (RCC->HSECR & ~RCC_HSECR_HSETUNE_Msk)
+               | (0x26U << RCC_HSECR_HSETUNE_Pos);
+    RCC->CR |= RCC_CR_HSEON;
+    while ((RCC->CR & RCC_CR_HSERDY) == 0) { }
+
+    /* Switch SYSCLK from MSI to HSE (SW field = 0b10). */
+    RCC->CFGR = (RCC->CFGR & ~RCC_CFGR_SW) | (2U << RCC_CFGR_SW_Pos);
+    while (((RCC->CFGR & RCC_CFGR_SWS) >> RCC_CFGR_SWS_Pos) != 2U) { }
 
     /* Start HSI48 (internal 48 MHz RC dedicated to USB/RNG). */
     RCC->CRRCR |= RCC_CRRCR_HSI48ON;
@@ -83,5 +78,5 @@ void SystemInit(void)
               | (0x2U    << CRS_CFGR_SYNCSRC_Pos);   /* 0b10 = USB SOF */
     CRS->CR |= CRS_CR_AUTOTRIMEN | CRS_CR_CEN;
 
-    SystemCoreClock = 16000000u;
+    SystemCoreClock = 32000000u;
 }

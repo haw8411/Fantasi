@@ -458,7 +458,7 @@ int hal_mem_regions(hal_mem_region_t *out, int max)
     if (n < max) {
         /* The FreeRTOS heap spans all app RAM (ucHeap is aliased onto the linker
          * heap region), so free RAM is the free heap - there is no separate
-         * unallocated newlib arena to add in. */
+         * unallocated libc arena to add in. */
         out[n].name  = "RAM";
         out[n].total = (uint32_t)&_ram_end - (uint32_t)&_ram_start;
         out[n].free  = (uint32_t)hal_free_heap_bytes();

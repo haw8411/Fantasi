@@ -50,6 +50,12 @@ LFS_MARKER  := $(LFS_DIR)/lfs.c
 # lives elsewhere: `make proto NANOPB=/path/to/nanopb_generator`.
 NANOPB ?= nanopb_generator
 
+# Cross-toolchain prefix. Matches the platform Makefiles' default; override to
+# point at a specific install, e.g. `make flash CROSS=/usr/bin/arm-none-eabi-`.
+# check-toolchain validates this toolchain, so the check tracks what actually
+# builds/flashes.
+CROSS ?= arm-none-eabi-
+
 .PHONY: all cli app launch flash storage test test-unit proto berry clean help $(PLATFORM) check-tinyusb check-littlefs check-toolchain
 
 all:
@@ -65,10 +71,17 @@ all:
 	fi
 
 check-toolchain:
-	@if ! command -v arm-none-eabi-gcc >/dev/null 2>&1; then \
-	  echo "error: arm-none-eabi-gcc not on PATH." >&2; \
-	  echo "  Debian/Ubuntu:  sudo apt install gcc-arm-none-eabi" >&2; \
-	  echo "  Or download:    https://developer.arm.com/downloads/-/arm-gnu-toolchain-downloads" >&2; \
+	@if ! command -v $(CROSS)gcc >/dev/null 2>&1; then \
+	  echo "error: $(CROSS)gcc not on PATH." >&2; \
+	  echo "  Debian/Ubuntu:  sudo apt install gcc-arm-none-eabi picolibc-arm-none-eabi" >&2; \
+	  echo "  Or set CROSS=/path/to/arm-none-eabi- to point at a specific install." >&2; \
+	  exit 1; \
+	fi
+	@if ! $(CROSS)gcc --specs=picolibc.specs -E - </dev/null >/dev/null 2>&1; then \
+	  echo "error: $(CROSS)gcc has no picolibc.specs (the firmware links picolibc)." >&2; \
+	  echo "  Debian/Ubuntu:  sudo apt install picolibc-arm-none-eabi" >&2; \
+	  echo "  Note: the upstream Arm GNU Toolchain tarball does not bundle picolibc - use the distro" >&2; \
+	  echo "  packages, or point CROSS at a picolibc-capable toolchain." >&2; \
 	  exit 1; \
 	fi
 

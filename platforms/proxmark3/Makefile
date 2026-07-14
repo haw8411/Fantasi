@@ -25,6 +25,7 @@ DEFS := -DCFG_TUSB_MCU=OPT_MCU_AT91SAM7S \
         -DFANTASI_ENABLE_WEBUSB \
         -DFANTASI_FAT_STORAGE \
         -DLFS_NO_MALLOC \
+        -DLFS_NO_DEBUG -DLFS_NO_WARN -DLFS_NO_ERROR \
         -DFANTASI_GIT_HASH=\"$(GIT_HASH)\" \
         -DCLI_TASK_STACK=1024 \
         -DUSB_TASK_STACK=512 \
@@ -56,7 +57,8 @@ INCLUDES := \
 CFLAGS := $(MCU_FLAGS) $(DEFS) $(INCLUDES) \
           -Os -ffunction-sections -fdata-sections -fno-common \
           -Wall -Wextra -Wno-unused-parameter \
-          -std=gnu11 -g3
+          -std=gnu11 -g3 \
+          --specs=picolibc.specs
 
 ASFLAGS := $(MCU_FLAGS) -g3
 
@@ -64,9 +66,9 @@ LDSCRIPT := $(ROOT)/platforms/proxmark3/linker.ld
 LDFLAGS := $(MCU_FLAGS) -T$(LDSCRIPT) \
            -Wl,--gc-sections \
            -Wl,-Map=$(BUILD)/$(TARGET).map \
-           -Wl,--wrap=_malloc_r,--wrap=_free_r,--wrap=_calloc_r,--wrap=_realloc_r \
-           -nostartfiles --specs=nano.specs --specs=nosys.specs \
-           -u _printf_float -lm
+           -Wl,--wrap=malloc,--wrap=free,--wrap=calloc,--wrap=realloc \
+           -Wl,--defsym=vfprintf=__d_vfprintf -Wl,--defsym=vfscanf=__d_vfscanf \
+           -nostartfiles --specs=picolibc.specs
 
 FRTOS_PORT := $(ROOT)/third_party/FreeRTOS-Kernel/portable/GCC/ARM7_AT91SAM7S
 TUSB_DIR := $(ROOT)/third_party/tinyusb/src
@@ -76,7 +78,7 @@ SRCS_C := \
     $(ROOT)/core/cli.c \
     $(wildcard $(ROOT)/core/commands/*.c) \
     $(ROOT)/core/log.c \
-    $(ROOT)/core/newlib_malloc.c \
+    $(ROOT)/core/libc_glue.c \
     $(ROOT)/platforms/proxmark3/hal.c \
     $(ROOT)/platforms/proxmark3/flash_storage.c \
     $(ROOT)/core/ramfs.c \

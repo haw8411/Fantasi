@@ -10,10 +10,11 @@
 #define configMINIMAL_STACK_SIZE        ((unsigned short)128)
 /* Elastic app heap. ucHeap (heap_4.c) is aliased onto the linker heap region,
  * and this size is its runtime span - end of .bss to the stack - so the FreeRTOS
- * heap uses all app RAM above the SoftDevice with nothing stranded. newlib malloc
- * (float printf's dtoa) is wrapped onto this same heap (core/newlib_malloc.c + the
- * --wrap flags in the Makefile), so there is no separate newlib arena. The heap
- * grows at the top of RAM, away from the SoftDevice's reservation at the bottom. */
+ * heap uses all app RAM above the SoftDevice with nothing stranded. libc malloc
+ * (float printf's conversion buffers) is wrapped onto this same heap
+ * (core/libc_glue.c + the --wrap flags in the Makefile), so there is no separate
+ * arena. The heap grows at the top of RAM, away from the SoftDevice's reservation
+ * at the bottom. */
 #ifndef __ASSEMBLER__
 extern unsigned char __heap_start__, __heap_end__;   /* linker heap region bounds */
 #endif

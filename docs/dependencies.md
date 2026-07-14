@@ -12,7 +12,8 @@ Debian/Ubuntu box. Versions other than the pinned ones below are usually fine.
 
 | Dependency | Required | Verified | Purpose / install |
 |---|---|---|---|
-| `arm-none-eabi-gcc` + binutils | yes | Arm GNU Toolchain **14.3.Rel1** (gcc 14.3.1) | Cross-compiler for all four firmwares. Install via `sudo apt install gcc-arm-none-eabi`, or download the upstream [Arm GNU Toolchain](https://developer.arm.com/downloads/-/arm-gnu-toolchain-downloads) and put its `bin/` on your `PATH`. `make` checks for it (`check-toolchain`). |
+| `arm-none-eabi-gcc` + binutils | yes | Debian `gcc-arm-none-eabi` **14.2.1** (15:14.2.rel1-1) | Cross-compiler for all four firmwares. The build links against **picolibc** (`--specs=picolibc.specs`), so install via `sudo apt install gcc-arm-none-eabi picolibc-arm-none-eabi`. The upstream [Arm GNU Toolchain](https://developer.arm.com/downloads/-/arm-gnu-toolchain-downloads) tarball does not ship `picolibc.specs` required to build the firmware - use the Debian packages. `make` checks for a working toolchain (`check-toolchain`). |
+| `picolibc-arm-none-eabi` | yes | 1.8.10-2 | The bare-metal C library the firmware links (`--specs=picolibc.specs`): float printf, ctype, string/mem, plus the malloc symbols we wrap onto the FreeRTOS heap. `sudo apt install picolibc-arm-none-eabi` |
 | GNU `make` | yes | 4.4.1 | Top-level + per-platform build driver. `sudo apt install make` |
 | `git` | yes | 2.47.2 | `make` auto-clones TinyUSB + LittleFS on demand (see below). `sudo apt install git` |
 
@@ -127,7 +128,7 @@ System packages:
 
 ```sh
 sudo apt install build-essential make git \
-                 gcc-arm-none-eabi \
+                 gcc-arm-none-eabi picolibc-arm-none-eabi \
                  libreadline-dev libsystemd-dev pkg-config \
                  udisks2 util-linux \
                  dfu-util bluez
@@ -145,7 +146,7 @@ pip install pyserial pyusb pexpect nanopb pyocd
 nrfutil install device nrf5sdk-tools
 ```
 
-> Note: either ARM toolchain source works - the Debian `gcc-arm-none-eabi`
-> package, or an upstream Arm GNU Toolchain build with its `bin/` on your `PATH`.
-> The upstream builds track newer GCC releases; this project is verified against
-> 14.3.Rel1.
+> Note: the firmware links against **picolibc** (`--specs=picolibc.specs`), which
+> the Debian `gcc-arm-none-eabi` package supplies alongside `picolibc-arm-none-eabi`.
+> The upstream Arm GNU Toolchain tarball does not bundle `picolibc.specs`, so it is
+> recommended to use the Debian packages.

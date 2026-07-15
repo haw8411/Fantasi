@@ -521,10 +521,18 @@ SVCALL(SVC_SD_POWER_SYSTEM_OFF, uint32_t, svc_power_system_off(void))
  * so the next press powers the device back up. Does not return. */
 int hal_shutdown(void)
 {
-    /* Blank the slot LEDs first. They're driven directly by GPIO and the
-     * nRF52 retains pin output levels through System OFF, so without this the
-     * boot-time blue (hal_init) would stay lit after "power off". Driving the
-     * colour channels (active-low sinks) high turns every slot off. */
+    /* Freeze the scheduler first. The launcher task redraws the LEDs every 20 ms
+     * (LED_8 is its always-on marker) and would re-light them during the
+     * wait-for-release below, leaving LED_8 lit through System OFF since the nRF52
+     * retains GPIO output levels. Suspended, pwr_button_task keeps running while
+     * no other task does; the button poll and System OFF path below need no
+     * scheduler, and System OFF never returns so there is no resume. */
+    vTaskSuspendAll();
+
+    /* Blank the slot LEDs. They're driven directly by GPIO and the nRF52 retains
+     * pin output levels through System OFF, so without this the boot-time blue
+     * (hal_init) would stay lit after "power off". Driving the colour channels
+     * (active-low sinks) high turns every slot off. */
     gpio_output_high(NRF_P0, 24);   /* LED_R off */
     gpio_output_high(NRF_P0, 22);   /* LED_G off */
     gpio_output_high(NRF_P1,  0);   /* LED_B off */

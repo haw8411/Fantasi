@@ -13,8 +13,8 @@ modulate. Everything above that line (anticollision, EM4100 decode, CRC, Crypto1
 written once in `core/rfid/` and shared. Platforms advertise their abilities through
 capability bits.
 
-| Device | HF frontend | LF | Emulation |
-|---|---|---|---|
+| Device | RFID frontend |
+|---|---|
 | **Proxmark3** | Xilinx Spartan-II XC2S30 FPGA driven by AT91SAM7S512 |
 | **Flipper / Kiisu** | ST25R3916 in transparent mode |
 | **Chameleon Ultra** | nRF52840 NFCT, MFRC522 |

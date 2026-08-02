@@ -27,6 +27,7 @@ void vfs_free(const uint8_t *data);
 int32_t vfs_pread(const char *path, uint32_t off, void *buf, uint32_t len); /* bytes, or -1 */
 int32_t vfs_read_file(const char *path, void *buf, uint32_t max);   /* bytes, or -1 */
 int     vfs_write_file(const char *path, const void *buf, uint32_t len); /* 0, or -1 */
+int     vfs_append(const char *path, const void *buf, uint32_t len);     /* append; 0, or -1 */
 int32_t vfs_size(const char *path);                                 /* bytes, or -1 */
 int     vfs_remove(const char *path);                               /* 0, or -1 (also rmdir, empty) */
 int     vfs_mkdir(const char *path);                                /* 0 (or already-exists), or -1 */

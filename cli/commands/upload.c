@@ -48,24 +48,12 @@ static void cmd_upload(const char *args)
 }
 
 #ifdef HAS_BLE
-static void ble_cmd_upload(const char *args)
+/* Pipelined upload of `local_path` to device `remote_path` (already resolved). Returns 0, or -1 on error.
+ * Shared by `upload` and `edit`'s WebUSB write-back of an edited temp file. */
+int ble_upload(const char *local_path, const char *remote_path)
 {
-    if (!args) { fprintf(stderr, "usage: upload <local> [remote]\n"); return; }
-    char local_path[128], remote_arg[64] = "";
-    sscanf(args, "%127s %63s", local_path, remote_arg);
-
-    char remote_path[256];
-    if (remote_arg[0]) {
-        resolve_path(remote_arg, remote_path, sizeof(remote_path));
-    } else {
-        const char *base = strrchr(local_path, '/');
-        base = base ? base + 1 : local_path;
-        snprintf(remote_path, sizeof(remote_path), "%s%s%s",
-                 cwd, (cwd[strlen(cwd)-1] == '/') ? "" : "/", base);
-    }
-
     FILE *f = fopen(local_path, "rb");
-    if (!f) { perror(local_path); return; }
+    if (!f) { perror(local_path); return -1; }
     fseek(f, 0, SEEK_END);
     long fsize = ftell(f);
     fseek(f, 0, SEEK_SET);
@@ -80,7 +68,7 @@ static void ble_cmd_upload(const char *args)
      * Exception: the Proxmark3 (switch-mode, g_switch_mode) has a SAM7S UDP with
      * only two 64-byte ping-pong OUT banks and a slow ARM7 draining them. Under
      * pipelining the host outruns the device, both banks fill, and the DCD's
-     * dual-bank handling wedges the endpoint. Pace it to a window of 1 - ack each
+     * dual-bank handling stalls the endpoint. Pace it to a window of 1 - ack each
      * chunk (i.e. wait until the device has drained + written it) before sending
      * the next, so the banks never overflow. */
     #define UPLOAD_WINDOW 6
@@ -178,6 +166,25 @@ static void ble_cmd_upload(const char *args)
     }
     fclose(f);
     printf("\n");
+    return error ? -1 : 0;
+}
+
+static void ble_cmd_upload(const char *args)
+{
+    if (!args) { fprintf(stderr, "usage: upload <local> [remote]\n"); return; }
+    char local_path[128], remote_arg[64] = "";
+    sscanf(args, "%127s %63s", local_path, remote_arg);
+
+    char remote_path[256];
+    if (remote_arg[0]) {
+        resolve_path(remote_arg, remote_path, sizeof(remote_path));
+    } else {
+        const char *base = strrchr(local_path, '/');
+        base = base ? base + 1 : local_path;
+        snprintf(remote_path, sizeof(remote_path), "%s%s%s",
+                 cwd, (cwd[strlen(cwd)-1] == '/') ? "" : "/", base);
+    }
+    ble_upload(local_path, remote_path);
 }
 #endif
 

@@ -62,10 +62,17 @@ static void udp_irq_trampoline(void)
 void pm3_launcher_init(void);   /* button/LED shortcut launcher, defined below */
 #endif
 
+/* Kick the watchdog. WDTC_WDMR is write-once per reset: under our own bootloader hal_init's WDDIS write
+ * disables the WDT, but a stock bootloader left in 0x100000 - which an app-only reflash can't replace -
+ * may enable it first, making WDDIS a silent no-op and resetting us every ~16 s. Called from the launcher
+ * loop and the sniff capture loop (not a tick-ISR hook - that preempts the time-critical 212 kB/s sniff
+ * loop and halves its modulation sensitivity). Kicking a disabled WDT is a harmless no-op. */
+void pm3_wdt_kick(void) { AT91C_BASE_WDTC->WDTC_WDCR = 0xA5000000 | AT91C_WDTC_WDRSTT; }
+
 void hal_init(void)
 {
-    /* Watchdog is write-once per reset; the PM3 bootloader leaves
-     * WDTC_WDMR untouched so this write disables it for us. */
+    /* Try to disable the watchdog (works under our own bootloader, where WDTC_WDMR is still pristine).
+     * If a foreign bootloader already enabled it, this write is ignored - vApplicationTickHook kicks it. */
     AT91C_BASE_WDTC->WDTC_WDMR = AT91C_WDTC_WDDIS;
 
     /* Peripheral clocks:
@@ -291,6 +298,7 @@ static void pm3_launcher_task(void *arg)
     TickType_t press_start = 0;
 
     for (;;) {
+        pm3_wdt_kick();                          /* keep a foreign-bootloader WDT fed while idle/menu */
         pm3_leds_show((uint8_t)sel);
 
         bool now = pm3_button_down();
@@ -533,7 +541,7 @@ void hal_radio_info(hal_radio_info_t *info)
  * field at offset 5: COMMAND=1 (ENTER_FLASH_MODE) makes it stay in the
  * serial-flash loop instead of chaining into our osimage.
  *
- * Layout (from original_fw/proxmark3/include/proxmark3_arm.h):
+ * Layout (originally from stock Proxmark3 include/proxmark3_arm.h):
  *   [0..3]  int   magic    = 0x43334D50 ('PM3C')
  *   [4]     char  version  = 1
  *   [5]     char  command  = 0 normal, 1 enter-flash-mode

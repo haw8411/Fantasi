@@ -10,9 +10,12 @@ Usage:
 """
 
 import sys
+import os
 import time
 import struct
 import math
+import hashlib
+import urllib.request
 import usb.core
 import usb.util
 
@@ -239,20 +242,75 @@ def cmd_start_ws():
     print("Done. Flash firmware and test: fantasi> scan")
 
 
+# Default STM32WB BLE coprocessor stack. If no binary is passed, it is fetched on
+# demand and verified against the SHA-256 below (cached under build/copro/ so later
+# runs are offline). Source is the flipperdevices/stm32wb_copro repo (pinned to a
+# release tag), not ST's STM32CubeWB - the ST binaries are a different build and are
+# incompatible with the Flipper Zero's FUS 1.2.0 (they fail on-device with
+# IMG_NOT_AUTHENTIC). The SHA gate refuses to flash anything but the pinned binary.
+COPRO_NAME   = "stm32wb5x_BLE_Stack_full_extended_fw.bin"
+COPRO_TAG    = "v1.20.0"
+COPRO_URL    = ("https://raw.githubusercontent.com/flipperdevices/stm32wb_copro/"
+                f"{COPRO_TAG}/firmware/{COPRO_NAME}")
+COPRO_SHA256 = "7ee9bd79463b47af2df46538005358a8aee9052e257c89b9e6367ab3c13f132e"
+COPRO_CACHE  = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "build", "copro", COPRO_NAME)
+
+
+def resolve_binary(arg):
+    """Return (path, bytes) for the stack to flash. An explicit path wins; with no
+    arg, use the SHA-verified cached download, fetching the pinned binary on first use."""
+    if arg:                                              # explicit image: flash as given
+        with open(arg, 'rb') as f:
+            data = f.read()
+        got = hashlib.sha256(data).hexdigest()
+        if got != COPRO_SHA256:
+            print(f"note: {arg} sha256 {got[:12]}.. is not the pinned full_extended "
+                  f"({COPRO_SHA256[:12]}..) - flashing it anyway, as requested")
+        return arg, data
+
+    if os.path.exists(COPRO_CACHE):                      # reuse a prior verified download
+        with open(COPRO_CACHE, 'rb') as f:
+            data = f.read()
+        if hashlib.sha256(data).hexdigest() == COPRO_SHA256:
+            print(f"Using cached {COPRO_NAME} ({len(data)} bytes)")
+            return COPRO_CACHE, data
+        print("  cached copro binary failed its SHA check - re-fetching")
+
+    print(f"Fetching {COPRO_NAME} ({COPRO_TAG}) from flipperdevices/stm32wb_copro...")
+    try:
+        with urllib.request.urlopen(COPRO_URL, timeout=60) as r:
+            data = r.read()
+    except Exception as e:
+        sys.exit(f"ERROR: download failed ({e}).\n"
+                 f"  Pass a local binary explicitly, or place it at {COPRO_CACHE}\n"
+                 f"  Source: {COPRO_URL}")
+    got = hashlib.sha256(data).hexdigest()
+    if got != COPRO_SHA256:
+        sys.exit(f"ERROR: downloaded SHA-256 {got}\n"
+                 f"        != expected      {COPRO_SHA256}\n"
+                 f"  The pinned tag ({COPRO_TAG}) no longer matches - NOT flashing "
+                 f"(wrong FUS version would brick BLE). Pass a known-good binary.")
+    os.makedirs(os.path.dirname(COPRO_CACHE), exist_ok=True)
+    with open(COPRO_CACHE, 'wb') as f:
+        f.write(data)
+    print(f"  verified SHA-256, cached at {COPRO_CACHE}")
+    return COPRO_CACHE, data
+
+
 def main():
-    if len(sys.argv) >= 2 and sys.argv[1] == '--start-ws':
+    if len(sys.argv) >= 2 and sys.argv[1] in ('--start-ws',):
         cmd_start_ws()
         return
+    if len(sys.argv) >= 2 and sys.argv[1] in ('-h', '--help'):
+        print(f"Usage: {sys.argv[0]} [stm32wb5x_BLE_*.bin]   (default: fetch {COPRO_NAME})")
+        print(f"       {sys.argv[0]} --start-ws              (activate wireless stack)")
+        return
 
-    if len(sys.argv) < 2:
-        print(f"Usage: {sys.argv[0]} <stm32wb5x_BLE_*.bin>")
-        print(f"       {sys.argv[0]} --start-ws   (activate wireless stack)")
-        sys.exit(1)
-
-    with open(sys.argv[1], 'rb') as f:
-        binary = f.read()
+    arg = sys.argv[1] if len(sys.argv) >= 2 else None
+    path, binary = resolve_binary(arg)
     size = len(binary)
-    print(f"Binary: {sys.argv[1]} ({size} bytes)")
+    print(f"Binary: {path} ({size} bytes)")
 
     dev = find_device()
     if not dev:

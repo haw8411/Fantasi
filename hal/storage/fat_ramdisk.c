@@ -35,8 +35,8 @@
 typedef struct { char vpath[VPATH_MAX]; uint32_t start, nclus; } syndir_t;
 typedef struct { char vpath[VPATH_MAX]; uint32_t size, start, nclus; int parent; } synfile_t;
 
-static syndir_t  s_dir[MAX_DIRS];
-static synfile_t s_file[MAX_FILES];
+static syndir_t  *s_dir;     /* the synthetic-FAT model - heap, allocated on first MSC access, freed on */
+static synfile_t *s_file;    /* eject/unplug (fatrd_release), so an idle device pins none of the ~6 KB */
 static int       s_ndir, s_nfile;
 
 static const char *leaf(const char *vpath)
@@ -101,11 +101,14 @@ static uint32_t s_fs_gen = 1;     /* incremented on every FS mutation */
 static uint32_t s_built_gen;      /* generation the cached model reflects */
 static bool     s_have_model;
 
-void fatrd_invalidate(void) { s_fs_gen++; }
+void fatrd_invalidate(void) { s_fs_gen++; }   /* buffer-free: safe from any task even when the model isn't resident */
+
+static bool model_alloc(void);   /* lazily (re)allocate the model buffers; defined below, after s_newdir */
 
 static void build_model(void)
 {
     if (s_have_model && s_built_gen == s_fs_gen) return;   /* cache still valid */
+    if (!model_alloc()) return;                            /* OOM: leave s_have_model false; callers present a blank drive */
     s_ndir = 0; s_nfile = 0;
     vfs_list("/", root_cb, NULL);   /* includes the synthetic /ramfs mount */
     for (int d = 0; d < s_ndir; d++) {
@@ -150,8 +153,33 @@ static synfile_t *file_of_cluster(uint32_t c)
  * raw file data. Cleared on every mount (boot-sector read) so a stale mapping
  * can't misroute a later session's writes. */
 #define MAX_NEWDIR 8
-static struct { uint32_t cluster; char vpath[VPATH_MAX]; } s_newdir[MAX_NEWDIR];
+static struct { uint32_t cluster; char vpath[VPATH_MAX]; } *s_newdir;
 static int s_nnewdir;
+
+/* The model (s_dir/s_file/s_newdir, ~6 KB) is heap-resident only while a host is actually using the MSC
+ * drive. Allocated lazily on the first read/write (via build_model), freed by fatrd_release() on eject /
+ * USB unplug. All of it is touched only on the usb task (tud_msc_* callbacks run from tud_task), so no
+ * locking; fatrd_invalidate (other tasks) bumps s_fs_gen only, never the buffers. */
+static bool model_alloc(void)
+{
+    if (s_file) return true;                             /* already resident */
+    s_dir    = pvPortMalloc(MAX_DIRS   * sizeof *s_dir);
+    s_file   = pvPortMalloc(MAX_FILES  * sizeof *s_file);
+    s_newdir = pvPortMalloc(MAX_NEWDIR * sizeof *s_newdir);
+    if (!s_dir || !s_file || !s_newdir) {               /* vPortFree(NULL) is a no-op */
+        vPortFree(s_dir); vPortFree(s_file); vPortFree(s_newdir);
+        s_dir = NULL; s_file = NULL; s_newdir = NULL;
+        return false;
+    }
+    return true;
+}
+
+void fatrd_release(void)
+{
+    vPortFree(s_dir); vPortFree(s_file); vPortFree(s_newdir);
+    s_dir = NULL; s_file = NULL; s_newdir = NULL;
+    s_have_model = false; s_nnewdir = 0;                 /* next access rebuilds from scratch */
+}
 static const char *newdir_lookup(uint32_t clus)
 {
     for (int i = 0; i < s_nnewdir; i++) if (s_newdir[i].cluster == clus) return s_newdir[i].vpath;
@@ -317,6 +345,7 @@ int fatrd_read(uint32_t lba, uint32_t offset, void *buf, uint32_t len)
 {
     if (lba >= FATRD_SECTOR_COUNT) return -1;
     build_model();
+    if (!s_file) { memset(buf, 0, len); return 0; }   /* model couldn't allocate (OOM): present a blank sector, don't crash */
 
     uint8_t sec[BPS];
     if (lba == 0) { s_nnewdir = 0; synth_boot(sec); }   /* fresh mount: drop stale dir routes */
@@ -355,7 +384,9 @@ static const char *slot_vpath(int dir, uint32_t g, char *out, uint32_t outlen)
     uint32_t lead = (dir < 0) ? 1 : 2;      /* volume label / "." ".." */
     if (g < lead) return NULL;
     uint32_t pos = lead;
-    for (int n = 0; ; n++) {
+    /* Bound the scan: dir_item returns NULL past the last entry for valid args, but a corrupted `dir`/`g`
+     * (0xA5A5A5A5) could otherwise loop forever. No real directory approaches this many entries. */
+    for (int n = 0; n < 65536; n++) {
         uint8_t attr; uint32_t start, size; int idx;
         const char *name = dir_item(dir, n, &attr, &start, &size, &idx);
         if (!name) return NULL;
@@ -367,6 +398,7 @@ static const char *slot_vpath(int dir, uint32_t g, char *out, uint32_t outlen)
         }
         pos += k;
     }
+    return NULL;   /* scan bound hit (only reachable with corrupted args) */
 }
 
 static void try_flush(const char *vpath, uint32_t start, uint32_t size)
@@ -479,9 +511,14 @@ static void write_dir(int dir, const char *prefix, uint32_t slot0,
 int fatrd_write(uint32_t lba, uint32_t offset, const uint8_t *buf, uint32_t len)
 {
     if (lba >= FATRD_SECTOR_COUNT) return -1;
+    /* A single MSC sector write is always within one 512-byte sector. Reject anything else: a garbage
+     * offset/len (e.g. 0xA5A5A5A5 from a corrupted caller) otherwise flows into write_dir -> slot_vpath
+     * whose scan then spin-loops forever and hangs USB off the bus (BMP-confirmed hard stall). */
+    if (offset >= BPS || len > BPS - offset || !buf) return -1;
     if (lba == 0 || lba < FAT_LBA + NFAT*FATSEC) return 0;
 
     build_model();
+    if (!s_file) return 0;   /* model couldn't allocate (OOM): drop the write rather than deref NULL */
 
     if (lba < ROOT_LBA + ROOTSEC) {
         uint32_t sec = lba - ROOT_LBA;

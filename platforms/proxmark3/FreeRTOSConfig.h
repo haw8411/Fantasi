@@ -9,7 +9,9 @@
 
 #define configUSE_PREEMPTION            1
 #define configUSE_IDLE_HOOK             0
-#define configUSE_TICK_HOOK             0
+#define configUSE_TICK_HOOK             0   /* WDT is kicked in the launcher + sniff loops, not the tick
+                                             * ISR - a per-tick hook preempts the 212 kB/s sniff capture
+                                             * loop and cuts its modulation sensitivity (~900->~200) */
 #define configMAX_PRIORITIES            5
 /* ARM7 port saves a 72-byte context frame on the task's stack on each
  * IRQ (tick) and each SWI (taskYIELD). With configIDLE_SHOULD_YIELD=1

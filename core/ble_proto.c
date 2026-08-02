@@ -6,6 +6,7 @@
 #include "../hal/storage/fat_ramdisk.h"   /* fatrd_invalidate() */
 #include "ramfs.h"
 #include "vfs.h"
+#include "app_run.h"
 #include "../proto/fantasi.pb.h"
 
 #include <pb_encode.h>
@@ -44,6 +45,13 @@ static ble_pipe_t  s_pipe;
 static size_t (*s_emit)(const uint8_t *buf, size_t len);
 static SemaphoreHandle_t s_proto_lock;
 
+/* Serialises the actual transport write only (not the whole dispatch), so the
+ * async app pump can stream output on its own task without holding s_proto_lock -
+ * which would stall the RX loop out of processing a file_write (a module the app
+ * is waiting for). Held only around a send, so the RX loop can write ramfs while
+ * the pump is mid-emit; a dispatch's ramfs work completes before its ack blocks. */
+static SemaphoreHandle_t s_emit_lock;
+
 static uint8_t         s_file_cache[FILE_CACHE_SZ];
 static lfs_file_t      s_file;
 static struct lfs_file_config s_fcfg = { .buffer = s_file_cache };
@@ -61,7 +69,9 @@ static void send_response(cli_ctx_t *ctx, CliResponse *resp)
     s_encode_buf[0] = (uint8_t)(len & 0xFF);
     s_encode_buf[1] = (uint8_t)(len >> 8);
 
+    if (s_emit_lock) xSemaphoreTake(s_emit_lock, portMAX_DELAY);
     if (s_emit) s_emit(s_encode_buf, 2 + len);
+    if (s_emit_lock) xSemaphoreGive(s_emit_lock);
 }
 
 static void send_error(cli_ctx_t *ctx, uint32_t id, const char *msg)
@@ -81,6 +91,89 @@ static void send_ok(cli_ctx_t *ctx, uint32_t id, const char *msg)
             sizeof(s_resp.payload.output) - 1);
     send_response(ctx, &s_resp);
 }
+
+#ifdef FANTASI_ENABLE_APPS
+/* ---- Async app session: emit callbacks the pump task (core/app_run.c) drives ----
+ * The pump runs on its own task, so these guard the shared encode buffer with the
+ * proto lock and emit to the sink captured when the app was launched, not the
+ * per-dispatch s_emit (which may belong to another channel by the time the app
+ * prints). One session at a time (app_launch_async enforces it). */
+static size_t (*s_session_emit)(const uint8_t *, size_t);
+static CliResponse s_sresp;
+static uint8_t     s_sencode[2 + CliResponse_size];   /* pump's own buffer (not shared) */
+
+static void session_send(void)
+{
+    if (!s_session_emit) return;
+    pb_ostream_t st = pb_ostream_from_buffer(s_sencode + 2, sizeof(s_sencode) - 2);
+    if (!pb_encode(&st, CliResponse_fields, &s_sresp)) return;
+    uint16_t len = (uint16_t)st.bytes_written;
+    s_sencode[0] = (uint8_t)(len & 0xFF);
+    s_sencode[1] = (uint8_t)(len >> 8);
+    if (s_emit_lock) xSemaphoreTake(s_emit_lock, portMAX_DELAY);
+    s_session_emit(s_sencode, 2 + len);
+    if (s_emit_lock) xSemaphoreGive(s_emit_lock);
+}
+
+static void session_output_cb(uint32_t id, const char *data, size_t len)
+{
+    for (size_t off = 0; off < len; ) {
+        size_t chunk = len - off;
+        if (chunk > sizeof(s_sresp.payload.output) - 1) chunk = sizeof(s_sresp.payload.output) - 1;
+        s_sresp = (CliResponse){ .id = id, .has_next = true, .which_payload = CliResponse_output_tag };
+        memcpy(s_sresp.payload.output, data + off, chunk);
+        s_sresp.payload.output[chunk] = '\0';
+        session_send();
+        off += chunk;
+    }
+}
+
+static void session_module_request_cb(uint32_t id, const char *name)
+{
+    s_sresp = (CliResponse){ .id = id, .has_next = true, .which_payload = CliResponse_module_request_tag };
+    strncpy(s_sresp.payload.module_request, name, sizeof(s_sresp.payload.module_request) - 1);
+    session_send();
+}
+
+static void session_done_cb(uint32_t id, int code)
+{
+    (void)code;
+    s_sresp = (CliResponse){ .id = id, .has_next = false, .which_payload = CliResponse_output_tag };
+    s_sresp.payload.output[0] = '\0';
+    session_send();
+    s_session_emit = NULL;
+}
+
+static const app_session_cb_t s_session_cb = {
+    session_output_cb, session_module_request_cb, session_done_cb,
+};
+
+static void handle_app_launch(cli_ctx_t *ctx, CliRequest *req)
+{
+    s_session_emit = s_emit;                 /* stream this session over this channel */
+    int rc = app_launch_async(req->payload.app_launch, req->id, &s_session_cb);
+    if (rc < 0) {
+        s_session_emit = NULL;
+        send_error(ctx, req->id,
+            rc == -1 ? "an app is already running" :
+            rc == -2 ? "not found" : "load failed");
+    }
+    /* success: the pump streams the app's output, its module requests, and a final
+     * has_next=false when it exits. The RX loop is now free for file_write etc. */
+}
+
+static void handle_app_input(cli_ctx_t *ctx, CliRequest *req)
+{
+    app_session_feed_input(req->payload.app_input.bytes, req->payload.app_input.size);
+    send_ok(ctx, req->id, "");
+}
+
+static void handle_app_stop(cli_ctx_t *ctx, CliRequest *req)
+{
+    app_session_stop();
+    send_ok(ctx, req->id, "");
+}
+#endif /* FANTASI_ENABLE_APPS */
 
 /* ---- Output capture for text commands ---- */
 
@@ -369,6 +462,7 @@ static void pipe_flush(void) { ble_pipe_flush(&s_pipe); }
 void fantasi_proto_init(void)
 {
     if (!s_proto_lock) s_proto_lock = xSemaphoreCreateMutex();
+    if (!s_emit_lock)  s_emit_lock  = xSemaphoreCreateMutex();
 }
 
 void fantasi_proto_rx(cli_ctx_t *ctx, uint8_t *accum, size_t cap, size_t *accum_len,
@@ -402,6 +496,11 @@ void fantasi_proto_rx(cli_ctx_t *ctx, uint8_t *accum, size_t cap, size_t *accum_
             case CliRequest_dir_list_tag:    handle_dir_list(ctx, &s_req); break;
             case CliRequest_file_delete_tag: handle_file_delete(ctx, &s_req); break;
             case CliRequest_mkdir_tag:       handle_mkdir(ctx, &s_req); break;
+#ifdef FANTASI_ENABLE_APPS
+            case CliRequest_app_launch_tag:  handle_app_launch(ctx, &s_req); break;
+            case CliRequest_app_input_tag:   handle_app_input(ctx, &s_req); break;
+            case CliRequest_app_stop_tag:    handle_app_stop(ctx, &s_req); break;
+#endif
             default: send_error(ctx, s_req.id, "unknown request"); break;
             }
         }

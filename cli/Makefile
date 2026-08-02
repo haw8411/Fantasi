@@ -10,7 +10,7 @@ LDLIBS  := -lreadline
 # main.c owns the transport/mount/BLE plumbing; each command is its own file
 # under commands/ and self-registers (see cli/commands/README.md). The wildcard
 # picks up new command files automatically.
-SRCS    := main.c $(wildcard commands/*.c)
+SRCS    := main.c theme.c $(wildcard commands/*.c)
 
 # BLE transport (requires libsystemd)
 HAS_SYSTEMD := $(shell pkg-config --exists libsystemd 2>/dev/null && echo 1)

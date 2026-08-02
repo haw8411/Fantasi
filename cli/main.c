@@ -34,6 +34,27 @@
 #endif
 
 #include "cli_internal.h"
+#include "theme.h"
+
+/* When non-NULL, device command output is appended here instead of printed, so the
+ * client can run a command silently and read its result (used for the saved theme
+ * at startup). Both output paths (serial framed + BLE/USB protobuf) honor it. */
+bool g_no_history;                           /* -c one-shot mode: skip reading/persisting history */
+
+void fantasi_state_path(const char *name, char *out, size_t len)
+{
+    const char *home = getenv("HOME");
+    if (!home || !*home) { if (len) out[0] = '\0'; return; }
+    char dir[400];
+    snprintf(dir, sizeof dir, "%s/.fantasi", home);
+    mkdir(dir, 0700);                         /* ignore EEXIST */
+    snprintf(out, len, "%s/%s", dir, name);
+}
+
+static char  *g_cap;
+static size_t g_cap_sz, g_cap_len;
+static void cap_putc(char c) { if (g_cap && g_cap_len + 1 < g_cap_sz) g_cap[g_cap_len++] = c; }
+static void cap_puts(const char *s) { while (*s) cap_putc(*s++); }
 
 /* Set when the protobuf transport is the USB vendor (WebUSB) pipe rather than
  * BLE. Declared unconditionally so the shared proto-path checks compile even in
@@ -54,6 +75,28 @@ static bool g_switched;       /* sent `msc` to enter MSC mode (switch-mode PM3) 
 /* ---- Persistent serial path (for reconnect after MSC) ---- */
 
 static char g_ser_path[64];
+
+/* Restrict device selection to this device name (hal_device_name()),
+ * set by --name. The CDC scanners below match it against the USB device's iSerial
+ * (sysfs `serial`); the USB-vendor and BLE transports filter on it too. Empty = any. */
+static char g_device_name[64];
+
+/* True if a sysfs USB device dir (/sys/bus/usb/devices/X) matches the requested
+ * --name filter: no filter set, or its `serial` (iSerialNumber, = hal_device_name())
+ * equals g_device_name. Used to disambiguate multiple connected Fantasi devices. */
+static bool usb_dev_name_matches(const char *usb_dev_path)
+{
+    if (!g_device_name[0]) return true;
+    char spath[512];
+    snprintf(spath, sizeof(spath), "%s/serial", usb_dev_path);
+    FILE *fs = fopen(spath, "r");
+    if (!fs) return false;
+    char serial[64] = "";
+    if (!fgets(serial, sizeof(serial), fs)) { fclose(fs); return false; }
+    fclose(fs);
+    serial[strcspn(serial, "\n")] = '\0';
+    return strcmp(serial, g_device_name) == 0;
+}
 
 /* ---- Serial port ---- */
 
@@ -156,8 +199,10 @@ static void ser_emit_framed(const uint8_t *buf, ssize_t n, uint8_t *prev,
             ; /* drop stray sentinel */
         else if (c == FRAME_SENTINEL)
             ; /* hold - check next byte */
-        else if (c != '\r')
-            putchar(c);
+        else if (c != '\r') {
+            if (g_cap) cap_putc((char)c);
+            else       putchar(c);
+        }
         *prev = c;
     }
     fflush(stdout);
@@ -373,6 +418,7 @@ static bool find_fantasi_device(char *ser_path, size_t ser_len,
         pid[strcspn(pid, "\n")] = '\0';
 
         if (strcmp(vid, "1209") != 0 || strcmp(pid, "0001") != 0) continue;
+        if (!usb_dev_name_matches(g.gl_pathv[i])) continue;   /* --name filter */
 
         /* Found Fantasi device - scan for tty and block device */
         char pattern[512];
@@ -422,6 +468,7 @@ static bool wait_for_fantasi_block(char *out, size_t len, int timeout_s)
             vid[strcspn(vid, "\n")] = '\0';
             pid[strcspn(pid, "\n")] = '\0';
             if (strcmp(vid, "1209") != 0 || strcmp(pid, "0001") != 0) continue;
+            if (!usb_dev_name_matches(g.gl_pathv[j])) continue;   /* --name filter */
 
             char pattern[512];
             snprintf(pattern, sizeof(pattern),
@@ -468,6 +515,7 @@ static bool wait_for_fantasi_serial(char *out, size_t len, int timeout_s)
             vid[strcspn(vid, "\n")] = '\0';
             pid[strcspn(pid, "\n")] = '\0';
             if (strcmp(vid, "1209") != 0 || strcmp(pid, "0001") != 0) continue;
+            if (!usb_dev_name_matches(g.gl_pathv[j])) continue;   /* --name filter */
 
             char pattern[512];
             snprintf(pattern, sizeof(pattern), "%s/*/tty/ttyACM*", g.gl_pathv[j]);
@@ -914,7 +962,9 @@ void ble_send_cmd(const char *cmd)
     CliRequest req = CliRequest_init_zero;
     req.id = ++ble_req_id;
     req.which_payload = CliRequest_command_tag;
-    strncpy(req.payload.command, cmd, sizeof(req.payload.command) - 1);
+    size_t cl = strlen(cmd);                             /* the field is pre-zeroed by init_zero, so a */
+    if (cl >= sizeof(req.payload.command)) cl = sizeof(req.payload.command) - 1;   /* bounded copy leaves */
+    memcpy(req.payload.command, cmd, cl);               /* it NUL-terminated (an over-long command truncates) */
     ble_send_proto(&req);
 }
 
@@ -934,8 +984,10 @@ static void ble_read_response(bool forward_stdin)
 
         if (ble_recv_proto(&resp) < 0) break;
         got_data = true;
-        if (resp.which_payload == CliResponse_output_tag && resp.payload.output[0])
-            printf("%s", resp.payload.output);
+        if (resp.which_payload == CliResponse_output_tag && resp.payload.output[0]) {
+            if (g_cap) cap_puts(resp.payload.output);
+            else       printf("%s", resp.payload.output);
+        }
         else if (resp.which_payload == CliResponse_error_tag)
             fprintf(stderr, "error: %s\n", resp.payload.error.message);
         fflush(stdout);
@@ -1041,7 +1093,7 @@ static bool connect_webusb_direct(void)
  * back to the serial + MSC path: `required` (from --usb) makes that a hard error,
  * otherwise it's a quiet fallback. A switch-mode device that already tore down
  * CDC can't fall back, so its failure is always surfaced. */
-static bool try_webusb_upgrade(bool required)
+bool try_webusb_upgrade(bool required)
 {
     char id[8];
     query_device_id(id, sizeof(id));
@@ -1069,6 +1121,123 @@ static bool try_webusb_upgrade(bool required)
 }
 #endif /* HAS_USB_VENDOR */
 
+/* ---- readline TAB completion for the fantasi> prompt ----
+ * The first word completes against the command set: the host-local commands (the local_cmd registry)
+ * PLUS the device's own commands (ps, log, version, ...), fetched once by querying its `help` and
+ * cached - completing only local names would wrongly turn `p` into `pwd` when the device also has `ps`.
+ * Arguments aren't completed except for `upload`, whose argument is a HOST file (readline's default). */
+static char g_dev_cmd[64][24];
+static int  g_dev_ncmd = -1;   /* -1 = not yet fetched */
+
+static void fetch_dev_cmds(void)
+{
+    if (!ser_connected) return;                 /* retry once the device is up */
+    g_dev_ncmd = 0;
+#ifdef HAS_BLE
+    if (use_ble || use_usb) {
+        char out[2048]; int olen = 0;
+        ble_send_cmd("help");
+        CliResponse resp;
+        do {
+            if (ble_recv_proto(&resp) < 0) break;
+            if (resp.which_payload == CliResponse_output_tag) {
+                int sl = (int)strlen(resp.payload.output);
+                if (olen + sl < (int)sizeof out) { memcpy(out + olen, resp.payload.output, sl); olen += sl; }
+            }
+        } while (resp.has_next);
+        out[olen] = '\0';
+        for (char *lp = out; *lp && g_dev_ncmd < 64; ) {   /* first word of each help line = a command */
+            char *eol = strchr(lp, '\n'); if (eol) *eol = '\0';
+            char *p = lp; while (*p == ' ') p++;
+            char *ns = p; while (*p && *p != ' ') p++;
+            int nl = (int)(p - ns);
+            if (nl > 0 && nl < 24) { memcpy(g_dev_cmd[g_dev_ncmd], ns, nl); g_dev_cmd[g_dev_ncmd][nl] = '\0'; g_dev_ncmd++; }
+            lp = eol ? eol + 1 : lp + strlen(lp);
+        }
+    }
+#endif
+}
+
+static char *cmd_generator(const char *text, int state)
+{
+    static const local_cmd_t *lc; static int di; static size_t tlen;
+    if (state == 0) {
+        if (g_dev_ncmd < 0) fetch_dev_cmds();
+        lc = __start_local_cmd; di = 0; tlen = strlen(text);
+    }
+    for (; lc < __stop_local_cmd; ) {           /* host-local commands */
+        const char *nm = lc->name; lc++;
+        if (!strncmp(nm, text, tlen)) return strdup(nm);
+    }
+    for (; di < g_dev_ncmd; ) {                  /* device commands (skip any that duplicate a local one) */
+        const char *nm = g_dev_cmd[di]; di++;
+        if (strncmp(nm, text, tlen)) continue;
+        int dup = 0;
+        for (const local_cmd_t *c = __start_local_cmd; c < __stop_local_cmd; c++)
+            if (!strcmp(c->name, nm)) { dup = 1; break; }
+        if (!dup) return strdup(nm);
+    }
+    return NULL;
+}
+
+static char **cli_completion(const char *text, int start, int end)
+{
+    (void)end;
+    if (start == 0) {                            /* the command word */
+        rl_attempted_completion_over = 1;        /* command list only - no host-file fallback */
+        return rl_completion_matches(text, cmd_generator);
+    }
+    if (strncmp(rl_line_buffer, "upload ", 7) != 0)   /* args are device paths (except upload's host file) */
+        rl_attempted_completion_over = 1;
+    return NULL;
+}
+
+/* Refresh the client-side settings cached from the device. Currently that's just the active theme (read
+ * from the device's saved `theme`, default synthwave when unset/unknown/disconnected). Runs once at
+ * startup and again on the `reload` command; extend it as more client-side settings are added. */
+void load_client_settings(void)
+{
+    char out[80] = {0};
+    g_cap = out; g_cap_sz = sizeof out; g_cap_len = 0;
+#ifdef HAS_BLE
+    if (use_ble || use_usb) { ble_send_cmd("settings get theme"); ble_read_response(false); }
+    else
+#endif
+    if (ser_fd >= 0 && ser_connected) { ser_send_cmd("settings get theme"); ser_read_response(); }
+    g_cap = NULL;
+
+    char *nm = out;                                       /* trim surrounding whitespace/newlines */
+    while (*nm == ' ' || *nm == '\r' || *nm == '\n' || *nm == '\t') nm++;
+    char *e = nm + strlen(nm);
+    while (e > nm && (e[-1] == ' ' || e[-1] == '\r' || e[-1] == '\n' || e[-1] == '\t')) *--e = 0;
+
+    theme_set((*nm && !strstr(nm, "not set")) ? nm : NULL);   /* unset/empty -> synthwave default */
+}
+
+/* Execute one command line: a host-local command, or pass it through to the device over the active
+ * transport. Returns false if the CLI should exit (the `exit`/`quit` command). */
+static bool exec_line(const char *line)
+{
+    if (cli_local_match(line))
+        return handle_local(line);
+#ifdef HAS_BLE
+    if (use_ble || use_usb) {
+        /* Only a launch turns stdin into app I/O (so a piped ^C reaches the app). */
+        bool is_launch = strncmp(line, "launch", 6) == 0 && (line[6] == '\0' || line[6] == ' ');
+        ble_send_cmd(line);
+        ble_read_response(is_launch);
+        if ((use_ble && !ble_transport_connected()) || (use_usb && !usb_transport_connected()))
+            ser_connected = false;
+        return true;
+    }
+#endif
+    /* Switch-mode devices (PM3) share USB endpoints between MSC and CDC: leave MSC before a serial cmd. */
+    if (ser_fd < 0 && msc_active) fat_unmount();
+    if (ser_fd >= 0) { ser_send_cmd(line); ser_read_response(); }
+    else if (!ser_connected) fprintf(stderr, "device disconnected\n");
+    return true;
+}
+
 int main(int argc, char **argv)
 {
     char blk_path[64] = "";
@@ -1076,8 +1245,10 @@ int main(int argc, char **argv)
     bool force_ble = false;
     bool force_usb = false;
     bool force_serial = false;
+    const char *oneshot = NULL;              /* -c: run this one command, then exit (no history) */
     (void)force_usb;
     for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) { oneshot = argv[++i]; continue; }
         if (strncmp(argv[i], "/dev/tty", 8) == 0)
             strncpy(g_ser_path, argv[i], sizeof(g_ser_path) - 1);
         else if (strncmp(argv[i], "/dev/sd", 7) == 0)
@@ -1088,6 +1259,17 @@ int main(int argc, char **argv)
             force_usb = true;
         else if (strcmp(argv[i], "--serial") == 0)
             force_serial = true;
+        else if (strcmp(argv[i], "--name") == 0 && i + 1 < argc) {
+            /* Pick a specific device by name (hal_device_name()) when
+             * several Fantasi devices are connected. Applies across every
+             * transport - the name is the USB iSerial (USB-vendor + CDC serial)
+             * and the BLE advertised name ("Fantasi <name>"). */
+            snprintf(g_device_name, sizeof(g_device_name), "%s", argv[++i]);
+            usb_transport_set_name(g_device_name);
+#ifdef HAS_BLE
+            ble_transport_set_name(g_device_name);
+#endif
+        }
 #ifdef HAS_BLE
         else if (strncmp(argv[i], "--ble-addr=", 11) == 0) {
             force_ble = true;
@@ -1095,7 +1277,9 @@ int main(int argc, char **argv)
         }
 #endif
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
-            printf("usage: fantasi [--ble[=ADDR]] [--usb|--serial] [/dev/ttyACMx] [/dev/sdX]\n");
+            printf("usage: fantasi [--ble[=ADDR]] [--usb|--serial] [--name NAME] [-c <command>] [/dev/ttyACMx] [/dev/sdX]\n");
+            printf("  --name NAME   select a specific device by name (see `whoami`) when several are connected;\n");
+            printf("                works over USB and BLE\n");
             return 0;
         }
     }
@@ -1192,68 +1376,47 @@ int main(int argc, char **argv)
       }
 
     signal(SIGINT, sigint_handler);
-    rl_bind_key('\t', rl_insert);
-    /* The idle-reconnect hook is only useful for an interactive session. With
-     * piped (non-TTY) input a non-NULL rl_event_hook keeps readline's read loop
-     * alive at EOF instead of returning NULL, so a script that doesn't end in
-     * `exit` (e.g. one ending in a streaming `launch`, which swallows trailing
-     * lines as app input) would hang. Only install it on a real terminal. */
-    if (isatty(STDIN_FILENO))
-        rl_event_hook = rl_poll_serial;
+    load_client_settings();                              /* apply the device's saved theme etc. (silent) */
 
-    #define PROMPT_LIVE    "fantasi> "
-    #define PROMPT_DEAD    "\001" C_RED "\002" "fantasi" "\001" C_RESET "\002" "> "
+    if (oneshot) {
+        g_no_history = true;                             /* -c: run one command, save nothing */
+        exec_line(oneshot);
+    } else {
+        rl_attempted_completion_function = cli_completion;   /* TAB completes the command word */
+        /* The idle-reconnect hook is only useful for an interactive session. With
+         * piped (non-TTY) input a non-NULL rl_event_hook keeps readline's read loop
+         * alive at EOF instead of returning NULL, so a script that doesn't end in
+         * `exit` (e.g. one ending in a streaming `launch`, which swallows trailing
+         * lines as app input) would hang. Only install it on a real terminal. */
+        if (isatty(STDIN_FILENO))
+            rl_event_hook = rl_poll_serial;
 
-    while (running) {
-        const char *prompt = ser_connected ? PROMPT_LIVE : PROMPT_DEAD;
-        char *rl = readline(prompt);
-        if (!rl) break;
-        if (!rl[0]) { free(rl); continue; }
-        add_history(rl);
+        /* Persistent command history: load past commands so up/down recall them, and append each new
+         * command so it survives the session. Only for an interactive terminal (piped input has no use
+         * for it). The rfid app keeps its own history file (see cli/commands/rfid.c). */
+        char hist[512] = "";
+        if (isatty(STDIN_FILENO)) {
+            fantasi_state_path("fantasi.log", hist, sizeof hist);
+            if (hist[0]) { using_history(); read_history(hist); stifle_history(1000); }
+        }
 
-        char line[256];
-        strncpy(line, rl, sizeof(line) - 1);
-        line[sizeof(line) - 1] = '\0';
-        free(rl);
+        #define PROMPT_LIVE    "fantasi> "
+        #define PROMPT_DEAD    "\001" C_RED "\002" "fantasi" "\001" C_RESET "\002" "> "
 
-        if (cli_local_match(line)) {
-            if (!handle_local(line))
-                break;
-        } else {
-#ifdef HAS_BLE
-            if (use_ble || use_usb) {
-                /* Only a launch turns stdin into app I/O (so a piped ^C reaches
-                 * the app). Other streaming commands (ps, log, …) must NOT eat
-                 * stdin - that's the next scripted command. */
-                bool is_launch = strncmp(line, "launch", 6) == 0 &&
-                                 (line[6] == '\0' || line[6] == ' ');
-                ble_send_cmd(line);
-                ble_read_response(is_launch);
-                /* A command like `reboot` drops the link; reflect it now so
-                 * the prompt goes red and the idle hook starts reconnecting.
-                 * Covers both transports - over USB the failed transfer has
-                 * already marked usb_transport_connected() false. */
-                if ((use_ble && !ble_transport_connected()) ||
-                    (use_usb && !usb_transport_connected()))
-                    ser_connected = false;
-            } else
-#endif
-            {
-                /* Switch-mode devices (PM3) share USB endpoints between MSC and
-                 * CDC: fat_mount() closed the serial port (ser_fd < 0) while
-                 * mounted, so a serial command must leave MSC first. Composite
-                 * devices (FZ/CU) keep CDC live alongside MSC (ser_fd stays
-                 * open) and handle concurrent access, so don't unmount - that
-                 * churned the OS mount on every serial/storage switch. */
-                if (ser_fd < 0 && msc_active)
-                    fat_unmount();
-                if (ser_fd >= 0) {
-                    ser_send_cmd(line);
-                    ser_read_response();
-                } else if (!ser_connected) {
-                    fprintf(stderr, "device disconnected\n");
-                }
-            }
+        while (running) {
+            const char *prompt = ser_connected ? PROMPT_LIVE : PROMPT_DEAD;
+            char *rl = readline(prompt);
+            if (!rl) break;
+            if (!rl[0]) { free(rl); continue; }
+            add_history(rl);
+            if (hist[0]) write_history(hist);            /* persist this command immediately */
+
+            char line[256];
+            strncpy(line, rl, sizeof(line) - 1);
+            line[sizeof(line) - 1] = '\0';
+            free(rl);
+
+            if (!exec_line(line)) break;
         }
     }
 

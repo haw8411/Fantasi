@@ -11,6 +11,13 @@ static libusb_device_handle *s_dev;
 static int      s_itf   = -1;
 static uint8_t  s_ep_in;
 static uint8_t  s_ep_out;
+static char     s_want_name[64]; /* restrict to this device name (iSerial), for multi-device setups (empty = any) */
+
+void usb_transport_set_name(const char *name)
+{
+    if (name) { strncpy(s_want_name, name, sizeof s_want_name - 1); s_want_name[sizeof s_want_name - 1] = 0; }
+    else s_want_name[0] = 0;
+}
 
 /* Locate the vendor (class 0xFF) interface on the open device and record its
  * bulk endpoints. Returns 0 on success. */
@@ -60,6 +67,14 @@ int usb_transport_open(void)
         if (find_vendor_interface(list[i]) != 0) continue;   /* not in vendor mode */
 
         if (libusb_open(list[i], &s_dev) != 0) { s_dev = NULL; continue; }
+        if (s_want_name[0]) {                        /* filter by device name (iSerial) for multi-device setups */
+            unsigned char name[64];
+            int sr = dd.iSerialNumber
+                   ? libusb_get_string_descriptor_ascii(s_dev, dd.iSerialNumber, name, sizeof name) : -1;
+            if (sr < 0 || strcmp((char *)name, s_want_name) != 0) {
+                libusb_close(s_dev); s_dev = NULL; continue;
+            }
+        }
         libusb_set_auto_detach_kernel_driver(s_dev, 1);
         /* A vendor device with no kernel driver may be left unconfigured by the
          * OS; set config 1 explicitly before claiming (else claim fails and the

@@ -11,7 +11,8 @@
 #define APP_MAX_SECTIONS 32
 
 typedef struct {
-    void    *sec[APP_MAX_SECTIONS];   /* allocated base per ELF section (NULL if none) */
+    void    *base;                    /* the single allocation holding every loaded section */
+    void    *sec[APP_MAX_SECTIONS];   /* per-section pointer into base (NULL if not loaded) */
     uint32_t entry;                   /* app_main runtime address (Thumb bit set) */
 } app_image_t;
 

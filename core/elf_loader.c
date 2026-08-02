@@ -58,11 +58,23 @@ static int fail(const char *msg) { strncpy(s_err, msg, sizeof(s_err) - 1); s_err
  * (returning "unresolved") keeps non-Berry builds linking. */
 __attribute__((weak)) uint32_t berry_resolve_api(const char *name) { (void)name; return 0; }
 
+/* App-facing RFID API resolver (core/rfid/rfid_api.c overrides this where
+ * FANTASI_ENABLE_RFID is set); weak default keeps non-RFID builds linking. */
+__attribute__((weak)) uint32_t rfid_resolve_api(const char *name) { (void)name; return 0; }
+
+/* App loader API resolver (core/app_run.c provides fantasi_run_module); weak
+ * default keeps builds without the app loader linking. */
+__attribute__((weak)) uint32_t app_resolve_api(const char *name) { (void)name; return 0; }
+
 static uint32_t resolve_helper(const char *name)
 {
     for (unsigned i = 0; i < sizeof(g_helpers)/sizeof(g_helpers[0]); i++)
         if (strcmp(name, g_helpers[i].name) == 0) return g_helpers[i].addr;
-    return berry_resolve_api(name);
+    uint32_t a = berry_resolve_api(name);
+    if (a) return a;
+    a = rfid_resolve_api(name);
+    if (a) return a;
+    return app_resolve_api(name);
 }
 
 /* Set the error string without returning (for the goto-cleanup paths). */
@@ -116,6 +128,40 @@ int app_load(app_read_fn rd, void *ctx, uint32_t total, app_image_t *img)
     if ((uint64_t)symtab_sh.sh_offset + symtab_sh.sh_size > total ||
         (uint64_t)strtab_sh.sh_offset + strtab_sh.sh_size > total) { seterr("bad sym/str range"); goto err; }
 
+    /* Pass 0: lay every SHF_ALLOC section out inside one image block and allocate it.
+     *
+     * Both of these matter for heap fragmentation, which is what limits how much a loaded
+     * module can then allocate for itself on a small heap:
+     *
+     *  - One block, not one per section. Per-section allocation scattered a module's
+     *    text/rodata/bss (plus a heap_4 header each) through the free space it was carving
+     *    them out of; a single block leaves the remainder contiguous.
+     *  - Allocated before strtab/symtab (which only relocation needs). Those are freed
+     *    before returning, so allocating them after the image means their space coalesces
+     *    back into the tail free region instead of being stranded as a hole in front of the
+     *    resident image - which is what split the heap into two useless halves.
+     *
+     * Sections are packed at their own sh_addralign (capped at portBYTE_ALIGNMENT, which
+     * pvPortMalloc guarantees for the base), so the layout is exactly as strict as before. */
+    uint32_t imgsz = 0;
+    uint32_t secoff[APP_MAX_SECTIONS] = {0};
+    for (unsigned i = 0; i < eh.e_shnum; i++) {
+        Elf32_Shdr *sh = &shdrs[i];
+        if (!(sh->sh_flags & SHF_ALLOC) || sh->sh_size == 0) continue;
+        if (sh->sh_addralign > portBYTE_ALIGNMENT) { seterr("over-aligned"); goto err; }
+        uint32_t a = sh->sh_addralign ? sh->sh_addralign : 1;
+        imgsz = (imgsz + a - 1) & ~(a - 1);
+        secoff[i] = imgsz;
+        imgsz += sh->sh_size;
+        if (sh->sh_type != SHT_NOBITS && (uint64_t)sh->sh_offset + sh->sh_size > total) {
+            seterr("bad section"); goto err;
+        }
+    }
+    if (imgsz) {
+        img->base = pvPortMalloc(imgsz);
+        if (!img->base) { seterr("out of memory"); goto err; }
+    }
+
     /* Buffer strtab + symtab so relocation lookups stay in RAM (no per-symbol
      * file reads). These are freed before return; only the loaded image stays. */
     uint32_t strsz = strtab_sh.sh_size, symsz = symtab_sh.sh_size;
@@ -126,20 +172,17 @@ int app_load(app_read_fn rd, void *ctx, uint32_t total, app_image_t *img)
         rd_at(rd, ctx, symtab_sh.sh_offset, symtab, symsz) != 0) { seterr("read error"); goto err; }
     unsigned nsym = symsz / sizeof(Elf32_Sym);
 
-    /* Pass 1: allocate each SHF_ALLOC section and stream it straight from the
-     * file into its RAM (no whole-ELF buffer). */
+    /* Pass 1: point each section at its slot in the image block and stream it
+     * straight from the file into that RAM (no whole-ELF buffer). */
     for (unsigned i = 0; i < eh.e_shnum; i++) {
         Elf32_Shdr *sh = &shdrs[i];
         if (!(sh->sh_flags & SHF_ALLOC) || sh->sh_size == 0) continue;
-        if (sh->sh_addralign > portBYTE_ALIGNMENT) { seterr("over-aligned"); goto err; }
-        void *mem = pvPortMalloc(sh->sh_size);
-        if (!mem) { seterr("out of memory"); goto err; }
+        void *mem = (uint8_t *)img->base + secoff[i];
         img->sec[i] = mem;
         secsz[i] = sh->sh_size;
         if (sh->sh_type == SHT_NOBITS) {
             memset(mem, 0, sh->sh_size);
         } else {
-            if ((uint64_t)sh->sh_offset + sh->sh_size > total) { seterr("bad section"); goto err; }
             if (rd_at(rd, ctx, sh->sh_offset, mem, sh->sh_size) != 0) { seterr("read error"); goto err; }
         }
     }
@@ -221,8 +264,9 @@ err:
 
 void app_unload(app_image_t *img)
 {
-    for (int i = 0; i < APP_MAX_SECTIONS; i++) {
-        if (img->sec[i]) { vPortFree(img->sec[i]); img->sec[i] = NULL; }
-    }
+    /* One allocation covers every section (see app_load Pass 0), so sec[] entries are
+     * interior pointers - free only the base. */
+    if (img->base) { vPortFree(img->base); img->base = NULL; }
+    for (int i = 0; i < APP_MAX_SECTIONS; i++) img->sec[i] = NULL;
     img->entry = 0;
 }

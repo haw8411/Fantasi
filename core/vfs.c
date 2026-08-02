@@ -115,6 +115,30 @@ int vfs_write_file(const char *path, const void *buf, uint32_t len)
     return (n == (lfs_ssize_t)len && crc >= 0) ? 0 : -1;
 }
 
+/* Append `buf` to the end of `path` (created if absent). Lets a module stream a large log incrementally
+ * without buffering it all - the whole-file write_file would truncate. */
+int vfs_append(const char *path, const void *buf, uint32_t len)
+{
+    fatrd_invalidate();
+#if HAS_RAMFS
+    if (vfs_is_ramfs(path)) {
+        const char *leaf = vfs_ramfs_leaf(path);
+        int32_t sz = ramfs_size(leaf); if (sz < 0) sz = 0;
+        return ramfs_write_at(leaf, (uint32_t)sz, buf, len);
+    }
+#endif
+    lfs_t *lfs = hal_storage_lfs();
+    if (!lfs) return -1;
+    static uint8_t fc[256];
+    struct lfs_file_config fcfg = { .buffer = fc };
+    lfs_file_t f;
+    if (lfs_file_opencfg(lfs, &f, path,
+                         LFS_O_WRONLY | LFS_O_CREAT | LFS_O_APPEND, &fcfg) < 0) return -1;
+    lfs_ssize_t n = lfs_file_write(lfs, &f, buf, len);
+    int crc = lfs_file_close(lfs, &f);
+    return (n == (lfs_ssize_t)len && crc >= 0) ? 0 : -1;
+}
+
 int32_t vfs_size(const char *path)
 {
 #if HAS_RAMFS

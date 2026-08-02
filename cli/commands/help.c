@@ -111,12 +111,18 @@ done:
                 entries[j] = tmp;
             }
 
+    int maxw = 0;                                   /* align descriptions to the widest command name (+2) */
     for (int i = 0; i < count; i++) {
+        int w = (int)strlen(entries[i].name);
+        if (w > maxw) maxw = w;
+    }
+    for (int i = 0; i < count; i++) {
+        int pad = maxw + 2 - (int)strlen(entries[i].name);
         if (entries[i].local)
-            printf("  " C_YELLOW "%-10s" C_RESET "  %s\n",
-                   entries[i].name, entries[i].help);
+            printf("  " C_YELLOW "%s" C_RESET "%*s%s\n",
+                   entries[i].name, pad, "", entries[i].help);
         else
-            printf("  %-10s  %s\n", entries[i].name, entries[i].help);
+            printf("  %s%*s%s\n", entries[i].name, pad, "", entries[i].help);
     }
 }
 

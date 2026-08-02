@@ -79,7 +79,7 @@ int main(void)
     xTaskCreate(platform_usb_task, "usb", USB_TASK_STACK, NULL, tskIDLE_PRIORITY + 2, NULL);
 
 #ifdef FANTASI_ENABLE_PWR_BUTTON
-    xTaskCreate(pwr_button_task, "pwrbtn", configMINIMAL_STACK_SIZE * 2,
+    xTaskCreate(pwr_button_task, "pwrbtn", configMINIMAL_STACK_SIZE,   /* shallow: poll + hal_shutdown (I2C PMIC regs only, no lfs/display) */
                 NULL, tskIDLE_PRIORITY + 1, NULL);
 #endif
 

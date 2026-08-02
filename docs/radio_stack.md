@@ -32,20 +32,25 @@ signed by ST.
 
 ### Which binary?
 
-ST publishes multiple BLE stack variants. The binary **must match the FUS version
-on your device**. The Flipper Zero ships with FUS 1.2.0. Use the binaries
-vendored in the Flipper firmware repo at
-`lib/stm32wb_copro/firmware/stm32wb5x_BLE_*.bin` - these are pinned to the
-correct FUS version.
+The binary **must match the FUS version on your device**. The Flipper Zero ships
+with FUS 1.2.0. By default `radio_flash.py` fetches the right one for you:
+`stm32wb5x_BLE_Stack_full_extended_fw.bin`, pinned to
+[`flipperdevices/stm32wb_copro`](https://github.com/flipperdevices/stm32wb_copro)
+tag `v1.20.0`, verified against a known SHA-256 and cached under `build/copro/`
+(so later runs are offline). You can override with an explicit path.
+
+**Use the flipperdevices/stm32wb_copro binaries, not ST's STM32CubeWB ones** - the
+STM32CubeWB builds are incompatible with the Flipper's FUS 1.2.0 and fail on-device
+with `IMG_NOT_AUTHENTIC`. The SHA gate in `radio_flash.py` enforces this: it refuses
+to flash anything but the pinned binary unless you pass a path yourself.
+
+Variants (all in that repo; pass a path to use one other than the default):
 
 | Binary | Size | Features |
 |---|---|---|
 | `stm32wb5x_BLE_Stack_light_fw.bin` | ~117 KB | Peripheral + GATT server, up to 4 links |
 | `stm32wb5x_BLE_Stack_full_fw.bin` | ~152 KB | Central + peripheral, up to 8 links |
-| `stm32wb5x_BLE_Stack_full_extended_fw.bin` | ~189 KB | Full + extended advertising/scanning |
-
-**Do not use binaries from the STM32CubeWB GitHub `master` branch** - they may be
-a newer version incompatible with FUS 1.2.0 (error: `IMG_NOT_AUTHENTIC`).
+| `stm32wb5x_BLE_Stack_full_extended_fw.bin` | ~189 KB | Full + extended advertising/scanning (default) |
 
 ### Flashing
 
@@ -53,7 +58,10 @@ a newer version incompatible with FUS 1.2.0 (error: `IMG_NOT_AUTHENTIC`).
 # 1. Enter DFU mode
 fantasi> dfu
 
-# 2. Run the flashing tool
+# 2. Run the flashing tool (no arg: fetch + SHA-verify the pinned default)
+python3 tools/radio_flash.py
+
+# ...or flash a specific binary you already have:
 python3 tools/radio_flash.py path/to/stm32wb5x_BLE_Stack_full_extended_fw.bin
 ```
 

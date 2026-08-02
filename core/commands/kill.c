@@ -32,6 +32,6 @@ static int cmd_kill(int argc, char **argv)
     return 0;
 }
 
-CLI_COMMAND("kill", "stop the running app: kill [pid]", cmd_kill);
+CLI_COMMAND("kill", "stop a pid or the running app", cmd_kill);
 
 #endif

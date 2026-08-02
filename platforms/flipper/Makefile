@@ -34,6 +34,7 @@ DEFS := -DSTM32WB55xx \
         -DFANTASI_ENABLE_GUI \
         -DFANTASI_ENABLE_WEBUSB \
         -DFANTASI_ENABLE_PWR_BUTTON \
+        -DFANTASI_ENABLE_RFID \
         -DFANTASI_FAT_STORAGE \
         -DLFS_NO_MALLOC \
         -DLFS_NO_DEBUG -DLFS_NO_WARN -DLFS_NO_ERROR \
@@ -41,7 +42,10 @@ DEFS := -DSTM32WB55xx \
         -DFANTASI_GIT_HASH=\"$(GIT_HASH)\" \
         -DWEBUSB_PROTO_STACK=1024 \
         -DBLE_PROTO_STACK=1024 \
+        -DUSB_TASK_STACK=2048 \
         $(EXTRA_DEFS)
+# USB_TASK_STACK bumped 1024->2048 words (4KB->8KB): the MSC host-write path (tud_task -> fatrd_write ->
+# build_model's littlefs traversal + write_dir + picolibc vsnprintf) overflows the 4KB "usb" task. Flipper has ample RAM.
 
 INCLUDES := \
     -I$(ROOT)/core \
@@ -98,6 +102,11 @@ SRCS := \
     $(ROOT)/platforms/flipper/gui.c \
     $(ROOT)/platforms/flipper/font_data.c \
     $(ROOT)/platforms/flipper/flash_storage.c \
+    $(ROOT)/platforms/flipper/rfid.c \
+    $(ROOT)/core/rfid/rfid_crc.c \
+    $(ROOT)/core/rfid/rfid_iso14443a.c \
+    $(ROOT)/core/rfid/rfid_em4100.c \
+    $(ROOT)/core/rfid/rfid_api.c \
     $(ROOT)/hal/storage/hal_storage.c \
     $(ROOT)/hal/storage/msc_device.c \
     $(ROOT)/hal/storage/fat_ramdisk.c \
@@ -164,7 +173,14 @@ $(BUILD)/splash.bin: $(SPLASH_PNG)
 
 $(BUILD)/%.o: $(ROOT)/%.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
+
+# Header dependencies. Without these a header-only edit rebuilds nothing, so an object
+# silently keeps a stale view of any struct/macro declared in that header - e.g. a change
+# to app_image_t in core/elf_loader.h would leave core/app_run.o (which owns a static
+# app_image_t) laid out to the old struct while the loader wrote the new fields. -MMD -MP
+# emits a .d per object; -MP adds phony targets so a deleted header doesn't stall make.
+-include $(OBJS:.o=.d)
 
 $(BUILD)/$(TARGET).elf: $(OBJS) $(LDSCRIPT)
 	@mkdir -p $(BUILD)

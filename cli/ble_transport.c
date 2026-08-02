@@ -29,10 +29,16 @@
 static sd_bus *bus;
 static char device_path[256];
 static char forced_addr[64];
+static char wanted_name[64];   /* restrict discovery to this device name (empty = any) */
 
 void ble_transport_set_addr(const char *addr)
 {
     snprintf(forced_addr, sizeof(forced_addr), "%s", addr);
+}
+
+void ble_transport_set_name(const char *name)
+{
+    snprintf(wanted_name, sizeof(wanted_name), "%s", name ? name : "");
 }
 static char rx_char_path[256];
 static char tx_char_path[256];
@@ -157,6 +163,14 @@ static int find_fantasi_device(void)
         if (strncmp(dev_name, "Fantasi ", 8) != 0 &&
             !has_uuid_in_array(obj_path, SVC_UUID_FZ) &&
             !has_uuid_in_array(obj_path, SVC_UUID_NUS))
+            continue;
+
+        /* Name filter (--name): the advertised name is "Fantasi <name>", so match
+         * against the suffix. A UUID-only match with no readable name can't be
+         * confirmed against the requested name, so drop it. */
+        if (wanted_name[0] &&
+            (strncmp(dev_name, "Fantasi ", 8) != 0 ||
+             strcmp(dev_name + 8, wanted_name) != 0))
             continue;
 
         if (n < (int)(sizeof(cand) / sizeof(cand[0]))) {

@@ -15,6 +15,12 @@ int  usb_transport_open(void);
 void usb_transport_close(void);
 bool usb_transport_connected(void);
 
+/* Restrict usb_transport_open() to the device with this name, for
+ * disambiguating multiple connected Fantasi devices. The device's name
+ * (hal_device_name()) is carried in the USB iSerialNumber string
+ * descriptor, so this matches against iSerial. NULL/empty = any. */
+void usb_transport_set_name(const char *name);
+
 /* Active liveness probe (a GET_STATUS on EP0). Returns false and marks the
  * transport disconnected once the device is unplugged. Use to detect an idle
  * disconnect, where there's no bulk traffic to surface the removal. */

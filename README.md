@@ -11,7 +11,7 @@
 | Flipper Zero | STM32WB55 (Cortex-M4) | `dfu-util` via ROM DFU |
 | Kiisu | STM32WB55 (Cortex-M4)| `dfu-util` via ROM DFU |
 | Chameleon Ultra | nRF52840 (Cortex-M4) | `nrfutil` DFU |
-| Proxmark3 | AT91SAM7S256/512 (ARM7TDMI) | `tools/pm3_flasher.py` (pyserial) |
+| Proxmark3 | AT91SAM7S512 (ARM7TDMI) | `tools/pm3_flasher.py` (pyserial) |
 | Proxmark5 | AT32F435 | Coming soon |
 | Kiisu Smol | STM32WB55 (Cortex-M4) | Coming soon |
 | Kode Dot | ESP32-S3 | Coming soon |

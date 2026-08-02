@@ -30,7 +30,7 @@ RAMFS_PATH = "/ramfs/hello"
 # What apps/hello/hello.c is expected to emit (see that file).
 EXPECT_GREETING = "hello from a Fantasi app"
 EXPECT_HEAP = "x" * 31          # the malloc'd buffer it fills and prints
-EXPECT_ABI = "abi=2"          # app_api.h FANTASI_APP_ABI
+EXPECT_ABI = "abi=3"          # app_api.h FANTASI_APP_ABI
 EXPECT_EXIT = "exit 42"
 
 

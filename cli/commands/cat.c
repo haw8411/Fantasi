@@ -24,16 +24,12 @@ static void cmd_cat(const char *arg)
 }
 
 #ifdef HAS_BLE
-/* Resumable, windowed download over BLE: request the file in bounded CAT_WINDOW
- * ranges so a dropped notification only re-requests one window. See the long note
- * in the protocol docs; ble_drain_quiet() clears stale stream bytes before a
- * resume. */
-static void ble_cmd_cat(const char *arg)
+/* Resumable, windowed download of device file `path` to `out`: request the file in bounded CAT_WINDOW
+ * ranges so a dropped notification only re-requests one window. See the long note in the protocol docs;
+ * ble_drain_quiet() clears stale stream bytes before a resume. Returns 0, or -1 on a hard error (printed).
+ * Shared by `cat` (out = stdout) and `edit`'s WebUSB temp-file path. `path` must already be resolved. */
+int ble_download(const char *path, FILE *out)
 {
-    if (!arg) { fprintf(stderr, "usage: cat <path>\n"); return; }
-    char path[256];
-    resolve_path(arg, path, sizeof(path));
-
     uint32_t got = 0;          /* contiguous bytes written so far */
     int stalls = 0;            /* consecutive re-requests with no progress */
     bool eof = false;
@@ -46,7 +42,7 @@ static void ble_cmd_cat(const char *arg)
                 sizeof(req.payload.file_read.path) - 1);
         req.payload.file_read.offset = got;
         req.payload.file_read.size = CAT_WINDOW;
-        if (ble_send_proto(&req) < 0) { fprintf(stderr, "send failed\n"); return; }
+        if (ble_send_proto(&req) < 0) { fprintf(stderr, "send failed\n"); return -1; }
 
         uint32_t before = got;
         bool last_seen = false, err_seen = false;
@@ -64,7 +60,7 @@ static void ble_cmd_cat(const char *arg)
                 if (off > got) break;                      /* gap → resume from `got` */
                 if (off + sz > got) {                      /* new (or partially new) bytes */
                     uint32_t skip = got - off;
-                    fwrite(b + skip, 1, sz - skip, stdout);
+                    fwrite(b + skip, 1, sz - skip, out);
                     got += sz - skip;
                 }
                 if (resp.payload.file_data.last) { last_seen = true; break; }
@@ -75,7 +71,7 @@ static void ble_cmd_cat(const char *arg)
         uint32_t delivered = got - before;
         if (err_seen) {
             if (got > 0) { eof = true; }                   /* error at/after EOF window */
-            else { fprintf(stderr, "error: %s\n", resp.payload.error.message); break; }
+            else { fprintf(stderr, "error: %s\n", resp.payload.error.message); return -1; }
         } else if (last_seen && delivered < CAT_WINDOW) {
             eof = true;                                    /* final (short) window */
         } else if (last_seen) {
@@ -84,13 +80,22 @@ static void ble_cmd_cat(const char *arg)
             /* window incomplete (gap/timeout) - resume it from `got` */
             if (delivered > 0) stalls = 0;
             else if (++stalls > 40) {
-                fprintf(stderr, "cat: download stalled at %u bytes\n", got);
-                break;
+                fprintf(stderr, "download stalled at %u bytes\n", got);
+                return -1;
             }
             ble_drain_quiet();                             /* clear stale stream before resume */
         }
     }
-    fflush(stdout);
+    fflush(out);
+    return 0;
+}
+
+static void ble_cmd_cat(const char *arg)
+{
+    if (!arg) { fprintf(stderr, "usage: cat <path>\n"); return; }
+    char path[256];
+    resolve_path(arg, path, sizeof(path));
+    ble_download(path, stdout);
 }
 #endif
 

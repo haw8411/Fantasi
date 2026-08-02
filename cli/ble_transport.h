@@ -7,6 +7,11 @@
 #include <sys/types.h>
 
 void    ble_transport_set_addr(const char *addr);
+
+/* Restrict device discovery to the Fantasi device with this name (the bare
+ * hal_device_name() token). Advertised as "Fantasi <name>", so the
+ * "Fantasi " prefix is matched automatically. NULL/empty = any. */
+void    ble_transport_set_name(const char *name);
 int     ble_transport_open(void);
 bool    ble_transport_reconnect(void);
 void    ble_transport_close(void);

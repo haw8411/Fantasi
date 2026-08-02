@@ -24,6 +24,7 @@ DEFS := -DNRF52840_XXAA \
         -DFANTASI_ENABLE_BERRY \
         -DFANTASI_ENABLE_WEBUSB \
         -DFANTASI_ENABLE_PWR_BUTTON \
+        -DFANTASI_ENABLE_RFID \
         -DFANTASI_FAT_STORAGE \
         -DLFS_NO_MALLOC \
         -DLFS_NO_DEBUG -DLFS_NO_WARN -DLFS_NO_ERROR \
@@ -80,6 +81,11 @@ SRCS := \
     $(ROOT)/platforms/chameleon/ble.c \
     $(ROOT)/platforms/chameleon/ble_serial.c \
     $(ROOT)/platforms/chameleon/hal.c \
+    $(ROOT)/platforms/chameleon/rfid.c \
+    $(ROOT)/core/rfid/rfid_crc.c \
+    $(ROOT)/core/rfid/rfid_iso14443a.c \
+    $(ROOT)/core/rfid/rfid_em4100.c \
+    $(ROOT)/core/rfid/rfid_api.c \
     $(ROOT)/platforms/chameleon/flash_storage.c \
     $(ROOT)/hal/storage/hal_storage.c \
     $(ROOT)/hal/storage/msc_device.c \
@@ -130,7 +136,14 @@ all: $(BUILD)/$(TARGET).hex $(BUILD)/$(TARGET).bin size
 
 $(BUILD)/%.o: $(ROOT)/%.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
+
+# Header dependencies. Without these a header-only edit rebuilds nothing, so an object
+# silently keeps a stale view of any struct/macro declared in that header - e.g. a change
+# to app_image_t in core/elf_loader.h would leave core/app_run.o (which owns a static
+# app_image_t) laid out to the old struct while the loader wrote the new fields. -MMD -MP
+# emits a .d per object; -MP adds phony targets so a deleted header doesn't stall make.
+-include $(OBJS:.o=.d)
 
 $(BUILD)/$(TARGET).elf: $(OBJS) $(LDSCRIPT)
 	@mkdir -p $(BUILD)

@@ -66,9 +66,13 @@ bool tud_msc_start_stop_cb(uint8_t lun, uint8_t power_condition,
     /* FAT writes are committed synchronously, so no flush is needed - but eject
      * must still fire hal_on_msc_eject() so switch-mode platforms (PM3) leave MSC
      * and re-enumerate as CDC. (No-op on composite FZ/CU.) */
-    if (load_eject && !start) hal_on_msc_eject();
+    if (load_eject && !start) { hal_on_msc_eject(); fatrd_release(); }   /* host ejected: drop the ~6 KB FAT model */
     return true;
 }
+
+/* USB unplugged: the host can no longer mount the drive, so free the synthetic-FAT model. Runs on the usb
+ * task (tud_task), same context as the MSC read/write callbacks, so it can't race a transfer. */
+void tud_umount_cb(void) { fatrd_release(); }
 
 void tud_msc_write10_complete_cb(uint8_t lun)
 {

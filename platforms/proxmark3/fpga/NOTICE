@@ -1,0 +1,18 @@
+Proxmark3 FPGA bitstreams
+=========================
+
+Files:
+  fpga_pm3_lf.bit   125 kHz LF reader gateware (Spartan-II XC2S30)
+  fpga_pm3_hf.bit   13.56 MHz HF reader/sniffer gateware (Spartan-II XC2S30)
+
+These are compiled FPGA bitstreams from the Proxmark3 project (Iceman fork),
+https://github.com/RfidResearchGroup/proxmark3, licensed under GPL-3.0.
+
+They are compiled artifacts of the Verilog sources in that project's fpga/
+directory (also vendored in this tree at original_fw/proxmark3/fpga/*.v, e.g.
+fpga_lf.v, fpga_hf.v, and the shared define.v / clk_divider.v). Per GPL-3.0,
+the corresponding source is those Verilog files; rebuild with the Xilinx ISE
+toolchain per the upstream fpga/Makefile.
+
+The build (platforms/proxmark3/Makefile) LZSS-compresses these into
+build/fpga/pm3_{lf,hf}.bit.z; the host streams them to /fpga on the device.

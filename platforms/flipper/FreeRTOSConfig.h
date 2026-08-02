@@ -20,6 +20,14 @@ extern unsigned char __heap_start__, __heap_end__;   /* linker heap region bound
 #define configTOTAL_HEAP_SIZE           ((size_t)(&__heap_end__ - &__heap_start__))
 #define configMAX_TASK_NAME_LEN         12
 #define configUSE_TRACE_FACILITY        1
+#define INCLUDE_uxTaskGetStackHighWaterMark 1
+/* App task stack (words). 4 KB overflows on the RFID MFC-emu auth path (recv Miller DSP + crypto1 + streamed
+ * reply build). The Flipper has ample RAM; give it 8 KB. */
+#define APP_TASK_STACK_WORDS            2048
+/* Fire the RFID emu ISR-shutdown the instant its task is deleted (abrupt kill / USB disconnect never runs
+ * emu_teardown, leaving the EXTI4 ISR notifying a freed task handle -> heap corruption -> USB stall). */
+extern void rfid_emu_task_deleted(void *tcb);
+#define traceTASK_DELETE(pxTCB)         rfid_emu_task_deleted((void *)(pxTCB))
 #define configUSE_16_BIT_TICKS          0
 #define configIDLE_SHOULD_YIELD         1
 #define configUSE_MUTEXES               1

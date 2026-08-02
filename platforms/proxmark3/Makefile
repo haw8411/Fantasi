@@ -23,6 +23,7 @@ DEFS := -DCFG_TUSB_MCU=OPT_MCU_AT91SAM7S \
         -DFANTASI_ENABLE_APPS \
         -DFANTASI_ENABLE_BERRY \
         -DFANTASI_ENABLE_WEBUSB \
+        -DFANTASI_ENABLE_RFID \
         -DFANTASI_FAT_STORAGE \
         -DLFS_NO_MALLOC \
         -DLFS_NO_DEBUG -DLFS_NO_WARN -DLFS_NO_ERROR \
@@ -81,6 +82,12 @@ SRCS_C := \
     $(ROOT)/core/libc_glue.c \
     $(ROOT)/platforms/proxmark3/hal.c \
     $(ROOT)/platforms/proxmark3/flash_storage.c \
+    $(ROOT)/platforms/proxmark3/rfid.c \
+    $(ROOT)/core/lzss.c \
+    $(ROOT)/core/rfid/rfid_crc.c \
+    $(ROOT)/core/rfid/rfid_iso14443a.c \
+    $(ROOT)/core/rfid/rfid_em4100.c \
+    $(ROOT)/core/rfid/rfid_api.c \
     $(ROOT)/core/ramfs.c \
     $(ROOT)/core/vfs.c \
     $(ROOT)/core/elf_loader.c \
@@ -127,19 +134,38 @@ endif
 
 SRCS_S := $(ROOT)/platforms/proxmark3/startup.S
 
+# LF + HF reader FPGA bitstreams: not embedded in firmware flash. Compressed
+# (tools/fpga_lzss.py) into build/fpga/ so the host `rfid` command can stream them
+# into /fpga on the device on first use; the driver loads them from there. This is
+# what lets 4+ protocols cost no app-region flash. See platforms/proxmark3/rfid.c.
+# Bitstreams are vendored in-tree (see platforms/proxmark3/fpga/NOTICE for source + license).
+FPGA_DIR := $(ROOT)/platforms/proxmark3/fpga
+FPGA_Z   := $(ROOT)/build/fpga/pm3_lf.bit.z $(ROOT)/build/fpga/pm3_hf.bit.z
+
 OBJS := $(patsubst $(ROOT)/%.c,$(BUILD)/%.o,$(SRCS_C)) \
         $(patsubst $(ROOT)/%.S,$(BUILD)/%.o,$(SRCS_S))
 
 .PHONY: all clean size
-all: $(BUILD)/$(TARGET).elf $(BUILD)/$(TARGET).bin size
+all: $(BUILD)/$(TARGET).elf $(BUILD)/$(TARGET).bin $(FPGA_Z) size
 
 $(BUILD)/%.o: $(ROOT)/%.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
 $(BUILD)/%.o: $(ROOT)/%.S
 	@mkdir -p $(dir $@)
-	$(AS) $(ASFLAGS) -c $< -o $@
+	$(AS) $(ASFLAGS) -MMD -MP -c $< -o $@
+
+# Header dependencies. Without these a header-only edit rebuilds nothing, so objects
+# silently keep a stale view of any struct it declares - e.g. changing app_image_t in
+# core/elf_loader.h would leave core/app_run.o (which owns a static app_image_t) laid out to
+# the old struct while core/elf_loader.o wrote the new fields. -MMD -MP
+# emits a .d per object; -MP adds phony targets so a deleted header doesn't stall make.
+-include $(OBJS:.o=.d)
+
+$(ROOT)/build/fpga/pm3_%.bit.z: $(FPGA_DIR)/fpga_pm3_%.bit
+	@mkdir -p $(dir $@)
+	python3 $(ROOT)/tools/fpga_lzss.py $< $@
 
 $(BUILD)/$(TARGET).elf: $(OBJS) $(LDSCRIPT)
 	@mkdir -p $(BUILD)

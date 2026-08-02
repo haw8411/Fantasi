@@ -15,13 +15,14 @@ The binary is placed at `build/cli/fantasi`. It has no filesystem dependency of 
 ## Usage
 
 ```
-fantasi [--ble[=ADDR]] [/dev/ttyACMx] [/dev/sdX]
+fantasi [--ble[=ADDR]] [--name NAME] [/dev/ttyACMx] [/dev/sdX]
 ```
 
 All arguments are optional:
 
 - No arguments - auto-detect a Fantasi device over USB (VID `1209` / PID `0001`, resolving the CDC and MSC interfaces). If no USB device is found, it falls back to BLE.
 - `/dev/ttyACMx` and/or `/dev/sdX` - pin a specific CDC port and/or MSC block device.
+- `--name NAME` - select a specific device by its name (the name `whoami` prints) when several Fantasi devices are connected. The name is the device's USB serial descriptor and BLE advertised name (`Fantasi <NAME>`), so it disambiguates over USB and BLE alike.
 - `--ble` - connect over BLE to the first paired/available Fantasi.
 - `--ble-addr=AA:BB:CC:DD:EE:FF` - connect over BLE to a specific address.
 

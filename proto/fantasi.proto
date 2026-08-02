@@ -10,6 +10,13 @@ message CliRequest {
     DirListRequest dir_list = 5;
     FileDeleteRequest file_delete = 6;
     MkdirRequest mkdir = 7;
+    // Async app session (host CLI `rfid` and any interactive launch): app_launch
+    // starts the app and returns immediately (unlike `command "launch ..."`,
+    // which streams synchronously); app_input feeds keystrokes to the running
+    // app; app_stop aborts it (the ^C equivalent).
+    string app_launch = 8 [(nanopb).max_size = 64];
+    bytes app_input = 9 [(nanopb).max_size = 64];
+    bool app_stop = 10;
   }
 }
 
@@ -21,6 +28,9 @@ message CliResponse {
     FileReadChunk file_data = 4;
     ErrorResponse error = 5;
     DirEntry dir_entry = 6;
+    // Device->host: a running app is asking for a feature module by name; the
+    // host answers with FileWriteChunk(s) into /ramfs. id echoes the app_launch.
+    string module_request = 7 [(nanopb).max_size = 32];
   }
 }
 

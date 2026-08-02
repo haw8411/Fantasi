@@ -9,6 +9,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdio.h>
 
 #ifdef HAS_BLE
 #include "ble_transport.h"
@@ -84,6 +85,13 @@ void cmd_exit(const char *arg);
 extern char cwd[256];                       /* device-side working directory */
 void  resolve_path(const char *arg, char *out, size_t len);
 
+void  load_client_settings(void);            /* (re)read device-backed client settings, e.g. the theme */
+
+/* Build $HOME/.fantasi/<name> into `out` (creating the dir), or "" if $HOME is unset. Used for the
+ * persistent readline history files (fantasi.log, fantasi.rfid.log). Defined in main.c. */
+void  fantasi_state_path(const char *name, char *out, size_t len);
+extern bool g_no_history;                    /* -c one-shot mode: don't read or persist any history */
+
 bool  fat_mount(void);                       /* ensure the Fantasi FAT is mounted */
 void  fat_unmount(void);
 const char *fat_path(const char *vpath);     /* device path -> host mount path */
@@ -109,7 +117,16 @@ int   ble_recv_proto(CliResponse *resp);
 void  ble_send_cmd(const char *cmd);
 void  ble_drain_quiet(void);                 /* discard rx until the link is quiet */
 void  ble_cmd_rm(const char *arg);           /* in rm.c; reused as rmdir's BLE handler */
+int   ble_download(const char *devpath, FILE *out);            /* windowed download (cat.c) */
+int   ble_upload(const char *localpath, const char *devpath); /* pipelined upload (upload.c) */
 #define CAT_WINDOW 4096                       /* windowed download chunk size */
+#endif
+
+#ifdef HAS_USB_VENDOR
+/* Bring a serial session up to the WebUSB vendor pipe (sets use_usb). No-op/true if already there.
+ * `required` makes a failure hard. Defined in main.c; used by `edit` when it needs the protobuf file
+ * path but the session is still on plain serial. */
+bool  try_webusb_upgrade(bool required);
 #endif
 
 #endif

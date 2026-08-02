@@ -1,0 +1,1235 @@
+/* Fantasi / Chameleon Ultra - RFID HAL (HF reader via MFRC522).
+ *
+ * Implements the hal_rfid.h contract for the Chameleon's HF *read* path, which
+ * is a discrete MFRC522 on SPI0 (the nRF's own NFCT is emulation-only and is a
+ * later phase; the LF chain likewise). Ported from the stock ChameleonUltra
+ * driver (application/src/rfid/reader/hf/rc522.c) but against bare nRF registers
+ * - no Nordic SDK. SPI0 is driven directly (NRF_SPI0->TXD/RXD/EVENTS_READY) with
+ * a software-toggled CS, exactly as the stock firmware does.
+ *
+ * Pin map: Ultra hw_ver 1 (matches platforms/chameleon/hal.c LED map):
+ *   CS=P1.06 MISO=P0.11 MOSI=P1.07 SCK=P1.04  HF_ANT_SEL=P1.10  READER_POWER=P1.15
+ */
+#include "nrf.h"
+#include "../../hal/hal_rfid.h"
+#include "../../core/vfs.h"
+
+#include "FreeRTOS.h"
+#include "task.h"
+
+#include <stdio.h>
+#include <string.h>
+
+/* ---- Pins (absolute nRF pin numbers: P1.x == 32 + x) ---- */
+#define PIN_CS        (32 + 6)    /* P1.06 */
+#define PIN_MISO      (0  + 11)   /* P0.11 */
+#define PIN_MOSI      (32 + 7)    /* P1.07 */
+#define PIN_SCK       (32 + 4)    /* P1.04 */
+#define PIN_HF_ANTSEL (32 + 10)   /* P1.10 */
+#define PIN_RDR_POWER (32 + 15)   /* P1.15 */
+#define PIN_LF_DRV    (0  + 31)   /* P0.31  LF antenna PWM carrier out */
+#define PIN_LF_OA     (0  + 29)   /* P0.29  LF op-amp comparator edges in */
+
+static NRF_GPIO_Type *port_of(uint32_t pin) { return (pin < 32) ? NRF_P0 : NRF_P1; }
+static uint32_t       bit_of(uint32_t pin)  { return pin & 31; }
+
+static void pin_out(uint32_t pin, int level)
+{
+    NRF_GPIO_Type *p = port_of(pin);
+    uint32_t b = bit_of(pin);
+    if (level) p->OUTSET = (1UL << b); else p->OUTCLR = (1UL << b);
+    p->PIN_CNF[b] = (GPIO_PIN_CNF_DIR_Output       << GPIO_PIN_CNF_DIR_Pos)
+                  | (GPIO_PIN_CNF_INPUT_Disconnect  << GPIO_PIN_CNF_INPUT_Pos);
+}
+static void pin_in(uint32_t pin)
+{
+    NRF_GPIO_Type *p = port_of(pin);
+    uint32_t b = bit_of(pin);
+    p->PIN_CNF[b] = (GPIO_PIN_CNF_DIR_Input   << GPIO_PIN_CNF_DIR_Pos)
+                  | (GPIO_PIN_CNF_INPUT_Connect << GPIO_PIN_CNF_INPUT_Pos);
+}
+static void pin_set(uint32_t pin, int level)
+{
+    NRF_GPIO_Type *p = port_of(pin);
+    if (level) p->OUTSET = (1UL << bit_of(pin)); else p->OUTCLR = (1UL << bit_of(pin));
+}
+
+#define CS_LOW()   pin_set(PIN_CS, 0)
+#define CS_HIGH()  pin_set(PIN_CS, 1)
+
+/* ---- MFRC522 register + command set (subset; see rc522.h upstream) ---- */
+#define CommandReg     0x01
+#define ComIrqReg      0x04
+#define ErrorReg       0x06
+#define Status2Reg     0x08
+#define FIFODataReg    0x09
+#define FIFOLevelReg   0x0A
+#define Control522Reg  0x0C
+#define BitFramingReg  0x0D
+#define ModeReg        0x11
+#define TxControlReg   0x14
+#define TxAutoReg      0x15
+#define MfRxReg        0x1D
+#define TModeReg       0x2A
+#define VersionReg     0x37
+
+/* Receiver registers used by the passive-RX card side of hal_rfid_hf_sniff. */
+#define RxModeReg      0x13
+#define RxSelReg       0x17
+#define RxThresholdReg 0x18
+#define DemodReg       0x19
+#define RFCfgReg       0x26
+
+#define PCD_IDLE       0x00
+#define PCD_RECEIVE    0x08
+#define PCD_TRANSCEIVE 0x0C
+#define PCD_RESET      0x0F
+
+static bool s_spi_up;
+static rfid_mode_t s_mode = RFID_OFF;
+
+/* ---- Raw SPI0 (legacy, non-DMA) - mode 0, 8 MHz, MSB first ---- */
+static void spi_init(void)
+{
+    if (s_spi_up) return;
+
+    pin_out(PIN_SCK, 0);      /* CPOL=0 idle low */
+    pin_out(PIN_MOSI, 0);
+    pin_in(PIN_MISO);
+    pin_out(PIN_CS, 1);       /* CS idle high */
+
+    NRF_SPI0->ENABLE   = 0;
+    NRF_SPI0->PSEL.SCK  = PIN_SCK;
+    NRF_SPI0->PSEL.MOSI = PIN_MOSI;
+    NRF_SPI0->PSEL.MISO = PIN_MISO;
+    NRF_SPI0->FREQUENCY = SPI_FREQUENCY_FREQUENCY_M8;
+    NRF_SPI0->CONFIG    = (SPI_CONFIG_CPOL_ActiveHigh << SPI_CONFIG_CPOL_Pos)
+                        | (SPI_CONFIG_CPHA_Leading    << SPI_CONFIG_CPHA_Pos)
+                        | (SPI_CONFIG_ORDER_MsbFirst  << SPI_CONFIG_ORDER_Pos);
+    NRF_SPI0->EVENTS_READY = 0;
+    NRF_SPI0->ENABLE   = SPI_ENABLE_ENABLE_Enabled;
+    s_spi_up = true;
+}
+
+static void spi_deinit(void)
+{
+    if (!s_spi_up) return;
+    NRF_SPI0->ENABLE = 0;
+    s_spi_up = false;
+}
+
+static uint8_t spi_xfer(uint8_t v)
+{
+    NRF_SPI0->EVENTS_READY = 0;
+    NRF_SPI0->TXD = v;
+    /* Bounded wait: an 8 MHz byte completes in ~1 us, so this guard is orders of magnitude of slack.
+     * Without it a glitched/stuck SPI transaction busy-waits forever and freezes the whole task.
+     * Never hang; return whatever RXD holds. */
+    uint32_t guard = 100000;
+    while (NRF_SPI0->EVENTS_READY == 0 && --guard) { }
+    NRF_SPI0->EVENTS_READY = 0;
+    return (uint8_t)NRF_SPI0->RXD;
+}
+
+/* MFRC522 SPI address byte: bit7 = read, bits[6:1] = addr, bit0 = 0. */
+static uint8_t reg_read(uint8_t addr)
+{
+    uint8_t a = (uint8_t)(((addr << 1) & 0x7E) | 0x80);
+    CS_LOW();
+    spi_xfer(a);            /* address phase */
+    uint8_t v = spi_xfer(a);/* clock out value (repeat addr per datasheet) */
+    CS_HIGH();
+    return v;
+}
+static void reg_write(uint8_t addr, uint8_t val)
+{
+    uint8_t a = (uint8_t)((addr << 1) & 0x7E);
+    CS_LOW();
+    spi_xfer(a);
+    spi_xfer(val);
+    CS_HIGH();
+}
+static void reg_set(uint8_t addr, uint8_t mask)   { reg_write(addr, reg_read(addr) | mask); }
+static void reg_clear(uint8_t addr, uint8_t mask) { reg_write(addr, reg_read(addr) & (uint8_t)~mask); }
+
+static void reg_write_fifo(const uint8_t *buf, int n)
+{
+    uint8_t a = (uint8_t)((FIFODataReg << 1) & 0x7E);
+    CS_LOW();
+    spi_xfer(a);
+    for (int i = 0; i < n; i++) spi_xfer(buf[i]);
+    CS_HIGH();
+}
+static void reg_read_fifo(uint8_t *buf, int n)
+{
+    uint8_t a = (uint8_t)(((FIFODataReg << 1) & 0x7E) | 0x80);
+    CS_LOW();
+    spi_xfer(a);
+    for (int i = 0; i < n; i++) buf[i] = spi_xfer(a);
+    CS_HIGH();
+}
+
+static void rc522_reset(void)
+{
+    reg_write(CommandReg, PCD_IDLE);
+    reg_write(CommandReg, PCD_RESET);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    reg_clear(TxControlReg, 0x03);   /* antenna off */
+    reg_write(TModeReg, 0x00);       /* use MCU timeout, not the 522 timer */
+    reg_write(TxAutoReg, 0x40);      /* 100% ASK */
+    reg_write(ModeReg, 0x3D);        /* CRC preset 0x6363, common tx/rx */
+    vTaskDelay(pdMS_TO_TICKS(10));
+}
+
+/* ---- LF 125 kHz reader (ASK read via SAADC envelope + software demod) ----
+ * A 125 kHz carrier on LF_ANT_DRIVER (PWM0, 4 MHz base / COUNTERTOP) energises
+ * the tag; its load modulation comes back demodulated on the op-amp output
+ * LF_OA_OUT (= AIN5). The SAADC samples that envelope once per carrier cycle
+ * (PWMPERIODEND -> SAMPLE via PPI) into RAM, and hal_rfid_lf_acquire recovers the
+ * inter-edge intervals in software (see there for why this beats a GPIOTE digital
+ * edge detector). core/rfid/rfid_em4100.c turns the intervals into a UID.
+ * Frontend + timing reference: ChameleonUltra lf_125khz_radio.c (no nrfx). */
+
+#define LF_PPI_SAADC   1   /* PWMPERIODEND -> SAADC SAMPLE */
+#define LF_AIN         SAADC_CH_PSELP_PSELP_AnalogInput5   /* LF_OA_OUT = P0.29 = AIN5 */
+
+/* Carrier via a 4 MHz PWM clock: f = 4 MHz / COUNTERTOP, so top 32 => 125 kHz.
+ * s_pwm_val is the compare (duty) value; a low duty (~1/8) keeps the op-amp gain
+ * stages linear - see the acquire comment for why that matters. */
+static uint16_t  s_lf_top = 32;                /* 4 MHz / 32 = 125 kHz (bit rate lands in the op-amp band) */
+#define LF_DUTY_RX  4                          /* ~1/8 duty: linear amps (50% clips them rail-to-rail and erases the data) */
+/* EasyDMA re-reads this every PWM period (SEQ REFRESH=0 + loop shorts), so a plain store changes the drive
+ * within one carrier cycle - volatile because the peripheral, not this code, is the other reader. */
+static volatile uint16_t s_pwm_val = LF_DUTY_RX;
+static bool      s_lf_inited;
+static bool      s_pwm_running;
+
+/* Envelope sample buffer, sized for ~2 EM4100 frames (64 bits x ~64 carrier
+ * cycles/bit x 2) so an aligned 64-bit frame is always contained. */
+#define LF_ENV_SAMPLES 9000
+static int16_t s_lf_env[LF_ENV_SAMPLES];
+
+static void lf_hw_init(void)
+{
+    if (s_lf_inited) return;
+
+    pin_out(PIN_LF_DRV, 0);
+    /* LF_OA_OUT read as analog (AIN5) by the SAADC; leave the pin's digital
+     * input buffer disconnected so it doesn't load the op-amp output. */
+    NRF_P0->PIN_CNF[29] = (GPIO_PIN_CNF_DIR_Input      << GPIO_PIN_CNF_DIR_Pos)
+                        | (GPIO_PIN_CNF_INPUT_Disconnect << GPIO_PIN_CNF_INPUT_Pos);
+
+    /* PWM0: gapless 125 kHz carrier on LF_ANT_DRIVER. */
+    NRF_PWM0->PSEL.OUT[0] = PIN_LF_DRV;
+    NRF_PWM0->PSEL.OUT[1] = 0xFFFFFFFF;
+    NRF_PWM0->PSEL.OUT[2] = 0xFFFFFFFF;
+    NRF_PWM0->PSEL.OUT[3] = 0xFFFFFFFF;
+    NRF_PWM0->ENABLE     = PWM_ENABLE_ENABLE_Enabled;
+    NRF_PWM0->MODE       = PWM_MODE_UPDOWN_Up;
+    NRF_PWM0->PRESCALER  = PWM_PRESCALER_PRESCALER_DIV_4;    /* 16 MHz/4 = 4 MHz */
+    NRF_PWM0->COUNTERTOP = s_lf_top;                         /* 4 MHz/32 = 125 kHz */
+    NRF_PWM0->LOOP       = 1;
+    NRF_PWM0->DECODER    = (PWM_DECODER_LOAD_Common << 0) |
+                           (PWM_DECODER_MODE_RefreshCount << 8);
+    NRF_PWM0->SEQ[0].PTR     = (uint32_t)(uintptr_t)&s_pwm_val;
+    NRF_PWM0->SEQ[0].CNT     = 1;
+    /* REFRESH=0 + LOOPSDONE->SEQSTART0: EasyDMA re-fetches the duty every period, so the drive level can be
+     * changed by storing to s_pwm_val with no STOP/SEQSTART. */
+    NRF_PWM0->SEQ[0].REFRESH = 0;
+    NRF_PWM0->SEQ[0].ENDDELAY = 0;
+    /* SEQ[1] must mirror SEQ[0]: the loop mechanism plays SEQ0 then SEQ1 before LOOPSDONE, so with SEQ1
+     * unconfigured the playback never loops and EasyDMA never re-fetches - the duty then appears frozen
+     * (carrier fine, but a gap silently does nothing). nrfx_pwm_simple_playback sets both for this reason. */
+    NRF_PWM0->SEQ[1].PTR      = (uint32_t)(uintptr_t)&s_pwm_val;
+    NRF_PWM0->SEQ[1].CNT      = 1;
+    NRF_PWM0->SEQ[1].REFRESH  = 0;
+    NRF_PWM0->SEQ[1].ENDDELAY = 0;
+    NRF_PWM0->SHORTS = PWM_SHORTS_LOOPSDONE_SEQSTART0_Msk;
+
+    /* PPI: the PWM period end drives each SAADC sample, so we sample exactly once
+     * per carrier cycle (a sample index is therefore a carrier-cycle count). */
+    NRF_PPI->CH[LF_PPI_SAADC].EEP = (uint32_t)(uintptr_t)&NRF_PWM0->EVENTS_PWMPERIODEND;
+    NRF_PPI->CH[LF_PPI_SAADC].TEP = (uint32_t)(uintptr_t)&NRF_SAADC->TASKS_SAMPLE;
+
+    s_lf_inited = true;
+}
+
+static void lf_start(void)
+{
+    if (!s_lf_inited) return;
+    s_pwm_val = LF_DUTY_RX;             /* restore the drive level (a gap parks it at 0) */
+    if (!s_pwm_running) { NRF_PWM0->TASKS_SEQSTART[0] = 1; s_pwm_running = true; }
+}
+
+static void lf_stop(void)
+{
+    if (!s_lf_inited) return;
+    NRF_PWM0->TASKS_STOP = 1;
+    s_pwm_running = false;
+    NRF_PPI->CHENCLR = (1u << LF_PPI_SAADC);
+}
+
+/* DMA-sample AIN5 for `nsamp` samples at the carrier rate; returns 0 on success. The buffer is int16_t
+ * (SAADC result width) regardless of resolution. PWMPERIODEND drives SAMPLE over PPI, so a sample index is a
+ * carrier-cycle count - what the EM4100 decoder's interval arithmetic depends on. */
+
+static int lf_sample(int16_t *raw, int nsamp)
+{
+    NRF_SAADC->RESOLUTION = SAADC_RESOLUTION_VAL_8bit;
+    NRF_SAADC->CH[0].PSELP  = LF_AIN;
+    NRF_SAADC->CH[0].PSELN  = 0;
+    NRF_SAADC->CH[0].CONFIG =
+        (SAADC_CH_CONFIG_GAIN_Gain1_6   << SAADC_CH_CONFIG_GAIN_Pos)   |
+        (SAADC_CH_CONFIG_REFSEL_Internal << SAADC_CH_CONFIG_REFSEL_Pos) |
+        (SAADC_CH_CONFIG_TACQ_3us       << SAADC_CH_CONFIG_TACQ_Pos)   |
+        (SAADC_CH_CONFIG_MODE_SE         << SAADC_CH_CONFIG_MODE_Pos)   |
+        (SAADC_CH_CONFIG_RESP_Bypass     << SAADC_CH_CONFIG_RESP_Pos);
+    NRF_SAADC->ENABLE = SAADC_ENABLE_ENABLE_Enabled;
+
+    NRF_SAADC->RESULT.PTR    = (uint32_t)(uintptr_t)raw;
+    NRF_SAADC->RESULT.MAXCNT = (uint32_t)nsamp;
+    NRF_SAADC->EVENTS_STARTED = 0;
+    NRF_SAADC->EVENTS_END     = 0;
+    NRF_SAADC->TASKS_START = 1;
+    for (uint32_t g = 0; !NRF_SAADC->EVENTS_STARTED && g < 1000000; g++) { }   /* never hang on a stuck SAADC */
+
+    NRF_PPI->CHENSET = (1u << LF_PPI_SAADC);   /* let PWMPERIODEND drive SAMPLE */
+
+    /* nsamp/125kHz ~ 72 ms; poll for completion with margin. */
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(nsamp / 100 + 50);
+    while (!NRF_SAADC->EVENTS_END && xTaskGetTickCount() < deadline)
+        vTaskDelay(pdMS_TO_TICKS(5));
+
+    NRF_PPI->CHENCLR = (1u << LF_PPI_SAADC);
+    NRF_SAADC->EVENTS_STOPPED = 0;
+    NRF_SAADC->TASKS_STOP = 1;
+    for (uint32_t g = 0; !NRF_SAADC->EVENTS_STOPPED && g < 1000000; g++) { }
+    NRF_SAADC->ENABLE = 0;
+    NRF_SAADC->CH[0].PSELP = 0;   /* fully disconnect AIN5 so it can't load LF_OA_OUT */
+    return NRF_SAADC->EVENTS_END ? 0 : -1;
+}
+
+/* HF tag-emulation state (defined with the NFCT emulation block below; declared here for set_mode). */
+static int s_emu_armed;
+static int s_emu_active;
+
+/* ---- HAL contract ---- */
+
+uint32_t hal_rfid_caps(void)
+{
+    /* HF read (Ci522) + LF read (EM4100/T5577) + HF ISO14443-A tag emulation on the nRF's own NFCT.
+     * LF emulation is still a later phase (see docs/rfid.md). */
+    return RFID_CAP_HF_READ | RFID_CAP_LF_READ | RFID_CAP_HF_EMU;
+}
+
+int hal_rfid_set_mode(rfid_mode_t mode)
+{
+    if (mode == s_mode) return 0;
+
+    switch (mode) {
+    case RFID_HF_READER:
+        pin_out(PIN_RDR_POWER, 1);   /* reader analog power on */
+        pin_out(PIN_HF_ANTSEL, 0);   /* HF antenna -> reader (RC522) */
+        spi_init();
+        rc522_reset();
+        reg_set(TxControlReg, 0x03); /* energise the HF field: mfc modules transceive right after set_mode
+                                      * and never call field(1), so bring it up here (CU antenna_on). */
+        vTaskDelay(pdMS_TO_TICKS(5));/* field settle + card power-up before the first WUPA */
+        s_mode = RFID_HF_READER;
+        return 0;
+
+    case RFID_LF_READER:
+        pin_out(PIN_RDR_POWER, 1);   /* reader analog power on (LF op-amp) */
+        pin_out(PIN_HF_ANTSEL, 0);
+        /* The stock reader_mode_enter also brings up the RC522 here; it shares
+         * READER_POWER and the reader analog frontend, so mirror that. */
+        spi_init();
+        rc522_reset();
+        lf_hw_init();
+        s_mode = RFID_LF_READER;
+        return 0;
+
+    case RFID_HF_EMU:
+        /* Tag emulation runs on the nRF's own NFCT, not the Ci522: route the shared coil to the NFCT tap and
+         * put the reader frontend away so it cannot drive the antenna. Auto-collision-resolution is disabled
+         * so every frame reaches software - the module owns anticollision (it answers ATQA/UID/SAK itself)
+         * and, more importantly, MIFARE auth frames must not be answered by hardware. */
+        reg_clear(TxControlReg, 0x03);            /* make sure the reader field is off before switching */
+        spi_deinit();
+        pin_out(PIN_RDR_POWER, 0);
+        pin_out(PIN_HF_ANTSEL, 1);                /* shared antenna -> NFCT */
+        NRF_CLOCK->EVENTS_HFCLKSTARTED = 0;       /* NFCT needs the crystal, not the internal RC */
+        NRF_CLOCK->TASKS_HFCLKSTART = 1;
+        for (uint32_t g = 0; g < 200000 && !NRF_CLOCK->EVENTS_HFCLKSTARTED; g++) { }
+        NRF_NFCT->FRAMEDELAYMODE = 3;             /* WindowGrid: HW places the reply on the 14443-A timing grid */
+        NRF_NFCT->FRAMEDELAYMAX  = 0xFFFF;
+        NRF_NFCT->SENSRES = (NRF_NFCT->SENSRES & ~NFCT_SENSRES_BITFRAMESDD_Msk)
+                          | (NFCT_SENSRES_BITFRAMESDD_SDD00100 << NFCT_SENSRES_BITFRAMESDD_Pos);
+        *(volatile uint32_t *)0x4000559C |= 0x1UL;   /* AUTOCOLRESCONFIG.MODE = Disabled (undocumented reg) */
+        NRF_NFCT->EVENTS_FIELDDETECTED = 0;
+        NRF_NFCT->EVENTS_FIELDLOST     = 0;
+        NRF_NFCT->EVENTS_RXFRAMESTART  = 0;
+        NRF_NFCT->EVENTS_RXFRAMEEND    = 0;
+        NRF_NFCT->EVENTS_RXERROR       = 0;
+        NRF_NFCT->EVENTS_TXFRAMEEND    = 0;
+        NRF_NFCT->ERRORSTATUS = 0xFFFFFFFFUL;
+        NRF_NFCT->TASKS_SENSE = 1;
+        s_emu_armed = 0;
+        s_emu_active = 0;
+        s_mode = RFID_HF_EMU;
+        return 0;
+
+    case RFID_OFF:
+        if (s_spi_up) reg_clear(TxControlReg, 0x03);  /* HF antenna off */
+        spi_deinit();
+        lf_stop();
+        pin_out(PIN_RDR_POWER, 0);
+        s_mode = RFID_OFF;
+        return 0;
+
+    default:
+        return -1;   /* emulation not yet implemented on CU */
+    }
+}
+
+void hal_rfid_field(bool on)
+{
+    if (!s_spi_up) return;
+    if (on) reg_set(TxControlReg, 0x03);
+    else    reg_clear(TxControlReg, 0x03);
+}
+
+int hal_rfid_hf_probe(void)
+{
+    if (!s_spi_up) return -1;
+    return reg_read(VersionReg);
+}
+
+/* Unwrap an NFCT NoParity (RXD.FRAMECONFIG bit0=0) RX frame: the HW delivers the raw 9-bits-per-byte stream
+ * (8 data LSB-first + 1 parity bit), so pull out the data bytes and record which parity bits violate
+ * ISO14443-A odd parity (bit i of *par set = byte i's parity was wrong). Short frames (<9 bits: 7-bit
+ * WUPA/REQA, 4-bit ACK/NAK) carry no parity - pass the partial byte through. Returns the byte count.
+ * total_bits = (RXD.AMOUNT & 0xFFF): the register packs RXDATABYTES<<3 | RXDATABITS = total bits directly. */
+static int nfct_unwrap(const uint8_t *raw, int total_bits, uint8_t *out, uint32_t *par, int cap)
+{
+    *par = 0;
+    if (total_bits <= 0) return 0;
+    if (total_bits < 9) {                        /* short frame: one (partial) byte, no parity */
+        if (cap > 0) out[0] = (uint8_t)(raw[0] & ((1u << total_bits) - 1));
+        return cap > 0 ? 1 : 0;
+    }
+    int n = 0;
+    for (int bp = 0; bp + 8 <= total_bits && n < cap; bp += 9) {
+        uint8_t b = 0;
+        for (int i = 0; i < 8; i++)
+            if (raw[(bp + i) >> 3] & (1u << ((bp + i) & 7))) b |= (uint8_t)(1u << i);
+        out[n] = b;
+        int pp = bp + 8;
+        if (pp < total_bits) {                    /* odd parity: correct bit = !parity(byte) */
+            int pbit = (raw[pp >> 3] >> (pp & 7)) & 1;
+            if (pbit != (!__builtin_parity(b))) *par |= (1u << n);
+        }
+        n++;
+    }
+    return n;
+}
+
+/* EasyDMA RX buffer for the NFCT reader-direction receive (word-aligned RAM). */
+static uint8_t s_nfc_rx[261] __attribute__((aligned(4)));
+
+/* ---- HF ISO14443-A tag emulation (nRF NFCT) ----
+ * The module speaks the PM3's symbol contract: one byte per subcarrier symbol, TAG_SEC_D/E for a logic 1/0
+ * and TAG_SEC_F for the stop bit, with the start bit first and ISO14443-A parity already interleaved after
+ * every byte. NFCT is frame-oriented instead, but its BIT mode maps onto that one-for-one: each symbol is a
+ * bit, so we drop the leading start symbol (NFCT's SOF supplies it), stop at TAG_SEC_F, and hand the packed
+ * bits to TXD with FRAMECONFIG = SOF only.
+ *
+ * Leaving NFCT's automatic PARITY off is what makes MIFARE work at all: Crypto1 ENCRYPTS the parity bits, so
+ * they do not follow the odd-parity rule and hardware-generated parity would be wrong on every encrypted
+ * response. The module already produced the right (encrypted) parity symbols; we just pass them through. */
+static inline void spin_us(uint32_t us);   /* defined with the LF block below */
+
+#define EMU_SEC_D 0xF0     /* logic 1 - subcarrier in the first half-bit  */
+#define EMU_SEC_F 0x00     /* stop bit / no modulation                    */
+
+static uint8_t s_nfc_tx[64] __attribute__((aligned(4)));
+/* s_emu_armed: EasyDMA RX is armed for the next reader frame.
+ * s_emu_active: NFCT has been ACTIVATEd in the current field. (Both declared above set_mode.) */
+
+/* Arm EasyDMA for one reader frame. NoParity RX (FRAMECONFIG bit0 = 0) hands us the raw 9-bits-per-byte
+ * stream so nfct_unwrap can recover the reader's parity bits too. */
+static void emu_arm_rx(void)
+{
+    /* SOF expected (bit 2) so the HW consumes the start-of-frame symbol; PARITY off (bit 0) so the reader's
+     * parity bits stay in the stream for nfct_unwrap. Clearing SOF instead makes NFCT hand the start bit over
+     * as data, which shifts every byte left by one. */
+    NRF_NFCT->RXD.FRAMECONFIG = NFCT_RXD_FRAMECONFIG_SOF_Msk;
+    NRF_NFCT->PACKETPTR = (uint32_t)(uintptr_t)s_nfc_rx;
+    NRF_NFCT->MAXLEN = sizeof s_nfc_rx;
+    NRF_NFCT->EVENTS_RXFRAMEEND = 0;
+    NRF_NFCT->EVENTS_RXERROR    = 0;
+    NRF_NFCT->TASKS_ENABLERXDATA = 1;
+    s_emu_armed = 1;
+}
+
+/* Pack a symbol run into s_nfc_tx and fire it. `skip` is how many leading symbols to drop before the data:
+ * a frame built by iso14a_tag_encode carries a correction template and a start bit (2), while the streaming
+ * Crypto1 source emits only a start bit (1). Both are PM3 artefacts - the template exists to pick the 1236
+ * vs 1172 FDT there, and NFCT's SOF supplies the start bit - so neither belongs on the wire here. Returns
+ * bits sent, or <0. */
+static int emu_tx_bits(const uint8_t *sym, int n, int skip)
+{
+    int nbits = 0;
+    for (int i = skip; i < n && nbits < (int)sizeof s_nfc_tx * 8; i++) {
+        if (sym[i] == EMU_SEC_F) break;            /* stop bit ends the frame */
+        if (sym[i] == EMU_SEC_D) s_nfc_tx[nbits >> 3] |=  (uint8_t)(1u << (nbits & 7));
+        else                     s_nfc_tx[nbits >> 3] &= (uint8_t)~(1u << (nbits & 7));
+        nbits++;
+    }
+    if (nbits <= 0) return RFID_ERR_UNSUPP;
+
+    NRF_NFCT->PACKETPTR = (uint32_t)(uintptr_t)s_nfc_tx;
+    /* AMOUNT packs TXDATABYTES<<3 | TXDATABITS, so writing the raw bit count sets both fields correctly. */
+    NRF_NFCT->TXD.AMOUNT = (uint32_t)nbits;
+    NRF_NFCT->TXD.FRAMECONFIG = NFCT_TXD_FRAMECONFIG_SOF_Msk;   /* SOF only: parity is already in the stream */
+    NRF_NFCT->FRAMEDELAYMODE = 3;                  /* WindowGrid - HW lands the reply on the 14443-A grid */
+    NRF_NFCT->EVENTS_TXFRAMEEND = 0;
+    NRF_NFCT->TASKS_STARTTX = 1;
+
+    for (uint32_t g = 0; !NRF_NFCT->EVENTS_TXFRAMEEND && g < 2000000; g++) { }  /* never hang on a missed TX */
+    NRF_NFCT->EVENTS_TXFRAMEEND = 0;
+    /* Let the modulation settle before re-arming, else the tail of our own reply is captured as a bogus
+     * reader frame (seen as a full-length RXD.AMOUNT of 4095). */
+    spin_us(60);
+    NRF_NFCT->ERRORSTATUS = 0xFFFFFFFFUL;
+    emu_arm_rx();                                  /* the reader's next command follows immediately */
+    return nbits;
+}
+
+int hal_rfid_hf_emu_recv(uint8_t *rx, uint8_t *rx_par, int cap, uint32_t timeout_ms)
+{
+    if (s_mode != RFID_HF_EMU || !rx || cap <= 0) return RFID_ERR_UNSUPP;
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms ? timeout_ms : 100);
+
+    for (;;) {
+        if (NRF_NFCT->EVENTS_FIELDDETECTED) {      /* reader arrived: leave SENSE for the active state */
+            NRF_NFCT->EVENTS_FIELDDETECTED = 0;
+            *(volatile uint32_t *)0x4000559C |= 0x1UL;
+            NRF_NFCT->TASKS_ACTIVATE = 1;
+            s_emu_active = 1;
+            emu_arm_rx();
+        }
+        if (NRF_NFCT->EVENTS_FIELDLOST) {          /* reader left: back to sensing, drop any half-frame */
+            NRF_NFCT->EVENTS_FIELDLOST = 0;
+            NRF_NFCT->TASKS_SENSE = 1;
+            s_emu_active = 0; s_emu_armed = 0;
+        }
+        if (s_emu_active && !s_emu_armed) emu_arm_rx();
+
+        if (NRF_NFCT->EVENTS_RXERROR) {            /* framing/parity glitch: requeue, the reader will retry */
+            NRF_NFCT->EVENTS_RXERROR = 0;
+            NRF_NFCT->ERRORSTATUS = 0xFFFFFFFFUL;
+            s_emu_armed = 0;
+            continue;
+        }
+        if (NRF_NFCT->EVENTS_RXFRAMEEND) {
+            NRF_NFCT->EVENTS_RXFRAMEEND = 0;
+            s_emu_armed = 0;
+            int bits = (int)(NRF_NFCT->RXD.AMOUNT & 0xFFF);
+            if (bits >= 0xFFF) { continue; }       /* saturated count = not a real reader frame */
+            uint32_t par = 0;
+            int n = nfct_unwrap(s_nfc_rx, bits, rx, &par, cap);
+            /* rx_par[i] = the parity bit RECEIVED for byte i (nfct_unwrap flags violations of odd parity;
+             * an encrypted reader frame legitimately violates it, which is why the raw bit is what matters). */
+            if (rx_par)
+                for (int i = 0; i < n; i++)
+                    rx_par[i] = (uint8_t)(((par >> i) & 1) ? !!__builtin_parity(rx[i]) : !__builtin_parity(rx[i]));
+            if (n > 0) return n;
+            continue;
+        }
+        if (xTaskGetTickCount() > deadline) return 0;
+    }
+}
+
+int hal_rfid_hf_emu_send(const uint8_t *tosend, int len)
+{
+    if (s_mode != RFID_HF_EMU || !tosend || len <= 1) return RFID_ERR_UNSUPP;
+    return emu_tx_bits(tosend, len, 2) < 0 ? RFID_ERR_UNSUPP : 0;   /* template + start bit */
+}
+
+int hal_rfid_hf_emu_send_stream(uint8_t (*next)(void *ctx), void *ctx, int nsymbols)
+{
+    if (s_mode != RFID_HF_EMU || !next || nsymbols <= 3) return RFID_ERR_UNSUPP;
+
+    /* Protocol-agnostic: `next` yields one ISO14443-A tag symbol per call (EMU_SEC_D/E for a logic 1/0), and
+     * this streams them to air. What the symbols are - a Crypto1-encrypted MIFARE reply today, some future
+     * ISO14443-4 frame tomorrow - lives entirely in the caller's producer; the HAL never decodes it. The
+     * frame is start-bit + (nsymbols-2) data/parity symbols + stop-bit (the ISO14443-A tag framing every HF
+     * card protocol shares), and each middle symbol is one air bit.
+     *
+     * The optimisation is generic too, which is why it belongs here and not in any protocol module: overlap
+     * the producer with transmission, the NFCT analog of the PM3's paced FPGA feed. Pulling every symbol
+     * before STARTTX would put the producer's whole cost into the FDT (~400 us for an 18-byte reply when the
+     * producer is a per-symbol software cipher). Instead pull a head, fire STARTTX, then pull the tail while
+     * EasyDMA drains the buffer: WindowGrid delays the first symbol to FRAMEDELAYMIN (~85 us) after STARTTX
+     * and the 9.4 us/bit air rate outpaces any reasonable producer, so a small lead stays ahead to the last
+     * bit. Any streamed tag reply benefits, whatever produced it. */
+    int nbits = nsymbols - 2;
+    if (nbits <= 0 || nbits > (int)sizeof s_nfc_tx * 8) return RFID_ERR_UNSUPP;
+
+    (void)next(ctx);                                 /* consume the start bit - NFCT's SOF supplies it */
+    int head = nbits < 16 ? nbits : 16;              /* 2-byte lead: EasyDMA prefetches ~2 bytes at STARTTX, so 1 byte underruns */
+    int p = 0;
+    for (; p < head; p++) {
+        if (next(ctx) == EMU_SEC_D) s_nfc_tx[p >> 3] |=  (uint8_t)(1u << (p & 7));
+        else                        s_nfc_tx[p >> 3] &= (uint8_t)~(1u << (p & 7));
+    }
+
+    NRF_NFCT->PACKETPTR = (uint32_t)(uintptr_t)s_nfc_tx;
+    NRF_NFCT->TXD.AMOUNT = (uint32_t)nbits;           /* BYTES<<3|BITS; DiscardEnd drops the last byte's unused
+                                                       * high bits (LSB-first safe) */
+    NRF_NFCT->TXD.FRAMECONFIG = NFCT_TXD_FRAMECONFIG_SOF_Msk;   /* SOF only: parity comes from the producer's
+                                                                * symbols, not HW (it may not be plain odd parity) */
+    NRF_NFCT->FRAMEDELAYMODE = 3;
+    NRF_NFCT->EVENTS_TXFRAMEEND = 0;
+    NRF_NFCT->TASKS_STARTTX = 1;
+
+    for (; p < nbits; p++) {                          /* pull the tail while the head is already on air */
+        if (next(ctx) == EMU_SEC_D) s_nfc_tx[p >> 3] |=  (uint8_t)(1u << (p & 7));
+        else                        s_nfc_tx[p >> 3] &= (uint8_t)~(1u << (p & 7));
+    }
+
+    for (uint32_t g = 0; !NRF_NFCT->EVENTS_TXFRAMEEND && g < 2000000; g++) { }
+    NRF_NFCT->EVENTS_TXFRAMEEND = 0;
+    spin_us(60);
+    NRF_NFCT->ERRORSTATUS = 0xFFFFFFFFUL;
+    emu_arm_rx();
+    return 0;
+}
+
+/* ---- Passive dual-receiver HF sniff (see the rfid-chameleon-sniff design) ----
+ * True simultaneous bidirectional eavesdrop of an external reader<->card exchange, TX never fired: the nRF
+ * NFCT decodes the reader's modified-Miller (parity-preserving via nfct_unwrap), the Ci522 correlator decodes
+ * the card's 847 kHz load-modulation - both on the shared coil at once. A free-running 1 MHz TIMER stamps every
+ * frame (PPI HW-captures each RXFRAMEEND); the card side is coalesced (the Ci522 emits one byte at a time) and
+ * gated to the between-reader-frames window (bursts during / just after the reader's TX are Miller artifacts).
+ * Emits the host sniff wire-format to dump_path - a leading "L<couple> f o v m p1000" header (p1000 = the
+ * timestamps are already us) then one "<R|C> <start_us> <end_us> <hex>[!].." line per frame - and returns the
+ * frame count (RFID_ERR_TIMEOUT with the file cleared if the window was silent). Runs one window; the app loops. */
+int hal_rfid_hf_sniff(const char *dump_path, uint32_t timeout_ms)
+{
+    if (!s_spi_up || s_mode != RFID_HF_READER || !dump_path) return RFID_ERR_UNSUPP;
+    if (!timeout_ms) timeout_ms = 1500;
+
+    const int cap = 4096;                         /* <= the app's read buffer; frames stop at cap-300 */
+    char *txt = pvPortMalloc((size_t)cap);        /* heap only for the sniff's duration (idle-RAM discipline) */
+    if (!txt) return RFID_ERR_UNSUPP;
+
+    /* ---- both receivers on the coil, passive ---- */
+    pin_out(PIN_HF_ANTSEL, 1);                    /* route the shared antenna to the NFCT tap (was reader-only) */
+    pin_out(PIN_RDR_POWER, 1);                    /* Ci522 alive (already on in HF_READER) */
+    rc522_reset();
+    vTaskDelay(pdMS_TO_TICKS(60));
+    NRF_CLOCK->EVENTS_HFCLKSTARTED = 0;
+    NRF_CLOCK->TASKS_HFCLKSTART = 1;
+    for (uint32_t g = 0; g < 200000 && !NRF_CLOCK->EVENTS_HFCLKSTARTED; g++) { }
+
+    /* Ci522 -> passive card RX. Operating point picked by an on-device sweep vs a pm3 reading a tag (bad-frame
+     * rate ~17% -> ~4%): RxModeReg=0x0E is the big win - RxMultiple(bit3)=1 makes the receiver delimit frames
+     * properly (free-running byte-drain otherwise glued leading Miller-pause noise onto each response); RxCRCEn
+     * (bit7)=0 still keeps all bytes (anticoll has no CRC). RxThreshold=0x88 (MinLevel 8) is a noise gate that
+     * rejects the weak leading-edge junk while the strong on-coil response still decodes. Gain stays max (0x70);
+     * lowering it made framing worse. TxControlReg=0 keeps the field off (passive). */
+    reg_write(TxControlReg, 0x00);
+    reg_write(TModeReg, 0x00);
+    reg_write(RxModeReg, 0x0E);
+    reg_write(RFCfgReg, 0x70);
+    reg_write(RxThresholdReg, 0x88);
+    reg_write(DemodReg, 0x4D);
+    reg_write(ModeReg, 0x3D);
+    reg_set(FIFOLevelReg, 0x80);                  /* flush FIFO */
+    reg_write(ComIrqReg, 0x7F);
+    reg_write(CommandReg, PCD_RECEIVE);           /* free-running receive, no TX */
+
+    /* NFCT -> passive reader RX. FRAMEDELAYMODE=3 (WindowGrid) is load-bearing: FreeRun never trips the field
+     * detector in side-eavesdrop geometry. Auto-collision-resolution disabled -> deliver any demodulated frame. */
+    NRF_NFCT->FRAMEDELAYMODE = 3;
+    NRF_NFCT->SENSRES = (NRF_NFCT->SENSRES & ~NFCT_SENSRES_BITFRAMESDD_Msk)
+                      | (NFCT_SENSRES_BITFRAMESDD_SDD00100 << NFCT_SENSRES_BITFRAMESDD_Pos);
+    *(volatile uint32_t *)0x4000559C |= 0x1UL;    /* AUTOCOLRESCONFIG.MODE = Disabled */
+    NRF_NFCT->EVENTS_FIELDDETECTED = 0;
+    NRF_NFCT->EVENTS_FIELDLOST = 0;
+    NRF_NFCT->EVENTS_RXFRAMESTART = 0;
+    NRF_NFCT->EVENTS_RXFRAMEEND = 0;
+    NRF_NFCT->EVENTS_RXERROR = 0;
+    NRF_NFCT->ERRORSTATUS = 0xFFFFFFFFUL;
+    NRF_NFCT->TASKS_SENSE = 1;
+
+    /* us timebase: TIMER2 free-run @1 MHz; PPI CH[3] HW-stamps each RXFRAMEEND into CC[0] (no poll latency). */
+    NRF_TIMER2->MODE      = TIMER_MODE_MODE_Timer;
+    NRF_TIMER2->BITMODE   = TIMER_BITMODE_BITMODE_32Bit;
+    NRF_TIMER2->PRESCALER = 4;                    /* 16 MHz / 16 = 1 MHz -> 1 tick = 1 us */
+    NRF_TIMER2->TASKS_CLEAR = 1;
+    NRF_TIMER2->TASKS_START = 1;
+    NRF_PPI->CH[3].EEP = (uint32_t)(uintptr_t)&NRF_NFCT->EVENTS_RXFRAMEEND;
+    NRF_PPI->CH[3].TEP = (uint32_t)(uintptr_t)&NRF_TIMER2->TASKS_CAPTURE[0];
+    NRF_PPI->CHENSET = (1u << 3);
+
+    const int FSTART = 40;                        /* reserve the front for the L-header, prepended at the end */
+    int pos = FSTART, valid = 0, activated = 0, in_reader_tx = 0;
+    uint32_t iters = 0;
+    uint8_t  cbuf[32]; int cbn = 0;               /* card-byte coalescing buffer (one demod byte arrives at a time) */
+    unsigned long cbt0 = 0, cbt_last = 0, rx_end_us = 0, r_start_us = 0;
+    const unsigned long CARD_GUARD_US = 180;      /* drop Ci522 bytes <180 us after a reader frame (Miller edge) */
+
+    /* Emit the coalesced card frame: start = first byte, end = last byte + ~1 byte-time. The Ci522's
+     * Manchester decoder reads one extra empty byte-slot (0x00) after every response ends - drop that single
+     * trailing 00 so the host sees the true frame length (ATQA 44 00, UID+BCC ..36, SAK ..17) and its
+     * length-keyed annotation + BCC/CRC check land. A lone-00 frame collapses to nothing (pure artifact). */
+#define FLUSH_CARD() do { \
+        if (cbn > 0 && cbuf[cbn - 1] == 0x00) cbn--; \
+        if (cbn > 0) { \
+            if (pos < cap - 200) { \
+                valid++; \
+                pos += snprintf(txt + pos, (size_t)(cap - pos), "C %lu %lu", cbt0, cbt_last + 86); \
+                for (int _i = 0; _i < cbn; _i++) pos += snprintf(txt + pos, (size_t)(cap - pos), " %02X", cbuf[_i]); \
+                txt[pos++] = '\n'; \
+            } \
+            cbn = 0; \
+        } \
+    } while (0)
+
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+    while (xTaskGetTickCount() < deadline) {
+        /* ---- reader direction (NFCT) ---- */
+        if (!activated && NRF_NFCT->EVENTS_FIELDDETECTED) {
+            NRF_NFCT->EVENTS_FIELDDETECTED = 0;
+            vTaskDelay(pdMS_TO_TICKS(1));
+            NRF_NFCT->TASKS_ACTIVATE = 1;
+            NRF_NFCT->RXD.FRAMECONFIG = 0x04;     /* NoParity: HW delivers raw bits -> nfct_unwrap keeps parity */
+            NRF_NFCT->PACKETPTR = (uint32_t)(uintptr_t)s_nfc_rx;
+            NRF_NFCT->MAXLEN = sizeof s_nfc_rx;
+            NRF_NFCT->TASKS_ENABLERXDATA = 1;
+            activated = 1;
+        }
+        if (NRF_NFCT->EVENTS_RXFRAMESTART) {
+            NRF_NFCT->EVENTS_RXFRAMESTART = 0;
+            in_reader_tx = 1;
+            NRF_TIMER2->TASKS_CAPTURE[2] = 1;
+            r_start_us = NRF_TIMER2->CC[2];
+        }
+        int rgot = NRF_NFCT->EVENTS_RXFRAMEEND ? 1 : (NRF_NFCT->EVENTS_RXERROR ? 2 : 0);
+        if (rgot == 1) NRF_NFCT->EVENTS_RXFRAMEEND = 0;
+        if (rgot == 2) NRF_NFCT->EVENTS_RXERROR = 0;
+        if (rgot) {
+            in_reader_tx = 0;                     /* reader frame done -> the card may respond now */
+            rx_end_us = NRF_TIMER2->CC[0];        /* PPI-captured exact RXFRAMEEND time (us) */
+            int total_bits = (int)(NRF_NFCT->RXD.AMOUNT & 0xFFF);
+            uint8_t data[64]; uint32_t rpar;
+            int n = nfct_unwrap(s_nfc_rx, total_bits, data, &rpar, (int)sizeof data);
+            FLUSH_CARD();                         /* the card's response to the PREVIOUS reader frame goes first */
+            if (n > 0 && pos < cap - 300) {
+                valid++;
+                pos += snprintf(txt + pos, (size_t)(cap - pos), "R %lu %lu", r_start_us, rx_end_us);
+                for (int i = 0; i < n; i++)       /* '!' marks a byte whose parity disagreed with ISO14443-A odd */
+                    pos += snprintf(txt + pos, (size_t)(cap - pos), " %02X%s", data[i], (rpar >> i) & 1 ? "!" : "");
+                txt[pos++] = '\n';
+            }
+            NRF_NFCT->TASKS_ENABLERXDATA = 1;     /* re-arm for the next frame */
+        }
+        if (NRF_NFCT->EVENTS_FIELDLOST) { NRF_NFCT->EVENTS_FIELDLOST = 0; activated = 0; in_reader_tx = 0; NRF_NFCT->TASKS_SENSE = 1; }
+
+        /* ---- card direction (Ci522), gated + coalesced ---- */
+        uint8_t lvl = (uint8_t)(reg_read(FIFOLevelReg) & 0x7F);
+        if (lvl > 0) {
+            uint8_t buf[64];
+            int n = lvl > 64 ? 64 : lvl;
+            reg_read_fifo(buf, n);
+            reg_write(ComIrqReg, 0x7F);
+            NRF_TIMER2->TASKS_CAPTURE[1] = 1;
+            unsigned long t = NRF_TIMER2->CC[1];
+            if (!(in_reader_tx || (t - rx_end_us) < CARD_GUARD_US)) {   /* keep only real card responses */
+                if (cbn > 0 && (t - cbt_last) > 300) FLUSH_CARD();      /* gap -> a distinct card frame */
+                if (cbn == 0) cbt0 = t;
+                for (int i = 0; i < n && cbn < (int)sizeof cbuf; i++) cbuf[cbn++] = buf[i];
+                cbt_last = t;
+            }
+        }
+        if ((++iters & 0xFF) == 0) taskYIELD();
+    }
+    FLUSH_CARD();
+#undef FLUSH_CARD
+
+    /* ---- restore the reader front-end (mirror set_mode(HF_READER) so a re-entrant call is clean) ---- */
+    NRF_PPI->CHENCLR = (1u << 3);
+    NRF_TIMER2->TASKS_STOP = 1;
+    reg_write(CommandReg, PCD_IDLE);
+    reg_clear(TxControlReg, 0x03);
+    NRF_NFCT->TASKS_SENSE = 1;
+    rc522_reset();
+    pin_out(PIN_HF_ANTSEL, 0);
+
+    if (valid == 0) {                             /* silent window: clear the file so the app doesn't reprint a stale trace */
+        vPortFree(txt);
+        vfs_write_file(dump_path, "", 0);
+        return RFID_ERR_TIMEOUT;
+    }
+
+    /* Prepend the header into the reserved slot. Coupling / field strength is reported as unknown (couple
+     * sentinel 9), not estimated: the CU has no way to measure it - NFCT FIELDPRESENT is binary (datasheet
+     * 6.14.13.31) and there is no envelope ADC on the coil - and capture quality is not a proxy for it (a card
+     * emitting bad frames under perfect coupling would read "weak"). Only the frame count is real. The host
+     * renders couple>=3 as a plain "unknown" (vs the Flipper's measured 0/1/2 = strong/fair/weak). p1000 tells
+     * the host the timestamps are already us. */
+    char h[40];
+    int hl = snprintf(h, sizeof h, "L9 v%d p1000\n", valid);
+    memcpy(txt + (FSTART - hl), h, (size_t)hl);
+    vfs_write_file(dump_path, txt + (FSTART - hl), (uint32_t)(pos - (FSTART - hl)));
+    vPortFree(txt);
+    return valid;
+}
+
+int hal_rfid_hf_transceive(const uint8_t *tx, int tx_bits, uint32_t flags,
+                           uint8_t *rx, int rx_cap, uint32_t timeout_us)
+{
+    if (!s_spi_up || s_mode != RFID_HF_READER) return RFID_ERR_UNSUPP;
+    if (tx_bits <= 0) return RFID_ERR_FRAMING;
+
+    int tx_bytes = (tx_bits + 7) / 8;
+    uint8_t tx_last_bits = (uint8_t)(tx_bits & 7);   /* 0 => full final byte */
+
+    /* Parity: ISO14443-A hardware parity on by default; suppress for the short
+     * anticollision/REQA frames (RFID_HF_NO_PARITY). */
+    if (flags & RFID_HF_NO_PARITY) reg_set(MfRxReg, 0x10);
+    else                           reg_clear(MfRxReg, 0x10);
+
+    reg_write(CommandReg, PCD_IDLE);
+    reg_clear(ComIrqReg, 0x80);       /* clear IRQ flags */
+    reg_set(FIFOLevelReg, 0x80);      /* flush FIFO */
+    reg_write_fifo(tx, tx_bytes);
+    reg_write(CommandReg, PCD_TRANSCEIVE);
+    reg_write(BitFramingReg, tx_last_bits);
+    reg_set(BitFramingReg, 0x80);     /* StartSend */
+
+    uint32_t ms = timeout_us ? (timeout_us / 1000) : 25;
+    if (ms == 0) ms = 1;
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(ms) + 1;
+
+    uint8_t irq = 0;
+    bool timed_out = true;
+    /* waitFor = RxIRq | IdleIRq (0x20 | 0x10) */
+    while (xTaskGetTickCount() <= deadline) {
+        irq = reg_read(ComIrqReg);
+        if (irq & 0x30) { timed_out = false; break; }
+    }
+
+    reg_clear(BitFramingReg, 0x80);   /* stop send */
+    reg_write(BitFramingReg, 0x00);
+
+    if (timed_out) return RFID_ERR_TIMEOUT;
+
+    uint8_t err = reg_read(ErrorReg);
+    if (err & 0x01) return RFID_ERR_FRAMING;    /* ProtocolErr */
+    /* ParityErr (0x02) is not fatal: the anticoll/nonce data is still delivered to the FIFO, and every mfc
+     * frame is validated downstream (BCC, then SELECT, then CRC on reads, then Crypto1 on auth). On a
+     * marginal Ci522 signal the parity flag trips intermittently even though the UID is correct. Let the
+     * caller validate. */
+    if (err & 0x04) return RFID_ERR_CRC;        /* CRCErr     */
+    if (err & 0x08) return RFID_ERR_COLLISION;  /* CollErr    */
+
+    int n = reg_read(FIFOLevelReg);
+    uint8_t last = reg_read(Control522Reg) & 0x07;
+    int rx_bits = last ? ((n - 1) * 8 + last) : (n * 8);
+    if (n > rx_cap) { return RFID_ERR_OVERFLOW; }
+    reg_read_fifo(rx, n);
+
+    if (rx_bits == 0) return RFID_ERR_TIMEOUT;   /* no usable response */
+    return rx_bits;
+}
+
+/* Custom-parity transceive for Crypto1-encrypted 14443-A frames (nested-nonce attack, MIFARE auth). The
+ * MFRC522's hardware ISO parity is wrong for encrypted frames, whose parity bits are keystream-encrypted, so
+ * we run ParityDisable and interleave the caller's parity bits into the raw bit stream ourselves (8 data
+ * LSB-first + 1 parity per byte), then split them back out of the response. Ported from the ChameleonUltra
+ * reference pcd_14a_reader_bits_transfer (rc522.c). No CRC. Returns received data bits (parity stripped). */
+int hal_rfid_hf_transceive_par(const uint8_t *tx, int nbytes, const uint8_t *par,
+                               uint8_t *rx, uint8_t *rx_par, int rx_cap, uint32_t timeout_us)
+{
+    if (!s_spi_up || s_mode != RFID_HF_READER) return RFID_ERR_UNSUPP;
+    if (nbytes <= 0 || nbytes > 40) return RFID_ERR_FRAMING;
+
+    static uint8_t buf[64];
+    int i, dataLen, modulus;
+    buf[0] = tx[0];
+    if (nbytes > 1) {                                  /* pack tx + par -> 9-bits-per-byte stream */
+        modulus = dataLen = nbytes;
+        buf[1] = (uint8_t)((par[0] & 1) | (tx[1] << 1));
+        for (i = 2; i < dataLen; i++)
+            buf[i] = (uint8_t)(((par[i - 1] & 1) << (i - 1)) | (tx[i - 1] >> (9 - i)) | (tx[i] << i));
+        buf[dataLen] = (uint8_t)(((par[dataLen - 1] & 1) << (i - 1)) | (tx[dataLen - 1] >> (9 - i)));
+        dataLen += 1;
+    } else {                                           /* lone byte: 8 data bits, no parity (matches CU path) */
+        modulus = 0; dataLen = 1;
+    }
+
+    reg_set(MfRxReg, 0x10);                            /* ParityDisable: parity rides as data */
+    reg_write(CommandReg, PCD_IDLE);
+    reg_clear(ComIrqReg, 0x80);
+    reg_set(FIFOLevelReg, 0x80);
+    reg_write_fifo(buf, dataLen);
+    reg_write(CommandReg, PCD_TRANSCEIVE);
+    reg_write(BitFramingReg, (uint8_t)(modulus & 0x07));   /* TxLastBits = (nbytes*9) mod 8 = nbytes mod 8 */
+    reg_set(BitFramingReg, 0x80);                      /* StartSend */
+
+    uint32_t ms = timeout_us ? (timeout_us / 1000) : 25;
+    if (ms == 0) ms = 1;
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(ms) + 1;
+    bool timed_out = true;
+    while (xTaskGetTickCount() <= deadline) { if (reg_read(ComIrqReg) & 0x30) { timed_out = false; break; } }
+
+    reg_clear(BitFramingReg, 0x80);
+    reg_write(BitFramingReg, 0x00);
+    reg_clear(MfRxReg, 0x10);                          /* restore hardware parity for normal frames */
+
+    if (timed_out) return RFID_ERR_TIMEOUT;
+    /* Encrypted parity is non-ISO by design, so we do not fail on ErrorReg parity bits - just read the raw
+     * stream; a genuine no-answer shows up as an empty FIFO below. */
+    int n = reg_read(FIFOLevelReg);
+    uint8_t last = reg_read(Control522Reg) & 0x07;
+    int rx_bits = last ? ((n - 1) * 8 + last) : (n * 8);
+    if (n <= 0 || rx_bits <= 0) return RFID_ERR_TIMEOUT;
+    if (n > (int)sizeof buf) return RFID_ERR_OVERFLOW;
+    reg_read_fifo(buf, n);
+
+    /* Split the interleaved 9-bits-per-byte stream (8 data LSB-first + 1 parity) back into data + parity.
+     * General bit-level extraction: data byte d occupies stream bits [9d, 9d+7], its parity bit 9d+8. This
+     * works for long responses (an encrypted block read is 16+2 CRC = 18 bytes); the CU's shift-by-i trick
+     * silently zeroes out at byte index >=8 and only ever handled <=8-byte nonce frames. A short frame
+     * (<9 bits, e.g. a 4-bit NAK) carries no parity - pass it straight through. */
+    if (rx_bits < 9) { rx[0] = buf[0]; return rx_bits; }
+    int kbytes = rx_bits / 9;                          /* each data byte carries one interleaved parity bit */
+    if (kbytes > rx_cap) return RFID_ERR_OVERFLOW;
+    for (int d = 0; d < kbytes; d++) {
+        uint8_t db = 0;
+        for (int p = 0; p < 8; p++) { int pos = d * 9 + p; db |= (uint8_t)(((buf[pos >> 3] >> (pos & 7)) & 1) << p); }
+        rx[d] = db;
+        if (rx_par) { int pp = d * 9 + 8; rx_par[d] = (uint8_t)((buf[pp >> 3] >> (pp & 7)) & 1); }
+    }
+    return kbytes * 8;
+}
+
+/* ---- LF 125 kHz reader ---- */
+
+/* Energise/de-energise the 125 kHz carrier and edge capture. divisor is unused
+ * here (the carrier is always 125 kHz; the decoder tries the bit-rate divisors). */
+/* ---- T5577 downlink (OOK gap modulation) + block read ----
+ * T55 command bits are sent as brief field gaps: charge the tag, drop the carrier for a start gap, then per
+ * bit re-raise the carrier for a long (1) or short (0) burst followed by a write gap, then leave it on. The
+ * gap widths are us-critical, so we busy-delay off the Cortex-M4 DWT cycle counter (64 MHz) inside a critical
+ * section. Timing + protocol mirror the PM3 lf_tx_cmd; the reply is demodulated by the shared t5577 module. */
+/* Downlink gap timing, in Tc (1 carrier cycle = 8 us at 125 kHz), taken from the stock ChameleonUltra
+ * firmware (lf_t55xx_data.c), which is known to program T5577s on this exact frontend. */
+#define T55_START_GAP_US  240   /* 30 Tc */
+#define T55_WRITE_GAP_US   72   /*  9 Tc - field OFF between bits */
+#define T55_WRITE_0_US    192   /* 24 Tc - field ON before the gap => bit 0 */
+#define T55_WRITE_1_US    432   /* 54 Tc - field ON before the gap => bit 1 */
+#define T55_POWERUP_MS      8
+#define T55_PROGRAM_MS      6
+/* Settle before capturing the reply: just past the peak detector, not past the reply's start. The demod
+ * anchors on the gap->block transition (see lf_demod_t55), which happens microseconds after the command, so
+ * the capture must begin while it is still ahead of us. Matches the PM3 platform's value. */
+#define T55_READ_SETTLE_US 120
+#define T55_BIT            (2 * T55_HB)   /* one bit period, in carrier cycles */
+#define LF_T55_ARM         24    /* samples before edges are trusted (dc settles) */
+#define T55_SMOOTH         4     /* boxcar taps over the envelope before slicing (PM3 uses the same) */
+#define LF_T55_SKIP        150   /* EM4100 path: lead-in excluded from its band estimate + demod */
+#define T55_HB             32     /* half-bit width in carrier cycles = samples (RF/64: 32/half-bit) */
+
+/* us busy-delay off a free-running 1 MHz TIMER1 (1 tick = 1 us). Not the Cortex-M4 DWT cycle counter: on the
+ * nRF52 CYCCNT does not run unless a debugger is attached, so a DWT busy-wait spins forever (and here it runs
+ * IRQs-off, so that hard-hangs the device). The TIMER counts in hardware regardless. Started in lf_hw_init. */
+static int s_spin_ready = 0;
+static void spin_timer_init(void)
+{
+    NRF_TIMER1->TASKS_STOP  = 1;
+    NRF_TIMER1->MODE        = TIMER_MODE_MODE_Timer;
+    NRF_TIMER1->BITMODE     = TIMER_BITMODE_BITMODE_32Bit;
+    NRF_TIMER1->PRESCALER   = 4;                  /* 16 MHz / 2^4 = 1 MHz -> 1 us/tick */
+    NRF_TIMER1->TASKS_CLEAR = 1;
+    NRF_TIMER1->TASKS_START = 1;
+    s_spin_ready = 1;
+}
+static inline void spin_us(uint32_t us)
+{
+    if (!s_spin_ready) spin_timer_init();          /* free-runs thereafter; never re-stopped */
+    NRF_TIMER1->TASKS_CAPTURE[0] = 1;
+    uint32_t start = NRF_TIMER1->CC[0], guard = 0;
+    do {
+        NRF_TIMER1->TASKS_CAPTURE[0] = 1;
+        if (++guard > 4000000) break;              /* never hang if TIMER1 is dead */
+    } while ((NRF_TIMER1->CC[0] - start) < us);
+}
+/* Carrier drop for a downlink gap: hold the pin actively low by driving a 0% duty, which damps the antenna
+ * tank through the driver's low side. Merely stopping the PWM leaves the pin wherever the last period ended
+ * and lets the tank ring down on its own, so the field decays too slowly for the tag to register a gap. The
+ * PWM is never stopped or restarted here (see the SEQ config): a bare store retimes the drive on the next
+ * carrier cycle, with no chance of a stale-duty pulse punching a hole in the gap. */
+static inline void lf_carrier_off(void) { s_pwm_val = 0; }
+
+static void lf_t55_cmd(const uint8_t *p, int nbits)
+{
+    lf_start();                                   /* field on: charge the tag */
+    vTaskDelay(pdMS_TO_TICKS(T55_POWERUP_MS));
+    taskENTER_CRITICAL();                          /* gap timing must not be preempted */
+    lf_carrier_off(); spin_us(T55_START_GAP_US);   /* start gap */
+    for (int i = 0; i < nbits; i++) {
+        lf_start();       spin_us(p[i] ? T55_WRITE_1_US : T55_WRITE_0_US);
+        lf_carrier_off(); spin_us(T55_WRITE_GAP_US);
+    }
+    lf_start();                                    /* field back on */
+    taskEXIT_CRITICAL();
+}
+
+int hal_rfid_lf_field(bool on, uint32_t divisor)
+{
+    (void)divisor;
+    if (s_mode != RFID_LF_READER) return RFID_ERR_UNSUPP;
+    if (on) { lf_start(); vTaskDelay(pdMS_TO_TICKS(150)); /* field + op-amp bias settle (AC-coupled amp needs >50 ms) */ }
+    else lf_stop();
+    return 0;
+}
+
+/* Capture the LF envelope with the SAADC and turn it into a stream of inter-edge
+ * intervals (carrier-cycle counts) for the EM4100 decoder. `opts` is unused (the
+ * capture length is fixed at ~2 frames). Field must be on.
+ *
+ * The op-amp output is a small analog envelope oscillating at the bit clock, with
+ * the Manchester data as timing shifts of that oscillation. We DMA it at the
+ * carrier rate (1 sample/cycle, so a sample count == a carrier-cycle count), then
+ * recover edges by mean-crossing: a rising cross through mean+band marks a bit
+ * edge; the interval to the previous edge is the inter-edge count the decoder
+ * classifies as 1T/1.5T/2T. A hysteresis band (re-arm only below mean-band) stops
+ * noise near the mid from double-triggering. This replaces the old GPIOTE digital
+ * edge path, which saw nothing once the field was dropped to the low duty needed
+ * to keep the amps linear (the linear envelope never reaches the logic level). */
+static int lf_demod(uint8_t *buf, int max)   /* SAADC envelope -> inter-edge run-lengths (EM4100 + T55 reply) */
+{
+    if (lf_sample(s_lf_env, LF_ENV_SAMPLES) != 0) return RFID_ERR_TIMEOUT;
+
+    /* Detrend with an exponential moving average (~128-sample / 2-bit time
+     * constant) so the threshold tracks the op-amp's settling DC drift. A fixed
+     * global-mean threshold misses most edges whenever that drift exceeds the
+     * bit-swing amplitude. Overwrite the buffer in
+     * place with the detrended signal and record its swing for the hysteresis
+     * band. dc is Q8 fixed point. */
+    int32_t dc = (int32_t)s_lf_env[0] << 8;
+    int acmin = 0, acmax = 0;
+    for (int i = 0; i < LF_ENV_SAMPLES; i++) {
+        int32_t v = (int32_t)s_lf_env[i] << 8;
+        dc += (v - dc) >> 7;
+        int ac = (int)((v - dc) >> 8);
+        s_lf_env[i] = (int16_t)ac;
+        if (i >= LF_T55_SKIP) {                /* swing stats from the steady region: a lead-in transient is
+                                                * many times the reply and would size the band for itself */
+            if (ac < acmin) acmin = ac;
+            if (ac > acmax) acmax = ac;
+        }
+    }
+    if (acmax - acmin < 4) return 0;           /* flat: no field/tag, no edges */
+    int band = (acmax - acmin) / 10;           /* hysteresis = 10% of pk-pk */
+    if (band < 1) band = 1;
+
+    /* Bit edges by both-edge hysteresis: cross +band to go high, -band to go low, so every transition is
+     * caught and mid-level noise still can't double-trigger. Each crossing pair is one level run (~a
+     * half-bit); the EM4100 decoder wants same-direction (1T/1.5T/2T) intervals, so emit the sum of each
+     * non-overlapping pair of runs - one full period between like edges. */
+    /* Timestamp one edge direction and emit the gap between consecutive such edges - the same quantity the
+     * stock firmware gets from GPIOTE on one polarity plus a carrier-cycle counter, and what the decoder's
+     * 1T/1.5T/2T classes mean. Pairing adjacent level runs instead cannot work: a pair is only the correct
+     * like-edge period if it starts on the right run, and both pairings of this signal land in the same
+     * polarity class anyway. Polarity is handled in the decoder, which tries both Manchester conventions.
+     *
+     * Alternate the direction per capture: rising- and falling-edge intervals are different sequences drawn
+     * from the same signal, so a glitch that corrupts one often leaves the other intact, and
+     * rfid_lf_em4100_read retries. Each gap is snapped to a whole number of half-bits - the envelope is
+     * asymmetric (~29 low / ~35 high) and raw gaps landed outside the decoder's +-16 tolerance, where a
+     * single invalid value resets its 64-bit frame accumulator. */
+    static int s_edge_dir;
+    int want_rise = (s_edge_dir++ & 1);
+    int count = 0, state = 0, prev = -1;
+    for (int i = LF_T55_SKIP; i < LF_ENV_SAMPLES && count < max; i++) {
+        int rise;
+        if      (state == 0 && s_lf_env[i] >  band) { state = 1; rise = 1; }
+        else if (state == 1 && s_lf_env[i] < -band) { state = 0; rise = 0; }
+        else continue;                             /* no crossing on this sample */
+        if (rise != want_rise) continue;           /* consecutive LIKE edges bound one period */
+        if (prev >= 0) {
+            int q = ((i - prev) + T55_HB / 2) / T55_HB;   /* whole half-bits */
+            if (q < 1) q = 1;
+            int d = q * T55_HB;
+            buf[count++] = (d > 0xFF) ? 0xFF : (uint8_t)d;
+        }
+        prev = i;
+    }
+    return count;
+}
+
+int hal_rfid_lf_acquire(uint8_t *buf, int max, uint32_t opts)
+{
+    (void)opts;
+    if (s_mode != RFID_LF_READER || !buf || max <= 0) return RFID_ERR_UNSUPP;
+    return lf_demod(buf, max);
+}
+
+/* T5577 WRITE: send the opcode+password+data+addr bits as field gaps, hold the field steady while the EEPROM
+ * commits, then drop it. `opts` unused. */
+int hal_rfid_lf_modulate(const uint8_t *p, int nbits, uint32_t o)
+{
+    (void)o;
+    if (s_mode != RFID_LF_READER || !p || nbits <= 0) return RFID_ERR_UNSUPP;
+    lf_t55_cmd(p, nbits);
+    vTaskDelay(pdMS_TO_TICKS(T55_PROGRAM_MS));      /* EEPROM programming window, field steady */
+    lf_carrier_off();
+    return 0;
+}
+
+/* Sample index of the last capture's frame anchor (the gap->block falling edge), or -1. */
+static int s_lf_anchor = -1;
+/* Where the anchor sat on the previous read - later reads lock to it (see lf_demod_t55). */
+static int s_lf_expect = -1;
+
+/* T55 reply demod: level-run durations (alternating low, high), which is what t55_extract wants - distinct
+ * from lf_demod's rising-edge-to-rising-edge intervals (used by the EM4100 decoder). The read gap is
+ * unmodulated carrier = envelope high, so start high and anchor recording on the first falling edge (the
+ * data-independent gap->block transition); runs then alternate low(0), high(1), ... from index 0. */
+static int lf_demod_t55(uint8_t *buf, int cap)
+{
+    if (lf_sample(s_lf_env, LF_ENV_SAMPLES) != 0) return RFID_ERR_TIMEOUT;
+
+    /* Ported from the PM3 platform's T55 demod, which reads every block reliably. Two things matter:
+     *
+     * Anchor. The read gap is unmodulated carrier - envelope high - so start `high` and begin recording on
+     * the first falling edge, the gap->block transition. That edge's timing is data-independent, so every
+     * block frames identically and one rotation calibrated on block 0 transfers to any target. Taking
+     * whatever edge arrives first instead starts 1-2 half-bits into the block depending on its leading bits,
+     * a data-dependent phase.
+     *
+     * Band. Track the envelope amplitude with an EMA and slice at half of it, rather than sizing a fixed
+     * band from the whole capture's peak-to-peak: the post-downlink transient dwarfs the reply, so a global
+     * pk-pk sets the band from the transient and swallows real edges. */
+    /* Pre-converge the slicing band over the steady part of the capture, then hold it fixed for the edge
+     * pass. Letting the amplitude EMA warm up inside the edge loop leaves the threshold wrong for exactly
+     * the first few dozen samples - which is where the anchor edge lives. */
+    int32_t band;
+    { int32_t d2 = (int32_t)s_lf_env[LF_T55_ARM] << 8, a2 = 0;
+      int16_t w2[T55_SMOOTH] = {0}; int32_t s2 = 0;
+      for (int i = LF_T55_ARM; i < LF_ENV_SAMPLES; i++) {
+          s2 += s_lf_env[i] - w2[i % T55_SMOOTH];
+          w2[i % T55_SMOOTH] = s_lf_env[i];
+          int32_t v = (s2 / T55_SMOOTH) << 8;
+          d2 += (v - d2) >> 7;
+          int ac = (int)((v - d2) >> 8);
+          int32_t a = ac < 0 ? -ac : ac;
+          a2 += ((a << 8) - a2) >> 6;
+      }
+      band = (a2 >> 8) / 2;
+      if (band < 2) band = 2;                            /* floor: don't chase pure noise */
+    }
+
+    /* Boxcar the envelope before slicing (as the PM3 demod does): constant group delay, so it denoises
+     * without moving edges, and it stops single-sample noise from tripping the detector near a threshold. */
+    /* Pass 1: collect candidate falling edges (gap->block transitions). */
+    int fall[24], nf = 0;
+    { int hi = 1; int32_t d2 = (int32_t)s_lf_env[0] << 8;
+      int16_t w2[T55_SMOOTH] = {0}; int32_t s2 = 0;
+      for (int i = 0; i < LF_ENV_SAMPLES && nf < 24; i++) {
+          s2 += s_lf_env[i] - w2[i % T55_SMOOTH];
+          w2[i % T55_SMOOTH] = s_lf_env[i];
+          int32_t v = (s2 / T55_SMOOTH) << 8;
+          d2 += (v - d2) >> 7;
+          int ac = (int)((v - d2) >> 8);
+          if (i < LF_T55_ARM) continue;
+          if (hi && ac < -band)      { hi = 0; fall[nf++] = i; }
+          else if (!hi && ac > band) { hi = 1; }
+      }
+    }
+    if (!nf) return 0;
+
+    /* Pick the anchor. Every read of a given tag places the gap->block edge at essentially the same sample
+     * (measured 203-210 across a whole dump), because the command is timed to the microsecond and the tag's
+     * reply delay is fixed. So once one read has established where it sits, lock subsequent reads to that
+     * position rather than trusting a run-length heuristic. Length plausibility is still used to
+     * skip the transient on the first read, when there is nothing to lock to yet. */
+    int anchor = -1;
+    if (s_lf_expect >= 0) {
+        int best = 1 << 30;
+        for (int k = 0; k < nf; k++) {
+            int d = fall[k] - s_lf_expect; if (d < 0) d = -d;
+            if (d < best) { best = d; anchor = fall[k]; }
+        }
+        if (best > T55_BIT) anchor = -1;          /* nothing near the expected spot: fall back */
+    }
+    if (anchor < 0) {
+        /* First read (nothing to lock to yet): skip the post-downlink transient. In settled data the tag
+         * puts a falling edge every 1-2 bit periods; through the transient they are sparse and irregular, so
+         * take the first candidate followed by a run of properly-spaced ones. */
+        for (int k = 0; k + 3 < nf && anchor < 0; k++) {
+            int good = 1;
+            for (int j = k; j < k + 3; j++) {
+                int sp = fall[j + 1] - fall[j];
+                if (sp < T55_HB || sp > 2 * T55_BIT) { good = 0; break; }
+            }
+            if (good) anchor = fall[k];
+        }
+        if (anchor < 0) anchor = fall[0];
+    }
+    s_lf_anchor = anchor;
+    if (s_lf_expect < 0) s_lf_expect = anchor;        /* lock later reads to the first good position */
+
+    /* Pass 2: emit level runs from the chosen anchor. */
+    int count = 0, last_edge = anchor, high = 0;
+    { int32_t d2 = (int32_t)s_lf_env[0] << 8;
+      int16_t w2[T55_SMOOTH] = {0}; int32_t s2 = 0;
+      for (int i = 0; i < LF_ENV_SAMPLES && count < cap; i++) {
+          s2 += s_lf_env[i] - w2[i % T55_SMOOTH];
+          w2[i % T55_SMOOTH] = s_lf_env[i];
+          int32_t v = (s2 / T55_SMOOTH) << 8;
+          d2 += (v - d2) >> 7;
+          int ac = (int)((v - d2) >> 8);
+          if (i <= anchor) continue;
+          if (high && ac < -band) {
+              int d = i - last_edge; buf[count++] = d > 0xFF ? 0xFF : (uint8_t)d; last_edge = i; high = 0;
+          } else if (!high && ac > band) {
+              int d = i - last_edge; buf[count++] = d > 0xFF ? 0xFF : (uint8_t)d; last_edge = i; high = 1;
+          }
+      }
+    }
+    return count;
+}
+
+
+/* T5577 READ: send the read downlink (field left on), settle past the peak-detector, then demodulate the
+ * tag's continuously-repeated block into level-run durations for the shared t55 decoder (t55_extract). */
+int hal_rfid_lf_transceive(const uint8_t *cmd, int nbits, uint8_t *buf, int cap)
+{
+    if (s_mode != RFID_LF_READER) return RFID_ERR_UNSUPP;
+
+    /* A null/empty command is a phase nudge, not a read: it advances the settle used by subsequent reads and
+     * returns immediately. The reply's phase relative to the capture depends on that delay, so a block that
+     * frames one bit off at one settle frames correctly at another (measured: CAFEBABE/12345678 fail at 15 ms
+     * yet verify at 5 ms; 0F0F0F0F/A5A5A5A5 the reverse). Framing is deterministic for a given settle, so a
+     * plain retry repeats the same wrong answer - the write-verify loop needs to change the settle to get an
+     * independent look. Nudging is explicit rather than automatic because a whole-tag dump must hold one
+     * settle for all its blocks. */
+    if (!cmd || nbits <= 0) return RFID_ERR_UNSUPP;
+    if (!buf || cap <= 0) return RFID_ERR_UNSUPP;
+
+
+    spin_us(1);                                     /* ensure TIMER1 is initialised + running */
+    lf_t55_cmd(cmd, nbits);                         /* downlink; field left on */
+    /* Capture almost immediately, on the microsecond timebase. The demod anchors on the gap->block edge,
+     * so that edge has to be inside the capture - a long settle lets it pass before sampling starts and
+     * leaves nothing to anchor to. */
+    spin_us(T55_READ_SETTLE_US);
+    return lf_demod_t55(buf, cap);
+}

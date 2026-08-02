@@ -5,8 +5,8 @@
  *   yy = two-digit year, mm = month (no leading zero), pp = patch within that
  *   month (reset to 0 each new yy.mm). Bump pp for every release in a month.
  * Each release also gets a codename for easy human identification. */
-#define FANTASI_VERSION  "26.7.1"
-#define FANTASI_CODENAME "Avalon"
+#define FANTASI_VERSION  "26.8.0"
+#define FANTASI_CODENAME "Basilia"
 
 /* Short git commit, injected by the build (-DFANTASI_GIT_HASH); falls back to
  * "unknown" for builds made outside a git checkout. */

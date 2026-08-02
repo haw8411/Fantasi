@@ -56,6 +56,9 @@ typedef struct _CliResponse {
         FileReadChunk file_data;
         ErrorResponse error;
         DirEntry dir_entry;
+        /* Device->host: a running app is asking for a feature module by name; the
+     host answers with FileWriteChunk(s) into /ramfs. id echoes the app_launch. */
+        char module_request[32];
     } payload;
 } CliResponse;
 
@@ -67,6 +70,7 @@ typedef struct _MkdirRequest {
     char path[64];
 } MkdirRequest;
 
+typedef PB_BYTES_ARRAY_T(64) CliRequest_app_input_t;
 typedef struct _CliRequest {
     uint32_t id;
     pb_size_t which_payload;
@@ -77,6 +81,13 @@ typedef struct _CliRequest {
         DirListRequest dir_list;
         FileDeleteRequest file_delete;
         MkdirRequest mkdir;
+        /* Async app session (host CLI `rfid` and any interactive launch): app_launch
+     starts the app and returns immediately (unlike `command "launch ..."`,
+     which streams synchronously); app_input feeds keystrokes to the running
+     app; app_stop aborts it (the ^C equivalent). */
+        char app_launch[64];
+        CliRequest_app_input_t app_input;
+        bool app_stop;
     } payload;
 } CliRequest;
 
@@ -130,6 +141,7 @@ extern "C" {
 #define CliResponse_file_data_tag                4
 #define CliResponse_error_tag                    5
 #define CliResponse_dir_entry_tag                6
+#define CliResponse_module_request_tag           7
 #define FileDeleteRequest_path_tag               1
 #define MkdirRequest_path_tag                    1
 #define CliRequest_id_tag                        1
@@ -139,6 +151,9 @@ extern "C" {
 #define CliRequest_dir_list_tag                  5
 #define CliRequest_file_delete_tag               6
 #define CliRequest_mkdir_tag                     7
+#define CliRequest_app_launch_tag                8
+#define CliRequest_app_input_tag                 9
+#define CliRequest_app_stop_tag                  10
 
 /* Struct field encoding specification for nanopb */
 #define CliRequest_FIELDLIST(X, a) \
@@ -148,7 +163,10 @@ X(a, STATIC,   ONEOF,    MESSAGE,  (payload,file_write,payload.file_write),   3)
 X(a, STATIC,   ONEOF,    MESSAGE,  (payload,file_read,payload.file_read),   4) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (payload,dir_list,payload.dir_list),   5) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (payload,file_delete,payload.file_delete),   6) \
-X(a, STATIC,   ONEOF,    MESSAGE,  (payload,mkdir,payload.mkdir),   7)
+X(a, STATIC,   ONEOF,    MESSAGE,  (payload,mkdir,payload.mkdir),   7) \
+X(a, STATIC,   ONEOF,    STRING,   (payload,app_launch,payload.app_launch),   8) \
+X(a, STATIC,   ONEOF,    BYTES,    (payload,app_input,payload.app_input),   9) \
+X(a, STATIC,   ONEOF,    BOOL,     (payload,app_stop,payload.app_stop),  10)
 #define CliRequest_CALLBACK NULL
 #define CliRequest_DEFAULT NULL
 #define CliRequest_payload_file_write_MSGTYPE FileWriteChunk
@@ -163,7 +181,8 @@ X(a, STATIC,   REQUIRED, BOOL,     has_next,          2) \
 X(a, STATIC,   ONEOF,    STRING,   (payload,output,payload.output),   3) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (payload,file_data,payload.file_data),   4) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (payload,error,payload.error),   5) \
-X(a, STATIC,   ONEOF,    MESSAGE,  (payload,dir_entry,payload.dir_entry),   6)
+X(a, STATIC,   ONEOF,    MESSAGE,  (payload,dir_entry,payload.dir_entry),   6) \
+X(a, STATIC,   ONEOF,    STRING,   (payload,module_request,payload.module_request),   7)
 #define CliResponse_CALLBACK NULL
 #define CliResponse_DEFAULT NULL
 #define CliResponse_payload_file_data_MSGTYPE FileReadChunk

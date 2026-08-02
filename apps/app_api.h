@@ -11,12 +11,13 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdbool.h>
 
 /* Bumped whenever the struct layout below changes. New members are only ever
  * appended, so existing field offsets stay stable; an app should check
  * api->abi_version before using a member added in a later ABI than it was built
  * against. */
-#define FANTASI_APP_ABI 2
+#define FANTASI_APP_ABI 3
 
 /* Button bitmask bits returned by api->buttons(). Not every device has every
  * button; absent buttons simply never set their bit. */
@@ -64,8 +65,10 @@ typedef struct fantasi_api {
     /* ---- Storage (full paths: /ramfs/.., /apps/.., /..) ---- */
     int32_t (*read_file)(const char *path, void *buf, uint32_t max);   /* bytes, or -1 */
     int     (*write_file)(const char *path, const void *buf, uint32_t len); /* 0, or -1 */
+    int     (*append)(const char *path, const void *buf, uint32_t len);     /* append to end; 0, or -1 */
     int32_t (*file_size)(const char *path);                            /* bytes, or -1 */
     int     (*remove)(const char *path);                               /* 0, or -1 */
+    int32_t (*pread)(const char *path, uint32_t off, void *buf, uint32_t max); /* offset read; bytes, or -1 */
 
     /* ---- Hardware (a pointer is NULL where unsupported on this device) ---- */
     void     (*led)(uint8_t r, uint8_t g, uint8_t b);   /* best-effort RGB */
@@ -114,9 +117,52 @@ typedef struct fantasi_api {
      * need to expose their own native module build the VM directly against Berry's
      * C API (the loader resolves be_*). Returns 0, or -1 (error, or no Berry). */
     int (*be_exec)(const char *path);
+
+    /* api->abi_version = 3 */
+
+    /* ---- Console input (keystrokes from the launching CLI) ---- */
+    /* Read up to `max` bytes of pending console input into `buf`; returns the
+     * count, or 0 if none is waiting. Non-blocking - poll it (with api->delay
+     * between polls) to build an interactive prompt. The launching session
+     * forwards the user's keystrokes here in raw mode, so there is no local echo:
+     * an app that wants the user to see what they type must echo it via print().
+     * Ctrl-C never arrives here - the launcher treats it as "stop the app". NULL
+     * on a build without the app loader; returns 0 when there's no input channel. */
+    int (*read_input)(void *buf, uint32_t max);
+
+    /* ---- On-demand feature modules ---- */
+    /* Ask the host to stream feature module `name` into /ramfs, just in time, over
+     * the session's protobuf channel (WebUSB/BLE). Fire-and-forget: it records the
+     * request; the firmware signals the host, which answers with the module bytes.
+     * The caller then polls the VFS (api->file_size) for the module to appear, and
+     * reports "unavailable" if it never does (no host / host lacks it). Only
+     * meaningful for an app launched as an async session; a no-op otherwise (so an
+     * app must also handle the module simply not arriving). Meant for a thin driver
+     * that hot-loads a module with fantasi_run_module() then deletes it after use,
+     * so nothing persists in flash or RAM. */
+    void (*request_module)(const char *name);
 } fantasi_api_t;
 
 /* The app's entry point. Its return value is reported as the exit code. */
 int app_main(const fantasi_api_t *api);
+
+/* ---- In-app dynamic module loader (resolved symbol) ----
+ * Load the module ELF at `path` (a VFS path, typically in /ramfs), run its
+ * app_main synchronously with `api`, then fully unload it - reclaiming its image
+ * and (via `api`) anything it printed/allocated. Lets a resident "shell" app
+ * hot-load feature modules one at a time so only one is resident in RAM and none
+ * live in flash (see docs/rfid.md). Returns the module's exit code, or -1 if the
+ * module could not be loaded (e.g. not present in /ramfs yet). The loader
+ * resolves this symbol only where the firmware app loader is present.
+ *
+ * `delete_source` deletes `path` once the image is resident, before running it.
+ * The load reads the file completely (every section is streamed into its own RAM
+ * and all relocations applied) before returning, so afterwards the file is dead
+ * weight - and in /ramfs it is heap the module itself could be using. Pass true
+ * for a just-in-time module that gets re-provisioned per run (what the rfid
+ * driver does - its obtain_* helpers re-request on demand); pass false to keep
+ * the file, e.g. a module run repeatedly from flash. Only applied on a
+ * successful load, so a failed load leaves the file to retry or inspect. */
+int fantasi_run_module(const char *path, const fantasi_api_t *api, bool delete_source);
 
 #endif /* FANTASI_APP_API_H */

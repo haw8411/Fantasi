@@ -26,4 +26,9 @@ int  fatrd_write(uint32_t lba, uint32_t offset, const uint8_t *buf, uint32_t len
  * the next read/write. */
 void fatrd_invalidate(void);
 
+/* Free the synthetic-FAT model (~6 KB). Call when the host can no longer be using the drive - MSC eject or
+ * USB unplug. The model is rebuilt lazily on the next read/write, so an idle device (no drive mounted)
+ * keeps none of it resident. Must be called on the usb task (same context as fatrd_read/fatrd_write). */
+void fatrd_release(void);
+
 #endif /* HAL_FAT_RAMDISK_H */

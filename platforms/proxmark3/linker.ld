@@ -89,6 +89,21 @@ SECTIONS {
     __data_start__     = ADDR(.data);
     __data_end__       = __data_start__ + SIZEOF(.data);
 
+    /* picolibc TLS template. Placed explicitly as NOLOAD (NOBITS) in RAM so it
+     * never lands as an orphan LOAD section at the RAM VMA - which, lacking a
+     * flash load address, makes objcopy -O binary pad the whole flash->RAM gap
+     * into a ~1 MB .bin. The image is never copied at runtime (TLS is served
+     * from fantasi_tls_block, see core/libc_glue.c), so dropping its init bytes
+     * costs nothing; the sections still size the TLS segment for the ASSERT. */
+    .tdata (NOLOAD) : {
+        . = ALIGN(4);
+        *(.tdata .tdata.* .gnu.linkonce.td.*)
+    } >ram :bss
+
+    .tbss (NOLOAD) : {
+        *(.tbss .tbss.* .gnu.linkonce.tb.*) *(.tcommon)
+    } >ram :bss
+
     .bss : {
         . = ALIGN(4);
         __bss_start__ = .;

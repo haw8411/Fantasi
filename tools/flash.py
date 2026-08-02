@@ -399,7 +399,10 @@ def upload_resources(cli_bin, cdc_port, resources):
     # 3. Upload the changed ones (re-resolve the port after the MSC cycle above).
     time.sleep(1)
     cdc_port = find_cdc_port() or cdc_port
-    script = "".join(f"upload {local} {remote}\n" for local, remote in todo) + "exit\n"
+    # Create any parent directories first (LittleFS won't auto-create them on write).
+    dirs = sorted({os.path.dirname(remote) for _, remote in todo} - {"", "/"})
+    mk = "".join(f"mkdir {d}\n" for d in dirs)
+    script = mk + "".join(f"upload {local} {remote}\n" for local, remote in todo) + "exit\n"
     out = _cli(cli_bin, cdc_port, script)
     for local, remote in todo:
         print(f"  {remote}: {'uploaded' if remote in out else 'upload FAILED'}")
@@ -416,6 +419,10 @@ def collect_resources(platform):
         splash = os.path.join(REPO_ROOT, f"build/{platform}/splash.bin")
         if os.path.isfile(splash):
             resources.append((splash, "/splash.bin"))
+    # MIFARE Classic key dictionary (fixed 12-hex + \n records), the general dict `read mfc` consults.
+    mfc_dict = os.path.join(REPO_ROOT, "resources/nfc/mfc_dict.dic")
+    if os.path.isfile(mfc_dict):
+        resources.append((mfc_dict, "/nfc/mfc_dict.dic"))
     return resources
 
 

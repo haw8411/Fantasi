@@ -39,6 +39,13 @@ void SystemInit(void)
 
     FLASH->ACR = (FLASH->ACR & ~FLASH_ACR_LATENCY) | FLASH_ACR_LATENCY_1WS;
     while ((FLASH->ACR & FLASH_ACR_LATENCY) != FLASH_ACR_LATENCY_1WS) { }
+    /* Enable prefetch + the instruction/data caches (never enabled before): at 1 WS the WB55 otherwise fetches
+     * flash at ~2 cyc/word, ~doubling every code path's cycle count. This ~halves the FDT-critical Miller decode
+     * (and speeds everything). Reset the I-cache before enabling so no stale lines survive. */
+    FLASH->ACR &= ~FLASH_ACR_ICEN;
+    FLASH->ACR |= FLASH_ACR_ICRST;
+    FLASH->ACR &= ~FLASH_ACR_ICRST;
+    FLASH->ACR |= FLASH_ACR_PRFTEN | FLASH_ACR_ICEN | FLASH_ACR_DCEN;
 
     RCC->HSECR = (RCC->HSECR & ~RCC_HSECR_HSETUNE_Msk)
                | (0x26U << RCC_HSECR_HSETUNE_Pos);

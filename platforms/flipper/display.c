@@ -26,6 +26,35 @@
 static uint8_t fb[DISPLAY_PAGES * DISPLAY_WIDTH];
 static SemaphoreHandle_t fb_lock;
 
+/* Current ST7565 electronic-volume value (0-63). display_init() latches it into
+ * the panel; display_set_contrast() updates it live once the panel is up. Kept
+ * here so a value set before display_init() (unlikely, but harmless) is applied
+ * by the init sequence rather than clocked out to a dead SPI link.
+ * 0xFF = "not explicitly set": display_init() substitutes the panel-specific
+ * default, which differs between the two Flipper display vendors (see below). */
+#define CONTRAST_UNSET 0xFF
+static uint8_t contrast_ev = CONTRAST_UNSET;
+static uint8_t contrast_default = DISPLAY_CONTRAST_DEFAULT;
+static bool    display_ready;
+
+/* Flipper shipped with two LCD models, recorded in OTP by the factory:
+ * ERC (ST7565, board_display=1) and MGG (ST7567, board_display=2). The panels
+ * need different drive settings - stock firmware (u8g2_glue.c) uses
+ * EV=32/regulation-ratio=5 for ERC and EV=28/regulation-ratio=6 for MGG.
+ * Driving an MGG panel with the ERC settings undershoots V0 and the screen
+ * comes out washed out. OTP v2 header (magic 0xBABE, version byte >= 2) keeps
+ * board_display at byte 12; older/blank OTP (incl. Kiisu boards) has no
+ * display field and gets the ERC settings, same as stock. */
+#define OTP_AREA_BASE 0x1FFF7000UL
+
+static bool display_is_mgg(void)
+{
+    const volatile uint8_t *otp = (const volatile uint8_t *)OTP_AREA_BASE;
+    uint16_t magic = (uint16_t)(otp[0] | (otp[1] << 8));
+    if (magic != 0xBABE || otp[2] < 2) return false;
+    return otp[12] == 2;   /* FuriHalVersionDisplayMgg */
+}
+
 /* ---- font ---- */
 
 /* Public-domain 5×7 ASCII font, columns top-to-bottom (bit 0 = top row).
@@ -243,21 +272,56 @@ void display_init(void)
     GPIOB->BSRR = (1U << 0);          /* PB0 HIGH */
     delay_ms(2);
 
-    /* ST7565 init (ERC variant - same as stock Flipper firmware). */
+    /* ST756x init - same values as stock Flipper firmware, which drives the
+     * two factory display models differently (see display_is_mgg above). */
+    uint8_t rr = 0x05;                       /* ERC: regulation ratio 5 */
+    contrast_default = 32;                   /*      EV 32              */
+    if (display_is_mgg()) {
+        rr = 0x06;                           /* MGG: regulation ratio 6 */
+        contrast_default = 28;               /*      EV 28              */
+    }
+    if (contrast_ev == CONTRAST_UNSET)
+        contrast_ev = contrast_default;
+
     lcd_cmd(0xE2);          /* software reset             */
     lcd_cmd(0xA2);          /* bias 1/9                   */
     lcd_cmd(0xA0);          /* SEG direction normal       */
     lcd_cmd(0xC8);          /* COM direction reverse      */
     lcd_cmd(0x40);          /* start line 0               */
-    lcd_cmd(0x20 | 0x05);   /* regulation ratio = 5       */
+    lcd_cmd(0x20 | rr);     /* regulation ratio           */
     lcd_cmd(0x81);          /* set electronic volume ...  */
-    lcd_cmd(32);            /* ... contrast = 32          */
+    lcd_cmd(contrast_ev);   /* ... contrast (persisted)   */
     lcd_cmd(0x28 | 0x07);   /* power control: VB+VR+VF   */
     lcd_cmd(0xA4);          /* all-pixel-on OFF (normal)  */
     lcd_cmd(0xAF);          /* display ON                 */
 
+    display_ready = true;
+
     display_clear();
     display_flush();
+}
+
+/* Re-issue the ST7565 set-EV command with a new contrast (0-63). Safe to call
+ * from any task at runtime (holds display_lock so it never interleaves with a
+ * frame flush) and before the scheduler starts. Called before display_init()
+ * only latches the value for the init sequence to apply. */
+void display_set_contrast(uint8_t ev)
+{
+    if (ev > DISPLAY_CONTRAST_MAX) ev = DISPLAY_CONTRAST_MAX;
+    contrast_ev = ev;
+    if (!display_ready) return;
+
+    display_lock();
+    lcd_cmd(0x81);
+    lcd_cmd(contrast_ev);
+    display_unlock();
+}
+
+/* Current EV as the panel sees it: the persisted/user value, or the
+ * model-specific default when nothing was ever set. */
+uint8_t display_get_contrast(void)
+{
+    return (contrast_ev == CONTRAST_UNSET) ? contrast_default : contrast_ev;
 }
 
 void display_clear(void)

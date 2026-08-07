@@ -10,6 +10,16 @@
 #define DISPLAY_COLS    21  /* 128 / 6 (5px glyph + 1px gap) */
 #define DISPLAY_ROWS    8   /* 64 / 8 (7px glyph + 1px gap) */
 
+/* ST756x electronic-volume ("contrast") register: 6 bits, 0-63. The real
+ * default depends on the display model in OTP (ERC=32, MGG=28) and is picked
+ * by display_init(); DEFAULT here is only the pre-init fallback. Exposed via
+ * the `contrast` setting + Settings menu; STEP is the GUI LEFT/RIGHT
+ * increment. */
+#define DISPLAY_CONTRAST_MIN     0
+#define DISPLAY_CONTRAST_MAX     63
+#define DISPLAY_CONTRAST_DEFAULT 32
+#define DISPLAY_CONTRAST_STEP    2
+
 /* Extra glyphs past printable ASCII (in both the 5x7 grid font and the
  * proportional fonts below). */
 #define DISPLAY_CHAR_UP   "\x7F"
@@ -39,6 +49,8 @@ extern const fz_font_t font_item;   /* haxrcorp 4089 - stock FZ menu font  */
 extern const fz_font_t font_bold;   /* Helvetica Bold 8 - stock FZ titles  */
 
 void display_init(void);
+void display_set_contrast(uint8_t ev);   /* ST756x electronic volume, 0-63 */
+uint8_t display_get_contrast(void);      /* current EV (model default if unset) */
 void display_clear(void);
 void display_print(int col, int row, const char *str);
 void display_print_inv(int col, int row, const char *str);

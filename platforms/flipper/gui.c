@@ -25,6 +25,7 @@
 #include "queue.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define GUI_TASK_STACK    (configMINIMAL_STACK_SIZE * 8)  /* runs lfs + app_run paths, like cli */
@@ -237,6 +238,10 @@ static char set_key[SET_MAX][SET_KEY_MAX];
 static bool set_on[SET_MAX];
 static int  set_count;
 
+/* "contrast" is the one non-boolean setting: a 0-63 ST7565 EV value adjusted
+ * with LEFT/RIGHT rather than toggled. Held separately from set_on[]. */
+static int  contrast_val = DISPLAY_CONTRAST_DEFAULT;
+
 /* Fold one "key=value" line into the toggle list (hal_settings_foreach cb). */
 static void settings_scan_line(const char *line, void *ctx)
 {
@@ -249,6 +254,15 @@ static void settings_scan_line(const char *line, void *ctx)
     memcpy(key, line, klen);
     key[klen] = '\0';
     const char *val = eq + 1;
+    /* "contrast" is a numeric level, not a toggle - stash its value and leave
+     * the on/off list untouched. */
+    if (strcmp(key, "contrast") == 0) {
+        int ev = atoi(val);
+        if (ev < DISPLAY_CONTRAST_MIN) ev = DISPLAY_CONTRAST_MIN;
+        if (ev > DISPLAY_CONTRAST_MAX) ev = DISPLAY_CONTRAST_MAX;
+        contrast_val = ev;
+        return;
+    }
     /* "hid" carries a string value (persistent/switch); everything else is 0/1. */
     bool on = (strcmp(key, "hid") == 0) ? (strcmp(val, "switch") == 0) : (val[0] == '1');
     for (int i = 0; i < set_count; i++)
@@ -271,13 +285,17 @@ static void settings_scan(void)
     set_on[1] = false;   /* persistent */
     strcpy(set_key[2], "msc");
     set_on[2] = true;    /* drive present */
-    set_count = 3;
+    strcpy(set_key[3], "contrast");
+    contrast_val = display_get_contrast();     /* overridden by the file below */
+    set_count = 4;
 
     hal_settings_foreach(settings_scan_line, NULL);
 
     for (int i = 0; i < set_count; i++) {
         snprintf(item_label[i], sizeof(item_label[0]), "%s", set_key[i]);
-        if (strcmp(set_key[i], "hid") == 0)
+        if (strcmp(set_key[i], "contrast") == 0)
+            snprintf(item_value[i], sizeof(item_value[0]), "%d", contrast_val);
+        else if (strcmp(set_key[i], "hid") == 0)
             strcpy(item_value[i], set_on[i] ? "[switch]" : "[persist]");
         else
             strcpy(item_value[i], set_on[i] ? "[on]" : "[off]");
@@ -285,10 +303,30 @@ static void settings_scan(void)
     item_count = set_count;
 }
 
+/* Adjust the contrast row by `delta` steps, clamp 0-63, apply to the panel
+ * immediately and persist. LEFT/RIGHT in the Settings screen route here. */
+static void settings_adjust_contrast(int delta)
+{
+    int ev = contrast_val + delta;
+    if (ev < DISPLAY_CONTRAST_MIN) ev = DISPLAY_CONTRAST_MIN;
+    if (ev > DISPLAY_CONTRAST_MAX) ev = DISPLAY_CONTRAST_MAX;
+    if (ev == contrast_val) return;
+
+    contrast_val = ev;
+    display_set_contrast((uint8_t)ev);
+
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%d", ev);
+    hal_settings_set("contrast", buf);
+
+    settings_scan();   /* refresh the displayed value */
+}
+
 static void settings_toggle(int idx)
 {
     // Not a big fan of this - noproto
     if (idx >= set_count) return;
+    if (strcmp(set_key[idx], "contrast") == 0) return;  /* numeric: LEFT/RIGHT, not OK */
     bool on = !set_on[idx];
 
     /* "ble" has live side effects (start/stop the stack), so route it through
@@ -458,6 +496,12 @@ static void gui_task(void *arg)
                 clamp(&sel_main, &top_main);
             } else if (b == FANTASI_BTN_OK) {
                 settings_toggle(sel_set);
+            } else if ((b == FANTASI_BTN_LEFT || b == FANTASI_BTN_RIGHT) &&
+                       sel_set < set_count &&
+                       strcmp(set_key[sel_set], "contrast") == 0) {
+                settings_adjust_contrast(b == FANTASI_BTN_RIGHT
+                                             ? DISPLAY_CONTRAST_STEP
+                                             : -DISPLAY_CONTRAST_STEP);
             }
             break;
         }

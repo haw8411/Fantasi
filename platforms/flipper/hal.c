@@ -28,6 +28,7 @@
 
 #include <limits.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 
 /* ---- I2C1 helpers (PA9=SCL, PA10=SDA) ---- */
@@ -266,6 +267,18 @@ void hal_init(void)
     tusb_init();
 
     display_init();
+
+    /* Apply the persisted LCD contrast (ST7565 electronic volume). Absent key
+     * keeps display_init()'s built-in default, so a stock config is unchanged. */
+    {
+        char cv[8];
+        if (hal_settings_get("contrast", cv, sizeof(cv)) > 0) {
+            int ev = atoi(cv);
+            if (ev < DISPLAY_CONTRAST_MIN) ev = DISPLAY_CONTRAST_MIN;
+            if (ev > DISPLAY_CONTRAST_MAX) ev = DISPLAY_CONTRAST_MAX;
+            display_set_contrast((uint8_t)ev);
+        }
+    }
 
     splash_loaded = hal_storage_read_file("/splash.bin", splash_buf,
                                           sizeof(splash_buf)) == (int)sizeof(splash_buf);

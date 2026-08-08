@@ -216,6 +216,9 @@ void display_init(void)
 {
     fb_lock = xSemaphoreCreateMutex();
 
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+
     /* Enable GPIO port clocks (B, C, D) and SPI2. */
     RCC->AHB2ENR  |= RCC_AHB2ENR_GPIOBEN
                    |  RCC_AHB2ENR_GPIOCEN
@@ -258,7 +261,7 @@ void display_init(void)
      * for a menu UI. */
 #ifdef FANTASI_DISPLAY_COMPANION
     SPI2->CR1 = SPI_CR1_MSTR | SPI_CR1_SSM | SPI_CR1_SSI
-              | (3U << SPI_CR1_BR_Pos);   /* /16 = 1 MHz */
+              | (2U << SPI_CR1_BR_Pos);   /* /8 = 4 MHz on 32 MHz APB1 (matches official) */
 #else
     SPI2->CR1 = SPI_CR1_MSTR | SPI_CR1_SSM | SPI_CR1_SSI
               | (1U << SPI_CR1_BR_Pos);   /* /4 = 4 MHz */
@@ -473,31 +476,47 @@ void display_blit(const uint8_t *data, uint32_t len)
 
 #ifdef FANTASI_DISPLAY_COMPANION
 /* Kiisu: the LCD is an SH1106 driven by a companion MCU (STM32G431) that
- * emulates the Flipper's ST7565 - it receives our SPI stream as a slave and
- * re-drives the panel. It runs the panel in horizontal addressing mode with a
- * fixed 128x8 window (cols 0..127, pages 0..7): each data byte auto-advances
- * the column, wrapping to the next page at column 127 and back to (0,0) after
- * the last page. So the frame is one contiguous 1024-byte stream - no per-page
- * column/page commands are needed (the companion drops page commands anyway,
- * and column commands are ignored in horizontal mode).
+ * emulates the Flipper's ST7565 - it receives our SPI stream as a slave (host
+ * D/C and CS decoded via EXTI interrupts) and re-drives the panel per page.
  *
- * We therefore send the WHOLE framebuffer under a single CS assertion with one
- * command->data transition. Our fb is page-major (fb[page*128 + col]), which
- * is exactly the horizontal-addressing fill order, so it maps 1:1. Framing it
- * per page instead (8 CS / command->data boundaries) let the companion's
- * IRQ-driven CS/DI tracking drop a few bytes at each boundary, shearing every
- * page a little further across -> the static left/right banding. One boundary
- * per frame removes that; streaming exactly 1024 bytes keeps the panel's
- * auto-advance pointer wrapped back to (0,0) for the next frame. */
+ * The panel is addressed per page (col-high, col-low, page-select, then 128
+ * data bytes) like the stock Flipper u8g2 st756x driver, at the same 4 MHz. The
+ * per-edge settle timing - CS-low ~3 us, each SET_DC ~2 us (D/C re-asserted
+ * before every command byte), and a ~24 us inter-page gap while CS is high -
+ * reproduces the stock firmware's measured profile. Those delays give the
+ * companion's EXTI-driven D/C and CS tracking time to update before the next
+ * byte is clocked; without them it mis-latches bytes at the edges, showing as a
+ * static horizontal shear. Per-page col/page addressing also cures a 132-vs-128
+ * column drift seen on some companion firmware. */
+
+/* Busy-delay off the DWT cycle counter (as rfid.c does): exact and
+ * clock-independent, unlike a hand-tuned NOP loop. Sub-tick (us) granularity
+ * means a busy-wait is the only option - vTaskDelay is 1 ms and would yield
+ * mid-flush. DWT->CYCCNT is enabled in display_init. */
+static inline void udelay(uint32_t us)
+{
+    uint32_t start = DWT->CYCCNT;
+    uint32_t ticks = us * (SystemCoreClock / 1000000u);
+    while ((DWT->CYCCNT - start) < ticks) { }
+}
+
 void display_flush(void)
 {
-    GPIOC->BSRR = (1U << (11 + 16));  /* PC11 (CS) LOW  = select  */
-    GPIOB->BSRR = (1U << (1 + 16));   /* PB1 (D/I) LOW  = command */
-    uint8_t col[2] = { 0x00, 0x10 }; /* lower col = 0, upper col = 0 (window start) */
-    spi_tx(col, sizeof(col));
-    GPIOB->BSRR = (1U << 1);          /* PB1 (D/I) HIGH = data    */
-    spi_tx(fb, DISPLAY_PAGES * DISPLAY_WIDTH);   /* whole frame, one burst */
-    GPIOC->BSRR = (1U << 11);         /* CS HIGH */
+    for (uint8_t page = 0; page < DISPLAY_PAGES; page++) {
+        uint8_t cmd[3] = { 0x10, 0x00, (uint8_t)(0xB0 | page) }; /* col-hi, col-lo, page */
+        GPIOC->BSRR = (1U << (11 + 16));           /* PC11 (CS) LOW  = select  */
+        udelay(3);
+        for (int k = 0; k < 3; k++) {              /* command bytes, D/C re-asserted each */
+            GPIOB->BSRR = (1U << (1 + 16));        /* PB1 (D/I) LOW  = command */
+            udelay(2);
+            spi_tx(&cmd[k], 1);
+        }
+        GPIOB->BSRR = (1U << 1);                   /* PB1 (D/I) HIGH = data    */
+        udelay(2);
+        spi_tx(&fb[page * DISPLAY_WIDTH], DISPLAY_WIDTH);
+        GPIOC->BSRR = (1U << 11);                  /* CS HIGH                  */
+        udelay(24);                                /* inter-page gap           */
+    }
 }
 #else
 void display_flush(void)

@@ -1,0 +1,55 @@
+diff --git a/src/common/tusb_mcu.h b/src/common/tusb_mcu.h
+index 0a4462a..0629f7b 100644
+--- a/src/common/tusb_mcu.h
++++ b/src/common/tusb_mcu.h
+@@ -140,6 +140,13 @@
+   #define TUP_DCD_ENDPOINT_MAX    6
+   #define TUD_ENDPOINT_ONE_DIRECTION_ONLY
+ 
++#elif TU_CHECK_MCU(OPT_MCU_AT91SAM7S)
++  /* SAM7S UDP has 4 hardware endpoints (EP0-EP3). Same direction
++   * restriction as SAMG - the CSR EPTYPE field encodes direction,
++   * so a given EP number is either IN or OUT. */
++  #define TUP_DCD_ENDPOINT_MAX    4
++  #define TUD_ENDPOINT_ONE_DIRECTION_ONLY
++
+ #elif TU_CHECK_MCU(OPT_MCU_SAMX7X)
+   #define TUP_DCD_ENDPOINT_MAX    10
+   #define TUP_RHPORT_HIGHSPEED    1
+@@ -380,6 +387,14 @@
+   #define TUP_USBIP_DWC2
+   #define TUP_DCD_ENDPOINT_MAX    4
+ 
++//--------------------------------------------------------------------+
++// Artery
++//--------------------------------------------------------------------+
++#elif TU_CHECK_MCU(OPT_MCU_AT32F435)
++  // AT32F435 OTGFS is a Synopsys DWC2 full-speed core (8 bidir endpoints).
++  #define TUP_USBIP_DWC2
++  #define TUP_DCD_ENDPOINT_MAX    8
++
+ //--------------------------------------------------------------------+
+ // Broadcom
+ //--------------------------------------------------------------------+
+diff --git a/src/tusb_option.h b/src/tusb_option.h
+index fb02090..456a6ff 100644
+--- a/src/tusb_option.h
++++ b/src/tusb_option.h
+@@ -73,6 +73,7 @@
+ #define OPT_MCU_SAML22            205 ///< MicroChip SAML22
+ #define OPT_MCU_SAML21            206 ///< MicroChip SAML21
+ #define OPT_MCU_SAMX7X            207 ///< MicroChip SAME70, S70, V70, V71 family
++#define OPT_MCU_AT91SAM7S         208 ///< Atmel AT91SAM7S (ARM7TDMI, Fantasi/Proxmark3)
+ 
+ // STM32
+ #define OPT_MCU_STM32F0           300 ///< ST F0
+@@ -194,6 +195,9 @@
+ #define OPT_MCU_MAX32650         2402  ///< ADI MAX32650/1/2
+ #define OPT_MCU_MAX78002         2403  ///< ADI MAX78002
+ 
++// Artery
++#define OPT_MCU_AT32F435         2500  ///< Artery AT32F435 (Fantasi/Proxmark5, DWC2 OTGFS)
++
+ // Check if configured MCU is one of listed
+ // Apply _TU_CHECK_MCU with || as separator to list of input
+ #define _TU_CHECK_MCU(_m)    (CFG_TUSB_MCU == _m)

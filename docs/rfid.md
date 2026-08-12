@@ -1,9 +1,9 @@
 # RFID
 
 Fantasi supports RFID on every device it runs on. A capable RFID frontend is one of the
-criteria for a board becoming a Fantasi target. The Proxmark3, the Flipper Zero (and
-Kiisu) and the Chameleon Ultra all take the same commands and write the same dump files,
-so a card read on one can be emulated from another.
+criteria for a board becoming a Fantasi target. The Proxmark3, the Proxmark5, the Flipper
+Zero (and Kiisu) and the Chameleon Ultra all take the same commands and write the same dump
+files, so a card read on one can be emulated from another.
 
 ## Devices and frontends
 
@@ -16,11 +16,17 @@ capability bits.
 | Device | RFID frontend |
 |---|---|
 | **Proxmark3** | Xilinx Spartan-II XC2S30 FPGA driven by AT91SAM7S512 |
+| **Proxmark5** | GOWIN GW1N-4B FPGA driven by AT32F435 |
 | **Flipper / Kiisu** | ST25R3916 in transparent mode |
 | **Chameleon Ultra** | nRF52840 NFCT, MFRC522 |
 
 NB: On the Proxmark3, FPGA bitstreams are stored compressed under `/fpga` to conserve
-internal flash. They stream from the host the first time a band is used.
+internal flash. They stream from the host the first time a band is used. The Proxmark5's
+GW1N-4B is different: its gateware lives in the FPGA's own internal config flash and
+autoboots at power-on (LF and HF logic are both resident), so there is no host-streamed
+bitstream and no `/fpga` store. The AT32F435 reaches the frontend over a bit-banged
+command channel plus an SPI4/SSC sample bus; capability bits currently advertise LF and
+HF **read** (`hal_rfid_caps()` = LF_READ | HF_READ).
 
 ## Quickstart
 

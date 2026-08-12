@@ -6,7 +6,7 @@ firmware recovery, or CI). USB paths are preferred - each is designed so a bad
 image can't brick the device. SWD paths have target-specific landmines and must
 be run with care.
 
-All four devices run the same Fantasi CLI once flashed. Connect at 115200 baud
+All five devices run the same Fantasi CLI once flashed. Connect at 115200 baud
 to the enumerated CDC port (`/dev/ttyACM*` on Linux, `/dev/tty.usbmodem*` on macOS):
 
 ```
@@ -222,10 +222,36 @@ The app is linked at `0x27000`; MBR (`0x0`), SoftDevice (`0x1000-0x27000`), and
 bootloader (`0xF3000+`) are preserved by never writing outside `[0x27000,
 0x2Cxxx]` and the single 4 KB page at `0xFF000`.
 
+## Proxmark5 (AT32F435)
+
+### USB - AT32 ROM DFU
+
+The AT32F435 has a ROM system bootloader in system memory at `0x1FFF0000`,
+physically separate from user flash - the same arrangement as the Flipper's STM32.
+It enumerates as an Artery USB DFU device (`2e3c:df11`) and cannot be erased by a
+user-flash write, so it is always the recovery path. The firmware links its app at
+the flash base `0x08000000` (bank1); the LittleFS storage region lives in bank2
+(`0x08080000+`) and is never touched by a firmware flash.
+
+1. Build and flash: `make PLATFORM=proxmark5 flash`
+2. `tools/flash.py` sends `dfu` over the CDC serial link. The firmware's
+   `hal_reboot_dfu()` sets a `.noinit` magic word and resets; `Reset_Handler`
+   sees it and jumps to `0x1FFF0000`, so the board re-enumerates as `2e3c:df11`.
+3. It then runs, mirroring the Flipper's ROM-DFU flow:
+
+```
+dfu-util -a 0 -d 2e3c:df11 -s 0x08000000:leave -D build/proxmark5/fantasi-proxmark5.bin
+```
+
+If the device is not reachable over CDC, enter the bootloader manually: hold the
+button while plugging in USB (~6 s) to reach the AT32 ROM ISP, or use the BOOT
+pins per the board.
+
 ## Quick reference
 
 | Target | USB bootloader VID:PID | App base | Bootloader region preserved | SWD landmine |
 |---|---|---|---|---|
 | Flipper Zero | `0483:df11` (STM ROM DFU) | `0x08000000` | ROM `0x1FFF0000` (read-only, can't brick) | none |
 | Proxmark3 | `9ac4:4b8f` (PM3 bootloader) | `0x00102000` | `0x100000-0x101FFF` | 16 KB lock-region alignment erases bootrom - flash bootrom + app together |
+| Proxmark5 | `2e3c:df11` (AT32 ROM DFU) | `0x08000000` | ROM `0x1FFF0000` (read-only, can't brick) | hold PB0 power-lock high through reset or the board powers off |
 | Chameleon Ultra | `1915:521f` (Nordic Secure DFU) | `0x00027000` | `0xF3000+` | Bootloader settings page at `0xFF000` must match the app hash - regenerate with `nrfutil settings generate` |

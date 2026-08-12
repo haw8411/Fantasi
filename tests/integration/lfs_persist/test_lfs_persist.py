@@ -56,6 +56,12 @@ def main():
         print(f"FAIL: unknown platform {platform}")
         return 1
 
+    if PLATFORMS[platform].get("no_auto_dfu_return"):
+        print(f"SKIP: {platform} cannot re-enter its app after a USB DFU flash "
+              "without a manual power-cycle (AT32 ROM DFU + PB0 power-latch), so "
+              "the unattended reflash-and-verify cycle can't run")
+        return 77
+
     if not os.path.isfile(CLI_BIN):
         print(f"SKIP: CLI binary not found at {CLI_BIN}")
         return 77

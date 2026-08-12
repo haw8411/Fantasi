@@ -12,7 +12,7 @@
 | Kiisu | STM32WB55 (Cortex-M4)| `dfu-util` via ROM DFU |
 | Chameleon Ultra | nRF52840 (Cortex-M4) | `nrfutil` DFU |
 | Proxmark3 | AT91SAM7S512 (ARM7TDMI) | `tools/pm3_flasher.py` (pyserial) |
-| Proxmark5 | AT32F435 | Coming soon |
+| Proxmark5 | AT32F435 (Cortex-M4) | `dfu-util` via AT32 ROM DFU |
 | T-Watch Ultra | ESP32-S3 | Coming soon |
 | Kode Dot | ESP32-S3 | Coming soon |
 
@@ -24,12 +24,13 @@ make PLATFORM=flipper       # STM32WB55 (Cortex-M4)
 make PLATFORM=kiisu         # STM32WB55 (Cortex-M4)
 make PLATFORM=chameleon     # nRF52840  (Cortex-M4)
 make PLATFORM=proxmark3     # AT91SAM7S (ARM7TDMI)
+make PLATFORM=proxmark5     # AT32F435  (Cortex-M4)
 make cli                    # host CLI only (build/cli/fantasi)
 make clean                  # remove all build artifacts (or PLATFORM=<x> for one)
 make help                   # list targets
 ```
 
-A bare `make` builds all three firmwares and the host CLI; `make clean` wipes the
+A bare `make` builds every firmware and the host CLI; `make clean` wipes the
 `build/` tree. Pass `PLATFORM=<name>` to scope to a single firmware, or
 `make cli` to build only the host CLI.
 
@@ -45,6 +46,7 @@ Artifacts land in `build/`:
 | kiisu | `build/flipper/fantasi-kiisu.{elf,bin}` |
 | chameleon | `build/chameleon/fantasi-chameleon.{elf,bin,hex}` |
 | proxmark3 | `build/proxmark3/fantasi-proxmark3.{elf,bin}` |
+| proxmark5 | `build/proxmark5/fantasi-proxmark5.{elf,bin}` |
 | host CLI | `build/cli/fantasi` |
 
 ## Flash
@@ -93,10 +95,11 @@ pairing details and [docs/cli.md](docs/cli.md) for the full command reference.
 ## Apps (all targets)
 
 Fantasi loads and runs small statically-compiled ELF apps from RAM - on the
-Flipper Zero, Kiisu, Chameleon Ultra (Cortex-M4), **and** the Proxmark3 (ARM7TDMI).
+Flipper Zero, Kiisu, Chameleon Ultra, Proxmark5 (Cortex-M4), **and** the
+Proxmark3 (ARM7TDMI).
 Build one with `make app APP=<name>` (source at `apps/<name>/<name>.c`); this
-produces a per-architecture variant (`build/apps/<name>.cm4.elf` for FZ/CU/KIISU,
-`<name>.arm7.elf` for PM3). Copy the matching variant to the device's `/ramfs`
+produces a per-architecture variant (`build/apps/<name>.cm4.elf` for
+FZ/CU/KIISU/PM5, `<name>.arm7.elf` for PM3). Copy the matching variant to the device's `/ramfs`
 (RAM) or `/apps` (flash) - over USB the device mounts as a FAT drive with
 `RAMFS/` and `APPS/` folders, or over BLE/serial via the host CLI `upload` -
 then run it:

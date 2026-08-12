@@ -62,8 +62,8 @@ def main():
     parser.add_argument("--platform", required=True)
     args = parser.parse_args()
 
-    if args.platform == "proxmark3":
-        print("SKIP: PM3 has no BLE")
+    if args.platform in ("proxmark3", "proxmark5"):
+        print(f"SKIP: {args.platform} has no BLE")
         return 77
 
     usb_dev = find_usb_device(USB_VID, USB_PID)

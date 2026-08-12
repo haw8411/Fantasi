@@ -6,7 +6,9 @@ coprocessors that run a pre-compiled BLE stack. The stack binary is encrypted an
 signed by the chip vendor - it cannot be built from source. It must be installed
 separately from the Fantasi application firmware.
 
-The Proxmark3 has no radio coprocessor.
+The Proxmark3 has no radio coprocessor. The Proxmark5 has no on-die radio coprocessor
+either; its BLE comes from an ESP32-C2 module (development in progress), so this
+flashing procedure does not apply to it.
 
 ## Flipper Zero (STM32WB55)
 

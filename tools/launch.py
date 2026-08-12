@@ -36,7 +36,9 @@ from flash import (   # imported after sys.path is set above
 CLI_BIN = os.path.join(REPO_ROOT, "build/cli/fantasi")
 
 # App ELF variant per target core (matches apps/Makefile's outputs).
-APP_ARCH = {"flipper": "cm4", "chameleon": "cm4", "proxmark3": "arm7"}
+# All Cortex-M targets share the cm4 app variant; only the ARM7TDMI PM3 differs.
+APP_ARCH = {"flipper": "cm4", "kiisu": "cm4", "chameleon": "cm4",
+            "proxmark3": "arm7", "proxmark5": "cm4"}
 
 
 def wait_cdc(timeout=15):

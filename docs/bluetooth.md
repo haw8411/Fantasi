@@ -36,6 +36,7 @@ To pair manually with `bluetoothctl` instead, see [Pairing](#pairing) below.
 | Kiisu | STM32WB (CPU2) | ✓ | ✓ | Passkey Entry (KEYBOARD_ONLY central, DISPLAY_ONLY peripheral) |
 | Chameleon Ultra | Nordic S140 v7.2.0 | ✓ | ✓ | Passkey Entry (KEYBOARD_ONLY central, DISPLAY_ONLY peripheral) |
 | Proxmark3 | - | - | - | - |
+| Proxmark5 | ESP32-C2 | - | - | - |
 
 ## Service UUIDs
 

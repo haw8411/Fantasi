@@ -104,13 +104,13 @@ FZ
 
 Device storage is presented over USB MSC as a single synthetic FAT volume (label `Fantasi`). The firmware synthesizes the FAT boot sector, FAT tables, and directory entries on the fly from its real filesystems - internal flash (LittleFS, mounted at `/`) and, on app-capable targets, the RAM-backed `/ramfs` - so there is no second copy of the data and no fixed image size. Reads are served from those filesystems; writes are parsed back out of the FAT directory/data sectors and committed to the underlying filesystem.
 
-The first local command (`ls`, `upload`, …) triggers the CLI to mount that volume. On composite devices (Flipper, Kiisu, Chameleon) the block device is always present alongside CDC; on switch-mode devices (Proxmark3, which reuses its CDC endpoints for MSC) the CLI first sends the `msc` command to flip the device into MSC mode. Either way the volume is then mounted with `udisksctl`, and local commands are plain stdio against the mountpoint. When the CLI next needs the serial port (a forwarded firmware command, or exit) it unmounts; on switch-mode devices it also SCSI-ejects so the firmware re-enumerates as CDC.
+The first local command (`ls`, `upload`, …) triggers the CLI to mount that volume. On composite devices (Flipper, Kiisu, Chameleon, Proxmark5) the block device is always present alongside CDC; on switch-mode devices (Proxmark3, which reuses its CDC endpoints for MSC) the CLI first sends the `msc` command to flip the device into MSC mode. Either way the volume is then mounted with `udisksctl`, and local commands are plain stdio against the mountpoint. When the CLI next needs the serial port (a forwarded firmware command, or exit) it unmounts; on switch-mode devices it also SCSI-ejects so the firmware re-enumerates as CDC.
 
 Serial commands are sent as raw text over the CDC port. The CLI strips echo and prompt lines from the response before printing.
 
 ## Storage notes
 
 - Because the FAT is synthetic, the host sees a normal removable drive - you can also mount and browse it with your file manager. Long (non-8.3) filenames are supported via VFAT LFN entries.
-- Composite devices (FZ, Kiisu, CU) keep CDC and MSC active simultaneously, so the CLI freely interleaves serial commands and storage access (unmounting only momentarily to free the volume for the firmware).
+- Composite devices (FZ, Kiisu, CU, PM5) keep CDC and MSC active simultaneously, so the CLI freely interleaves serial commands and storage access (unmounting only momentarily to free the volume for the firmware).
 - Switch-mode devices (PM3) trade the CDC endpoints for MSC, so each storage operation is bracketed by a mode switch in and a SCSI eject out; the CLI handles this transparently and waits for the CDC port to reappear.
 - `crc32 <file>` reads a device file and prints its CRC32 and size - used by `tools/flash.py` to skip re-uploading unchanged resources without capturing binary data over the link.

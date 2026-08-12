@@ -1,10 +1,12 @@
-# Fantasi - unified CLI firmware for Flipper Zero, Chameleon Ultra, Proxmark3.
+# Fantasi - unified Makefile for all supported platforms.
 #
 # Usage:
 #   make                        # build all firmwares + host CLI
 #   make PLATFORM=flipper       # STM32WB55 (Cortex-M4)
+#   make PLATFORM=kiisu         # STM32WB55 (Cortex-M4)
 #   make PLATFORM=chameleon     # nRF52840  (Cortex-M4)
 #   make PLATFORM=proxmark3     # AT91SAM7S (ARM7TDMI)
+#   make PLATFORM=proxmark5     # AT32F435  (Cortex-M4)
 #   make cli                    # host-side CLI (build/cli/fantasi)
 #   make clean                  # remove all build artifacts (or PLATFORM=<x> for one)
 #   make flash                  # auto-detect connected device + flash (PLATFORM=<x> to force)
@@ -17,7 +19,7 @@ PLATFORM ?= help
 
 # Every buildable firmware target - used when no PLATFORM is given so a bare
 # `make` builds them all and `make clean` removes everything.
-ALL_PLATFORMS := flipper kiisu chameleon proxmark3
+ALL_PLATFORMS := flipper kiisu chameleon proxmark3 proxmark5
 
 # All three platforms build against TinyUSB under third_party/tinyusb/. The
 # `check-tinyusb` target auto-clones it if missing, pinned to a known-
@@ -40,6 +42,12 @@ TUSB_MARKER := $(TUSB_DIR)/src/tusb.c
 TUSB_PATCHES  := $(wildcard third_party/tinyusb_patches/*.patch)
 SAM7S_DCD_SRC := third_party/tinyusb_patches/dcd_at91sam7s.c
 SAM7S_DCD_DST := $(TUSB_DIR)/src/portable/microchip/at91sam7s/dcd_at91sam7s.c
+# AT32F435 DWC2 port header (Proxmark5). A NEW upstream file, copied in only
+# when absent - same discipline as the SAM7S DCD above. The two register
+# edits it needs (OPT_MCU_AT32F435, the dcd_dwc2.c include) ride in via the
+# *.patch glob.
+AT32_DWC2_SRC := third_party/tinyusb_patches/dwc2_at32.h
+AT32_DWC2_DST := $(TUSB_DIR)/src/portable/synopsys/dwc2/dwc2_at32.h
 
 LFS_URL     := https://github.com/littlefs-project/littlefs.git
 LFS_TAG     := v2.11.3
@@ -86,13 +94,14 @@ check-toolchain:
 	fi
 
 help:
-	@echo "Fantasi - PLATFORM is one of: flipper, kiisu, chameleon, proxmark3"
+	@echo "Fantasi - PLATFORM is one of: flipper, kiisu, chameleon, proxmark3, proxmark5"
 	@echo ""
 	@echo "  make                      build all firmwares + host CLI"
 	@echo "  make PLATFORM=flipper     build Flipper firmware (STM32WB55)"
 	@echo "  make PLATFORM=kiisu       build Kiisu firmware (STM32WB55, Flipper-compatible)"
 	@echo "  make PLATFORM=chameleon   build Chameleon Ultra firmware (nRF52840)"
 	@echo "  make PLATFORM=proxmark3   build Proxmark3 firmware (AT91SAM7S)"
+	@echo "  make PLATFORM=proxmark5   build Proxmark5 firmware (AT32F435)"
 	@echo "  make cli                  build the host CLI (build/cli/fantasi)"
 	@echo "  make app APP=<name>       build a loadable app (apps/<name>/<name>.c)"
 	@echo "  make launch APP=<name>    build + upload + run an app on the device"
@@ -139,6 +148,12 @@ check-tinyusb:
 	  mkdir -p $(dir $(SAM7S_DCD_DST)); \
 	  cp $(SAM7S_DCD_SRC) $(SAM7S_DCD_DST); \
 	fi
+	@# Install the AT32F435 DWC2 port header (a new upstream file) ONLY when absent.
+	@if [ -f $(AT32_DWC2_SRC) ] && [ ! -f $(AT32_DWC2_DST) ]; then \
+	  echo "Installing AT32 DWC2 header -> $(AT32_DWC2_DST)"; \
+	  mkdir -p $(dir $(AT32_DWC2_DST)); \
+	  cp $(AT32_DWC2_SRC) $(AT32_DWC2_DST); \
+	fi
 
 check-littlefs:
 	@if [ ! -f $(LFS_MARKER) ]; then \
@@ -165,6 +180,9 @@ chameleon: check-toolchain check-tinyusb check-littlefs
 	$(MAKE) -C platforms/$@
 
 proxmark3: check-toolchain check-tinyusb check-littlefs
+	$(MAKE) -C platforms/$@
+
+proxmark5: check-toolchain check-tinyusb check-littlefs
 	$(MAKE) -C platforms/$@
 
 flash:
@@ -208,7 +226,7 @@ storage:
 # Integration tests - need a connected device (run per-platform).
 test:
 	@if [ "$(PLATFORM)" = "help" ]; then \
-	  echo "Set PLATFORM=<flipper|chameleon|proxmark3> for test target"; exit 1; \
+	  echo "Set PLATFORM=<flipper|kiisu|chameleon|proxmark3|proxmark5> for test target"; exit 1; \
 	fi
 	python3 tests/run.py --platform $(PLATFORM)
 

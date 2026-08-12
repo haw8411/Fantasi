@@ -4,7 +4,7 @@ Fantasi can load and run small, statically-compiled **apps** from RAM. An app is
 an ELF that the firmware relocates into RAM, runs on its own interruptible task,
 and frees completely when it exits.
 
-Supported on all four targets: Flipper Zero, Kiisu, and Chameleon Ultra
+Supported on all five targets: Flipper Zero, Kiisu, Chameleon Ultra, and Proxmark5
 (Cortex-M4 / ARMv7E-M) and the Proxmark3 (ARM7TDMI / ARMv4T). The loader handles both
 architectures; apps are **architecture-specific**, so build and upload the
 variant that matches your target (see below).
@@ -40,7 +40,7 @@ int app_main(const fantasi_api_t *api)
 Put it at `apps/<name>/<name>.c` and build the loadable ELFs:
 
 ```
-make app APP=<name>        # -> build/apps/<name>.cm4.elf  (Flipper, Kiisu, Chameleon)
+make app APP=<name>        # -> build/apps/<name>.cm4.elf  (Flipper, Kiisu, Chameleon, Proxmark5)
                            #    build/apps/<name>.arm7.elf (Proxmark3)
 ```
 
@@ -69,7 +69,7 @@ make launch APP=hello
 ```
 
 It auto-detects the target (so it picks the right `.cm4`/`.arm7` variant); force
-one with `make PLATFORM=<flipper|kiisu|chameleon|proxmark3> launch APP=<name>`. The
+one with `make PLATFORM=<flipper|kiisu|chameleon|proxmark3|proxmark5> launch APP=<name>`. The
 app's output streams to your terminal; press **Ctrl-C** to stop it - that's
 forwarded to the device as a clean kill (task deleted, memory freed) and drops
 you back at the fantasi prompt. (Under the hood this is `tools/launch.py`; the host
@@ -91,7 +91,7 @@ The device presents a small FAT drive with `RAMFS/` and `APPS/` folders. Copy an
 app in and launch it:
 
 ```
-# pick the variant for your target: .cm4.elf (FZ/Kiisu/CU) or .arm7.elf (PM3)
+# pick the variant for your target: .cm4.elf (FZ/Kiisu/CU/PM5) or .arm7.elf (PM3)
 cp build/apps/hello.cm4.elf  /media/<you>/Fantasi/RAMFS/hello   # RAM (no flash wear)
 # or
 cp build/apps/hello.cm4.elf  /media/<you>/Fantasi/APPS/hello    # flash (persistent)

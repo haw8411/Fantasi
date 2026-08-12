@@ -1,6 +1,6 @@
 # Fantasi technical design
 
-Fantasi is a multi-platform firmware that runs on security research devices - the Flipper Zero, Kiisu, Chameleon Ultra, and Proxmark3. It replaces each device's stock firmware with a common runtime that presents a unified USB CLI and storage interface, then loads and executes applications transferred from the host.
+Fantasi is a multi-platform firmware that runs on security research devices - the Flipper Zero, Kiisu, Chameleon Ultra, Proxmark3, and Proxmark5. It replaces each device's stock firmware with a common runtime that presents a unified USB CLI and storage interface, then loads and executes applications transferred from the host.
 
 ## Architecture
 
@@ -30,7 +30,7 @@ Fantasi is a FreeRTOS-based system. The kernel provides preemptive multitasking,
 | BLE CLI (`blecli`) | `tskIDLE + 1` | BLE-only (FZ/Kiisu/CU): pumps the BLE stack, runs the protobuf CLI transport and the LittleFS write path for BLE file ops |
 | Idle | `tskIDLE` | FreeRTOS idle hook (unused) |
 
-The `blecli` task is created only on platforms built with `FANTASI_ENABLE_BLE_CLI` (Flipper Zero, Kiisu, and Chameleon Ultra); the Proxmark3 has no radio and omits it.
+The `blecli` task is created only on platforms built with `FANTASI_ENABLE_BLE_CLI` (Flipper Zero, Kiisu, and Chameleon Ultra); the Proxmark3 has no radio and omits it, as does the Proxmark5 (its external ESP32-C2 BLE link is not integrated yet).
 
 ### Code structure
 
@@ -51,6 +51,7 @@ platforms/      One directory per target
                   companion-MCU display
   chameleon/      nRF52840  - hal.c, BLE, flash driver, linker
   proxmark3/      AT91SAM7S - hal.c, flash driver, USB mode-switch, linker
+  proxmark5/      AT32F435  - hal.c, flash driver (bank 2), FPGA/RFID driver, linker
 
 third_party/    Auto-cloned dependencies (gitignored)
   tinyusb/        USB device stack (pinned tag)
@@ -78,7 +79,7 @@ Platforms that lack a feature return a sentinel value rather than requiring comp
 
 ## USB
 
-All targets use TinyUSB as the USB device stack. The Flipper Zero, Kiisu, and Chameleon Ultra run CDC and MSC as a composite device (both interfaces active simultaneously). The Proxmark3 has only 4 hardware endpoints, so it mode-switches between CDC and MSC on demand - the `msc` CLI command re-enumerates as MSC-only, and host-side `eject` returns to CDC.
+All targets use TinyUSB as the USB device stack. The Flipper Zero, Kiisu, Chameleon Ultra, and Proxmark5 run CDC and MSC as a composite device (both interfaces active simultaneously). The Proxmark3 has only 4 hardware endpoints, so it mode-switches between CDC and MSC on demand - the `msc` CLI command re-enumerates as MSC-only, and host-side `eject` returns to CDC.
 
 ## Storage
 

@@ -70,6 +70,21 @@ PLATFORMS = {
         "has_storage": True,
         "msc_mode": "switch",
     },
+    # Proxmark5 (AT32F435). USB is composite (CDC+MSC+HID+vendor). Reboot-to-DFU
+    # jumps to the AT32 ROM system bootloader, which enumerates as an Artery USB
+    # DFU device (2e3c:df11) and flashes internal flash at 0x08000000 - the same
+    # dfu-util flow as the Flipper's STM32 ROM DFU. No device-side storage
+    # resources yet (the RFID FPGA gateware is a later phase), so has_storage is
+    # False.
+    "proxmark5": {
+        "id": "PM5",
+        "bin": "build/proxmark5/fantasi-proxmark5.bin",
+        "dfu_vid": "2e3c",
+        "dfu_pid": "df11",
+        "flash_tool": "dfu-util",
+        "has_storage": False,
+        "msc_mode": "composite",
+    },
 }
 
 # ── USB device discovery ──────────────────────────────────────────────
@@ -478,6 +493,24 @@ def flash_flipper(bin_path):
         sys.exit(1)
 
 
+def flash_proxmark5(bin_path):
+    # AT32F435 ROM system bootloader (Artery USB DFU, 2e3c:df11), internal flash
+    # at 0x08000000 - same dfu-util flow as the Flipper's STM32 ROM DFU. The
+    # :leave sublet resets into the freshly flashed app; dfu-util often returns
+    # exit 74 there (device resets before the final get_status), which is fine.
+    r = subprocess.run(
+        ["dfu-util", "-a", "0", "-d", "2e3c:df11",
+         "-s", "0x08000000:leave", "-D", bin_path],
+    )
+    if r.returncode not in (0, 74):
+        sys.exit(r.returncode)
+
+    if not wait_for_usb(USB_VID, USB_PID, timeout=15):
+        print("error: device did not re-enumerate after flashing - still in DFU?",
+              file=sys.stderr)
+        sys.exit(1)
+
+
 def flash_chameleon(hex_path):
     build_dir = os.path.dirname(hex_path)
     zip_path = os.path.join(build_dir, "fantasi-chameleon-dfu.zip")
@@ -643,9 +676,11 @@ def main():
         if plat in ("flipper", "kiisu"):
             print("  Hold OK + BACK for 30 seconds until the screen goes blank.")
         elif plat == "chameleon":
-            print("  Unplug USB, hold the user button, plug USB back in.")
+            print("  Unplug USB, hold the B button while plugging in USB (or while USB plugged in: A+B, release A, then release B).")
         elif plat == "proxmark3":
             print("  Hold the button on the Proxmark3 while plugging in USB.")
+        elif plat == "proxmark5":
+            print("  Hold the button while plugging in USB (~6 s) to enter the AT32 ROM bootloader.")
         print()
         # Only prompt when a human is present; under a non-interactive runner
         # (e.g. the test harness) a missing stdin must surface as a clean error,
@@ -667,6 +702,8 @@ def main():
         flash_chameleon(bin_path)
     elif plat == "proxmark3":
         flash_proxmark3(bin_path)
+    elif plat == "proxmark5":
+        flash_proxmark5(bin_path)
     else:
         sys.exit(f"error: no flash routine for platform '{plat}'")
 

@@ -4,13 +4,15 @@
 
 #ifdef FANTASI_ENABLE_BLE_CLI
 #include "ble_serial.h"
-#include "ble_proto.h"
+#include "proto.h"
 #endif
 
 #ifdef FANTASI_ENABLE_WEBUSB
-#include "ble_proto.h"   /* fantasi_proto_init (shared protobuf engine) */
+#include "proto.h"   /* fantasi_proto_init (shared protobuf engine) */
 #include "usb_proto.h"
 #endif
+
+#include "../hal/storage/fat_ramdisk.h"   /* fatrd_store_init (storage lock) */
 
 #include "FreeRTOS.h"
 #include "task.h"
@@ -75,6 +77,8 @@ int main(void)
     fantasi_log_init();
     fantasi_log(LOG_INFO, "boot");
 
+    fatrd_store_init();   /* create the storage lock before the usb/cli/proto tasks touch LittleFS */
+
     xTaskCreate(cli_task, "cli", CLI_TASK_STACK, NULL, tskIDLE_PRIORITY + 1, NULL);
     xTaskCreate(platform_usb_task, "usb", USB_TASK_STACK, NULL, tskIDLE_PRIORITY + 2, NULL);
 
@@ -94,7 +98,7 @@ int main(void)
      * the stack-overflow hook during uploads. Platforms without a SoftDevice run
      * that path shallow and sequential (the Flipper measured usbproto at 1312 B
      * and blecli at 1368 B under full transfers), so their Makefiles override these
-     * stacks down e.g. with -DWEBUSB_PROTO_STACK=1024 and -DBLE_PROTO_STACK=1024. */
+     * stacks down e.g. with -DWEBUSB_PROTO_STACK=1024 and -DPROTO_STACK=1024. */
 #ifndef WEBUSB_PROTO_STACK
 #define WEBUSB_PROTO_STACK (CLI_TASK_STACK * 4)
 #endif
@@ -109,10 +113,10 @@ int main(void)
     ble_cli_ctx.transport.poll      = ble_serial_poll;
     ble_cli_ctx.transport.ctx       = NULL;
     /* Defaults to x4; see WEBUSB_PROTO_STACK above for the shared sizing rationale. */
-#ifndef BLE_PROTO_STACK
-#define BLE_PROTO_STACK (CLI_TASK_STACK * 4)
+#ifndef PROTO_STACK
+#define PROTO_STACK (CLI_TASK_STACK * 4)
 #endif
-    xTaskCreate(ble_proto_task, "blecli", BLE_PROTO_STACK,
+    xTaskCreate(proto_task, "blecli", PROTO_STACK,
                 &ble_cli_ctx, tskIDLE_PRIORITY + 1, NULL);
 #endif
 

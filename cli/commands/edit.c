@@ -56,7 +56,7 @@ static int run_editor(const char *editor, const char *path)
     return (WIFEXITED(st) && WEXITSTATUS(st) == 0) ? 0 : -1;
 }
 
-#ifdef HAS_BLE
+#ifdef HAS_PROTO
 /* Download `devpath` to a temp file, edit it, and upload it back only if the editor saved a change. */
 static void edit_via_temp(const char *editor, const char *devpath)
 {
@@ -66,7 +66,7 @@ static void edit_via_temp(const char *editor, const char *devpath)
     FILE *out = fdopen(fd, "wb");
     if (!out) { perror("edit: fdopen"); close(fd); unlink(tmp); return; }
 
-    if (ble_download(devpath, out) < 0) { fclose(out); unlink(tmp); return; }   /* error already printed */
+    if (proto_download(devpath, out) < 0) { fclose(out); unlink(tmp); return; }   /* error already printed */
     fclose(out);
 
     struct stat before = {0}, after = {0};
@@ -79,7 +79,7 @@ static void edit_via_temp(const char *editor, const char *devpath)
                    before.st_mtim.tv_nsec != after.st_mtim.tv_nsec;
     if (r == 0 && changed) {
         printf("saving %s ...\n", devpath);
-        ble_upload(tmp, devpath);
+        proto_upload(tmp, devpath);
     } else if (r == 0) {
         printf("no changes\n");
     }
@@ -105,14 +105,14 @@ static void cmd_edit(const char *arg)
     }
 
     /* No MSC: use the WebUSB/BLE temp-file path, upgrading a still-serial session to WebUSB for it. */
-#if defined(HAS_USB_VENDOR) && defined(HAS_BLE)
+#if defined(HAS_USB_VENDOR) && defined(HAS_PROTO)
     if (use_usb || try_webusb_upgrade(false)) { edit_via_temp(editor, path); return; }
 #endif
     fprintf(stderr, "edit: no filesystem available\n");
 }
 
-#ifdef HAS_BLE
-static void ble_cmd_edit(const char *arg)
+#ifdef HAS_PROTO
+static void proto_cmd_edit(const char *arg)
 {
     if (!arg) { fprintf(stderr, "usage: edit <file>\n"); return; }
     const char *editor = find_editor();
@@ -124,4 +124,4 @@ static void ble_cmd_edit(const char *arg)
 }
 #endif
 
-LOCAL_COMMAND_BLE("edit", "edit a device file in default editor", cmd_edit, ble_cmd_edit);
+LOCAL_COMMAND_BLE("edit", "edit a device file in default editor", cmd_edit, proto_cmd_edit);

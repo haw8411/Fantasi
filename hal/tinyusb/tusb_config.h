@@ -33,7 +33,15 @@
 
 #ifdef FANTASI_ENABLE_MSC
 #define CFG_TUD_MSC             1
+/* MSC transfer buffer. Larger = the host reads/writes the FAT in big bursts (one
+ * multi-block SD read per call) instead of a 512-byte sector per USB round-trip -
+ * worth ~8 KB of RAM on a target with a large (SD) volume. The fat_ramdisk bridge
+ * handles any size, so low-memory targets (Proxmark3-class) keep the 512-byte
+ * default; a platform with the RAM and a card opts in via -DCFG_TUD_MSC_EP_BUFSIZE
+ * in its Makefile (see platforms/flipper/Makefile). */
+#ifndef CFG_TUD_MSC_EP_BUFSIZE
 #define CFG_TUD_MSC_EP_BUFSIZE  512
+#endif
 #else
 #define CFG_TUD_MSC             0
 #endif

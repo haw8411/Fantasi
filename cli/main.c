@@ -12,6 +12,9 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/ioctl.h>
+#include <linux/fs.h>   /* BLKFLSBUF */
+#include <scsi/sg.h>    /* SG_IO: read the device generation sector, cache-bypassing */
 #include <termios.h>
 #include <errno.h>
 #include <glob.h>
@@ -22,7 +25,7 @@
 #include <readline/readline.h>
 #include <readline/history.h>
 
-#ifdef HAS_BLE
+#ifdef HAS_PROTO
 #include "ble_transport.h"
 #include "fantasi.pb.h"
 #include <pb_encode.h>
@@ -126,6 +129,10 @@ static bool ser_open(const char *path)
 
 static bool ser_connected;
 bool msc_active;
+/* True when the last byte written to stdout was not a newline, i.e. command output
+ * left the cursor mid-line. -c mode adds a single trailing newline only then, so
+ * output that already ends in '\n' doesn't get a spurious blank line. */
+static bool g_out_pending_nl;
 static void ser_drain(void);
 static bool wait_for_fantasi_serial(char *out, size_t len, int timeout_s);
 
@@ -201,7 +208,7 @@ static void ser_emit_framed(const uint8_t *buf, ssize_t n, uint8_t *prev,
             ; /* hold - check next byte */
         else if (c != '\r') {
             if (g_cap) cap_putc((char)c);
-            else       putchar(c);
+            else     { putchar(c); g_out_pending_nl = (c != '\n'); }
         }
         *prev = c;
     }
@@ -302,6 +309,38 @@ done:
 
 /* ---- Resolve path against cwd ---- */
 
+/* Collapse `.`, `..`, and duplicate/trailing slashes in an absolute path, in
+ * place. Without this, `cd ..` in /ramfs produced "/ramfs/.." (the device has no
+ * notion of "..") and validation failed. Every command routes through
+ * resolve_path, so normalizing here fixes navigation everywhere. */
+static void normalize_path(char *path)
+{
+    char *segs[64];
+    int   nseg = 0;
+    for (char *p = path; *p; ) {
+        while (*p == '/') p++;                 /* skip run of slashes */
+        if (!*p) break;
+        char *s = p;
+        while (*p && *p != '/') p++;
+        if (*p) { *p = '\0'; p++; }
+        if (strcmp(s, ".") == 0) continue;
+        if (strcmp(s, "..") == 0) { if (nseg > 0) nseg--; continue; }
+        if (nseg < 64) segs[nseg++] = s;       /* segs point into `path` */
+    }
+    char tmp[256];
+    size_t w = 0;
+    for (int i = 0; i < nseg; i++) {
+        size_t l = strlen(segs[i]);
+        if (w + 1 + l >= sizeof tmp) break;
+        tmp[w++] = '/';
+        memcpy(tmp + w, segs[i], l);
+        w += l;
+    }
+    if (w == 0) tmp[w++] = '/';                /* root */
+    tmp[w] = '\0';
+    memcpy(path, tmp, w + 1);
+}
+
 void resolve_path(const char *arg, char *out, size_t len)
 {
     if (!arg || !arg[0]) {
@@ -316,6 +355,36 @@ void resolve_path(const char *arg, char *out, size_t len)
             snprintf(out, len, "%s/%s", cwd, arg);
     }
     out[len - 1] = '\0';
+    normalize_path(out);
+}
+
+/* If the destination argument denotes a directory, append basename(src) to the
+ * already-resolved destination so `cp/mv SRC DIR` lands at DIR/<basename> - matching
+ * shell semantics. A directory is indicated by a trailing '/', or a '.'/'..' final
+ * component: ".", "..", ".../", ".../.", or ".../..". (resolve_path has already collapsed
+ * these in dst_resolved, so we read the intent from the raw argument.) `dst_resolved`
+ * is normalized: "/" for root, otherwise no trailing slash. No-op for a plain filename. */
+void dir_target(const char *src_resolved, const char *dst_raw,
+                char *dst_resolved, size_t cap)
+{
+    size_t rl = strlen(dst_raw);
+    bool is_dir = rl > 0 && dst_raw[rl - 1] == '/';
+    if (!is_dir && (strcmp(dst_raw, ".") == 0 || strcmp(dst_raw, "..") == 0))
+        is_dir = true;
+    if (!is_dir && rl >= 2 && dst_raw[rl - 1] == '.' && dst_raw[rl - 2] == '/')
+        is_dir = true;                                        /* ".../." */
+    if (!is_dir && rl >= 3 && dst_raw[rl - 1] == '.' && dst_raw[rl - 2] == '.'
+                           && dst_raw[rl - 3] == '/')
+        is_dir = true;                                        /* ".../.." */
+    if (!is_dir) return;
+
+    const char *base = strrchr(src_resolved, '/');
+    base = base ? base + 1 : src_resolved;
+    size_t l = strlen(dst_resolved);
+    if (l == 1 && dst_resolved[0] == '/')                     /* root: "/" + x -> "/x" */
+        snprintf(dst_resolved + l, cap - l, "%s", base);
+    else                                                      /* "/dir" + x -> "/dir/x" */
+        snprintf(dst_resolved + l, cap - l, "/%s", base);
 }
 
 /* ---- Local commands (operate on the OS-mounted "Fantasi" FAT) ----
@@ -366,9 +435,9 @@ const local_cmd_t *cli_local_match(const char *line)
     return NULL;
 }
 
-#ifdef HAS_BLE
+#ifdef HAS_PROTO
 bool     use_ble;       /* talking to the device over BLE rather than USB/MSC */
-uint32_t ble_req_id;    /* monotonic protobuf request id */
+uint32_t proto_req_id;    /* monotonic protobuf request id */
 #endif
 
 static bool handle_local(const char *line)
@@ -379,9 +448,9 @@ static bool handle_local(const char *line)
     const char *arg = skip_word(line);
     if (!*arg) arg = NULL;
 
-#ifdef HAS_BLE
-    if ((use_ble || use_usb) && c->ble_fn) {
-        c->ble_fn(arg);
+#ifdef HAS_PROTO
+    if ((use_ble || use_usb) && c->proto_fn) {
+        c->proto_fn(arg);
         return true;
     }
 #endif
@@ -537,40 +606,82 @@ static bool wait_for_fantasi_serial(char *out, size_t len, int timeout_s)
     return false;
 }
 
-/* Mount the block device (whole-disk superfloppy FAT) via udisksctl and
- * report where the OS put it. Handles the "already mounted" case too. */
-static bool udisks_mountpoint(const char *blk, char *out, size_t len)
+/* The device's external-write generation, read straight off the block device with
+ * an SG_IO READ(10) of the reserved generation sector (see GEN_LBA in
+ * fat_ramdisk.c). SG_IO bypasses the page cache, so this always reflects the
+ * device's current state - the race-free way to tell whether the filesystem changed
+ * under a mounted view since we last looked. Returns 0 if unavailable. */
+#define GEN_LBA 3
+static uint32_t fat_gen(const char *blk)
+{
+    int fd = open(blk, O_RDONLY | O_NONBLOCK);
+    if (fd < 0) return 0;
+    unsigned char cdb[10] = { 0x28, 0, 0, 0, 0, GEN_LBA, 0, 0, 1, 0 };  /* READ(10) lba=3 len=1 */
+    unsigned char buf[512], sense[32];
+    sg_io_hdr_t io;
+    memset(&io, 0, sizeof io);
+    io.interface_id = 'S'; io.dxfer_direction = SG_DXFER_FROM_DEV;
+    io.cmdp = cdb; io.cmd_len = sizeof cdb; io.dxferp = buf; io.dxfer_len = sizeof buf;
+    io.sbp = sense; io.mx_sb_len = sizeof sense; io.timeout = 5000;
+    uint32_t gen = 0;
+    if (ioctl(fd, SG_IO, &io) == 0 && (io.info & SG_INFO_OK_MASK) == SG_INFO_OK &&
+        memcmp(buf, "FSgen", 5) == 0)
+        gen = buf[8] | (buf[9] << 8) | (buf[10] << 16) | ((uint32_t)buf[11] << 24);
+    close(fd);
+    return gen;
+}
+
+/* The generation the currently-established OS mount reflects, persisted across our
+ * per-command (`-c`) invocations since the mount itself persists. */
+static uint32_t mount_gen_load(void)
+{
+    char path[512]; fantasi_state_path("mntgen", path, sizeof path);
+    if (!path[0]) return 0;
+    FILE *f = fopen(path, "r"); if (!f) return 0;
+    unsigned long g = 0; if (fscanf(f, "%lu", &g) != 1) g = 0;
+    fclose(f); return (uint32_t)g;
+}
+static void mount_gen_store(uint32_t gen)
+{
+    char path[512]; fantasi_state_path("mntgen", path, sizeof path);
+    if (!path[0]) return;
+    FILE *f = fopen(path, "w"); if (!f) return;
+    fprintf(f, "%lu\n", (unsigned long)gen); fclose(f);
+}
+
+/* Current mountpoint of `blk` (empty if not mounted). */
+static bool findmnt_target(const char *blk, char *out, size_t len)
 {
     out[0] = '\0';
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "udisksctl mount -b %s 2>&1", blk);
+    char cmd[256]; snprintf(cmd, sizeof cmd, "findmnt -n -o TARGET %s 2>/dev/null", blk);
+    FILE *p = popen(cmd, "r");
+    if (p) { if (fgets(out, len, p)) out[strcspn(out, "\n")] = '\0'; pclose(p); }
+    return out[0] != '\0';
+}
+
+/* Mount `blk` via udisksctl. `usefree` trusts the FAT's FSInfo free-cluster count
+ * instead of scanning the whole FAT on statfs - on a card-sized drive that scan is
+ * thousands of slow synthetic reads (~20s). Returns the mountpoint in `out`. */
+static bool udisks_do_mount(const char *blk, char *out, size_t len)
+{
+    out[0] = '\0';
+    char cmd[256]; snprintf(cmd, sizeof cmd, "udisksctl mount -b %s -o usefree 2>&1", blk);
     FILE *p = popen(cmd, "r");
     if (p) {
         char line[512];
         while (fgets(line, sizeof(line), p)) {
-            /* "Mounted <dev> at <path>" or "...already mounted at `<path>`." */
-            char *at = strstr(line, " at ");
+            char *at = strstr(line, " at ");   /* "Mounted <dev> at <path>" / "already mounted at ..." */
             if (!at) continue;
             char *m = at + 4;
             while (*m == '`' || *m == '\'' || *m == '"' || *m == ' ') m++;
             size_t k = 0;
-            while (m[k] && m[k] != '`' && m[k] != '\'' && m[k] != '"' &&
-                   m[k] != '\n') k++;
-            /* udisksctl ends the "already mounted" form with a '.' */
-            if (k > 0 && m[k - 1] == '.') k--;
+            while (m[k] && m[k] != '`' && m[k] != '\'' && m[k] != '"' && m[k] != '\n') k++;
+            if (k > 0 && m[k - 1] == '.') k--;   /* the "already mounted" form ends with '.' */
             m[k] = '\0';
             snprintf(out, len, "%s", m);
         }
         pclose(p);
     }
-    if (out[0]) return true;
-
-    /* Fall back to the current mountpoint (e.g. auto-mounted by the desktop). */
-    snprintf(cmd, sizeof(cmd), "findmnt -n -o TARGET %s 2>/dev/null", blk);
-    p = popen(cmd, "r");
-    if (!p) return false;
-    if (fgets(out, len, p)) out[strcspn(out, "\n")] = '\0';
-    pclose(p);
     return out[0] != '\0';
 }
 
@@ -621,12 +732,35 @@ bool fat_mount(void)
     }
 
     snprintf(g_blk, sizeof(g_blk), "%s", blk);
-    usleep(500000);   /* let the kernel settle on the new block device */
+    /* A switch-mode device's block node has just appeared - give udev a moment. A
+     * composite device's node is always present, so no settle is needed there. */
+    if (g_switched) usleep(500000);
+
+    /* Freshness without churn: read the device's write-generation (cache-bypassing
+     * SG_IO). If the drive is already mounted (our persistent mount) and its
+     * generation still matches what that mount reflects, reuse it as-is - a mounted
+     * FS only serves stale metadata if the FS changed under it, and the generation
+     * says it hasn't (our own writes over MSC don't bump it). Otherwise (unmounted,
+     * or another transport wrote) mount fresh, which is the only reliable way to
+     * drop the OS's cached view without root. */
+    uint32_t dev_gen = fat_gen(g_blk);
+    char existing[256];
+    if (findmnt_target(g_blk, existing, sizeof existing)) {
+        if (dev_gen && dev_gen == mount_gen_load()) {
+            snprintf(g_mnt, sizeof g_mnt, "%s", existing);   /* unchanged: reuse (fast) */
+            msc_active = true;
+            return true;
+        }
+        char cmd[256];                                       /* changed: remount fresh */
+        snprintf(cmd, sizeof cmd, "udisksctl unmount -b %s >/dev/null 2>&1", g_blk);
+        (void)system(cmd);
+    }
 
     /* udev/udisks needs a moment to register a freshly-enumerated device, so the
      * first mount attempt often races and fails - retry for a few seconds. */
     for (int i = 0; i < 12; i++) {
-        if (udisks_mountpoint(blk, g_mnt, sizeof(g_mnt))) {
+        if (udisks_do_mount(g_blk, g_mnt, sizeof(g_mnt))) {
+            mount_gen_store(dev_gen);   /* this mount now reflects dev_gen */
             msc_active = true;
             return true;
         }
@@ -642,21 +776,28 @@ void fat_unmount(void)
     if (!g_mnt[0]) return;
 
     sync();
+
+    /* Composite devices (FZ/CU) expose MSC and CDC at once, so there is nothing to
+     * switch back to - leave the drive mounted (udisks manages it) instead of
+     * churning an unmount/remount around every file command. Cross-transport
+     * freshness is still guaranteed: the next fat_mount drops the block cache
+     * (BLKFLSBUF) before reading, so a write made over another transport is seen.
+     * Only switch-mode devices (PM3), which reuse the CDC endpoints for MSC, must
+     * actually unmount + SCSI-eject to re-enumerate as CDC. */
+    if (!g_switched) { g_mnt[0] = '\0'; return; }
+
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "udisksctl unmount -b %s 2>/dev/null", g_blk);
+    snprintf(cmd, sizeof(cmd), "udisksctl unmount -b %s >/dev/null 2>&1", g_blk);
     (void)system(cmd);
     g_mnt[0] = '\0';
     msc_active = false;
 
-    /* Switch-mode devices (PM3) must be SCSI-ejected so the firmware leaves MSC
-     * and re-enumerates as CDC. Composite devices (FZ/CU) keep both interfaces,
-     * so there is nothing to switch back. */
-    if (g_switched) {
+    {
         snprintf(cmd, sizeof(cmd), "eject %s 2>/dev/null", g_blk);
         (void)system(cmd);
         g_switched = false;
 
-        printf("  ejected, waiting for serial...\n");
+        fprintf(stderr, "  ejected, waiting for serial...\n");   /* progress -> stderr, keep stdout clean for piping */
         char new_ser[64];
         if (wait_for_fantasi_serial(new_ser, sizeof(new_ser), 10)) {
             usleep(500000);
@@ -665,7 +806,7 @@ void fat_unmount(void)
                 usleep(200000);
                 ser_drain();
                 ser_connected = true;
-                printf("  reconnected: %s\n", g_ser_path);
+                fprintf(stderr, "  reconnected: %s\n", g_ser_path);
             } else {
                 fprintf(stderr, "  cannot reopen %s\n", g_ser_path);
             }
@@ -714,7 +855,7 @@ static int rl_poll_serial(void)
      * prompt never goes red. */
     if (msc_active && ser_fd < 0) return 0;
 
-#ifdef HAS_BLE
+#ifdef HAS_PROTO
     if (use_ble) {
         if (ser_connected) {
             ble_transport_process();
@@ -802,12 +943,12 @@ static volatile bool running = true;
 
 static void sigint_handler(int sig) { (void)sig; running = false; }
 
-#ifdef HAS_BLE
+#ifdef HAS_PROTO
 
-static uint8_t ble_rx_accum[65536];
-size_t  ble_rx_len;
+static uint8_t proto_rx_accum[65536];
+size_t  proto_rx_len;
 
-static volatile sig_atomic_t ble_stream_interrupted;
+static volatile sig_atomic_t proto_stream_interrupted;
 
 #ifdef HAS_USB_VENDOR
 /* Same framed protobuf over the USB vendor bulk pipe (libusb). The device runs
@@ -837,7 +978,7 @@ static int usb_send_proto(CliRequest *req)
 static int usb_recv_proto(CliResponse *resp)
 {
     for (int idle = 0; idle < 200; idle++) {
-        if (ble_stream_interrupted) return -1;         /* ^C during a stream */
+        if (proto_stream_interrupted) return -1;         /* ^C during a stream */
         if (!usb_transport_connected()) return -1;
         uint8_t chunk[512];
         ssize_t n = usb_transport_read(chunk, sizeof(chunk));
@@ -868,7 +1009,7 @@ static int usb_recv_proto(CliResponse *resp)
 
 /* Encode + write a request without touching the receive side. The pipelined
  * upload uses this so it doesn't drain pending acks between sends. */
-int ble_write_req(CliRequest *req)
+int proto_write_req(CliRequest *req)
 {
 #ifdef HAS_USB_VENDOR
     if (use_usb) return usb_write_req(req);
@@ -882,7 +1023,7 @@ int ble_write_req(CliRequest *req)
     return (ble_transport_write(buf, 2 + len) > 0) ? 0 : -1;
 }
 
-int ble_send_proto(CliRequest *req)
+int proto_send(CliRequest *req)
 {
 #ifdef HAS_USB_VENDOR
     if (use_usb) return usb_send_proto(req);
@@ -890,26 +1031,26 @@ int ble_send_proto(CliRequest *req)
     /* Drain stale data from both transport and accumulator */
     ble_transport_process();
     char d[256]; while (ble_transport_read(d, sizeof(d)) > 0) {}
-    ble_rx_len = 0;
+    proto_rx_len = 0;
 
-    return ble_write_req(req);
+    return proto_write_req(req);
 }
 
-int ble_recv_proto(CliResponse *resp)
+int proto_recv(CliResponse *resp)
 {
 #ifdef HAS_USB_VENDOR
     if (use_usb) return usb_recv_proto(resp);
 #endif
 
     for (int idle = 0; idle < 200; idle++) {
-        if (ble_stream_interrupted) return -1;
+        if (proto_stream_interrupted) return -1;
         /* If the device dropped (e.g. a reboot), stop waiting for a response
          * that will never come - checked periodically (the query isn't free). */
         if ((idle % 10) == 9 && !ble_transport_connected()) return -1;
         int bfd = ble_transport_fd();
         if (bfd >= 0) {
             struct pollfd pfd = { .fd = bfd, .events = POLLIN };
-            poll(&pfd, 1, ble_rx_len > 0 ? 1 : 50);
+            poll(&pfd, 1, proto_rx_len > 0 ? 1 : 50);
         }
         ble_transport_process();
         /* Drain the transport ring COMPLETELY each iteration so it can never
@@ -922,34 +1063,34 @@ int ble_recv_proto(CliResponse *resp)
         while ((n = ble_transport_read(chunk, sizeof(chunk))) > 0) {
             idle = 0;
             size_t copy = (size_t)n;
-            if (ble_rx_len + copy > sizeof(ble_rx_accum))
-                copy = sizeof(ble_rx_accum) - ble_rx_len;
-            memcpy(&ble_rx_accum[ble_rx_len], chunk, copy);
-            ble_rx_len += copy;
-            if (ble_rx_len == sizeof(ble_rx_accum)) break;
+            if (proto_rx_len + copy > sizeof(proto_rx_accum))
+                copy = sizeof(proto_rx_accum) - proto_rx_len;
+            memcpy(&proto_rx_accum[proto_rx_len], chunk, copy);
+            proto_rx_len += copy;
+            if (proto_rx_len == sizeof(proto_rx_accum)) break;
         }
 
-        if (ble_rx_len > 0 && ble_rx_accum[0] == 0) {
+        if (proto_rx_len > 0 && proto_rx_accum[0] == 0) {
             size_t skip = 0;
-            while (skip < ble_rx_len && ble_rx_accum[skip] == 0) skip++;
-            ble_rx_len -= skip;
-            if (ble_rx_len > 0)
-                memmove(ble_rx_accum, &ble_rx_accum[skip], ble_rx_len);
+            while (skip < proto_rx_len && proto_rx_accum[skip] == 0) skip++;
+            proto_rx_len -= skip;
+            if (proto_rx_len > 0)
+                memmove(proto_rx_accum, &proto_rx_accum[skip], proto_rx_len);
         }
 
-        if (ble_rx_len >= 2) {
-            uint16_t msg_len = (uint16_t)ble_rx_accum[0] |
-                               ((uint16_t)ble_rx_accum[1] << 8);
-            if (ble_rx_len >= 2u + msg_len) {
+        if (proto_rx_len >= 2) {
+            uint16_t msg_len = (uint16_t)proto_rx_accum[0] |
+                               ((uint16_t)proto_rx_accum[1] << 8);
+            if (proto_rx_len >= 2u + msg_len) {
                 pb_istream_t stream = pb_istream_from_buffer(
-                    &ble_rx_accum[2], msg_len);
+                    &proto_rx_accum[2], msg_len);
                 *resp = (CliResponse){0};
                 bool ok = pb_decode(&stream, CliResponse_fields, resp);
                 size_t consumed = 2 + msg_len;
-                ble_rx_len -= consumed;
-                if (ble_rx_len > 0)
-                    memmove(ble_rx_accum,
-                            &ble_rx_accum[consumed], ble_rx_len);
+                proto_rx_len -= consumed;
+                if (proto_rx_len > 0)
+                    memmove(proto_rx_accum,
+                            &proto_rx_accum[consumed], proto_rx_len);
                 return ok ? 0 : -1;
             }
         }
@@ -957,36 +1098,40 @@ int ble_recv_proto(CliResponse *resp)
     return -1;
 }
 
-void ble_send_cmd(const char *cmd)
+void proto_send_cmd(const char *cmd)
 {
     CliRequest req = CliRequest_init_zero;
-    req.id = ++ble_req_id;
+    req.id = ++proto_req_id;
     req.which_payload = CliRequest_command_tag;
     size_t cl = strlen(cmd);                             /* the field is pre-zeroed by init_zero, so a */
     if (cl >= sizeof(req.payload.command)) cl = sizeof(req.payload.command) - 1;   /* bounded copy leaves */
     memcpy(req.payload.command, cmd, cl);               /* it NUL-terminated (an over-long command truncates) */
-    ble_send_proto(&req);
+    proto_send(&req);
 }
 
-static void ble_stream_sigint(int sig) { (void)sig; ble_stream_interrupted = 1; }
+static void proto_stream_sigint(int sig) { (void)sig; proto_stream_interrupted = 1; }
 
-static void ble_read_response(bool forward_stdin)
+static void proto_read_response(bool forward_stdin)
 {
-    ble_stream_interrupted = 0;
-    struct sigaction sa = { .sa_handler = ble_stream_sigint };
+    proto_stream_interrupted = 0;
+    struct sigaction sa = { .sa_handler = proto_stream_sigint };
     sigaction(SIGINT, &sa, NULL);
 
     CliResponse resp;
     bool got_data = false;
 
     for (;;) {
-        if (ble_stream_interrupted) break;
+        if (proto_stream_interrupted) break;
 
-        if (ble_recv_proto(&resp) < 0) break;
+        if (proto_recv(&resp) < 0) break;
         got_data = true;
         if (resp.which_payload == CliResponse_output_tag && resp.payload.output[0]) {
             if (g_cap) cap_puts(resp.payload.output);
-            else       printf("%s", resp.payload.output);
+            else {
+                printf("%s", resp.payload.output);
+                size_t L = strlen(resp.payload.output);
+                if (L) g_out_pending_nl = (resp.payload.output[L - 1] != '\n');
+            }
         }
         else if (resp.which_payload == CliResponse_error_tag)
             fprintf(stderr, "error: %s\n", resp.payload.error.message);
@@ -1018,7 +1163,7 @@ static void ble_read_response(bool forward_stdin)
         ble_transport_write(&ctrl_c, 1);
         CliResponse drain;
         for (int i = 0; i < 20; i++) {
-            if (ble_recv_proto(&drain) < 0) break;
+            if (proto_recv(&drain) < 0) break;
             if (!drain.has_next) break;
         }
     }
@@ -1031,7 +1176,7 @@ done:
 /* Read & discard any pending BLE notifications until the link goes quiet, then
  * reset the protobuf framing accumulator. Used before re-requesting a download
  * range so stale bytes from the aborted stream can't desync the new one. */
-void ble_drain_quiet(void)
+void proto_drain_quiet(void)
 {
     uint8_t tmp[1024];
     int quiet = 0;
@@ -1042,10 +1187,10 @@ void ble_drain_quiet(void)
         if (ble_transport_fd() >= 0) poll(&pfd, 1, 3);
         quiet++;
     }
-    ble_rx_len = 0;   /* discard partial frame */
+    proto_rx_len = 0;   /* discard partial frame */
 }
 
-#endif /* HAS_BLE */
+#endif /* HAS_PROTO */
 
 #ifdef HAS_USB_VENDOR
 /* Read the device id ("PM3"/"FZ"/"CU") over the open serial CLI. */
@@ -1133,13 +1278,13 @@ static void fetch_dev_cmds(void)
 {
     if (!ser_connected) return;                 /* retry once the device is up */
     g_dev_ncmd = 0;
-#ifdef HAS_BLE
+#ifdef HAS_PROTO
     if (use_ble || use_usb) {
         char out[2048]; int olen = 0;
-        ble_send_cmd("help");
+        proto_send_cmd("help");
         CliResponse resp;
         do {
-            if (ble_recv_proto(&resp) < 0) break;
+            if (proto_recv(&resp) < 0) break;
             if (resp.which_payload == CliResponse_output_tag) {
                 int sl = (int)strlen(resp.payload.output);
                 if (olen + sl < (int)sizeof out) { memcpy(out + olen, resp.payload.output, sl); olen += sl; }
@@ -1199,8 +1344,8 @@ void load_client_settings(void)
 {
     char out[80] = {0};
     g_cap = out; g_cap_sz = sizeof out; g_cap_len = 0;
-#ifdef HAS_BLE
-    if (use_ble || use_usb) { ble_send_cmd("settings get theme"); ble_read_response(false); }
+#ifdef HAS_PROTO
+    if (use_ble || use_usb) { proto_send_cmd("settings get theme"); proto_read_response(false); }
     else
 #endif
     if (ser_fd >= 0 && ser_connected) { ser_send_cmd("settings get theme"); ser_read_response(); }
@@ -1220,12 +1365,12 @@ static bool exec_line(const char *line)
 {
     if (cli_local_match(line))
         return handle_local(line);
-#ifdef HAS_BLE
+#ifdef HAS_PROTO
     if (use_ble || use_usb) {
         /* Only a launch turns stdin into app I/O (so a piped ^C reaches the app). */
         bool is_launch = strncmp(line, "launch", 6) == 0 && (line[6] == '\0' || line[6] == ' ');
-        ble_send_cmd(line);
-        ble_read_response(is_launch);
+        proto_send_cmd(line);
+        proto_read_response(is_launch);
         if ((use_ble && !ble_transport_connected()) || (use_usb && !usb_transport_connected()))
             ser_connected = false;
         return true;
@@ -1236,6 +1381,31 @@ static bool exec_line(const char *line)
     if (ser_fd >= 0) { ser_send_cmd(line); ser_read_response(); }
     else if (!ser_connected) fprintf(stderr, "device disconnected\n");
     return true;
+}
+
+/* Run a line that may hold several ';'-separated commands, left to right, stopping
+ * early (returning false, so the caller exits) if one is `exit`. strtok_r collapses
+ * empty segments (";;", trailing/leading ';'); whitespace-only segments are trimmed
+ * away too. The split is literal - there is no quoting/escaping, matching the simple
+ * whitespace-delimited argument model, and no command takes a ';' in an argument. */
+static bool exec_commands(const char *line)
+{
+    if (!strchr(line, ';')) return exec_line(line);   /* common case: no copy needed */
+
+    char *dup = strdup(line);
+    if (!dup) return exec_line(line);                 /* OOM: fall back to the whole line */
+
+    bool cont = true;
+    char *save = NULL;
+    for (char *seg = strtok_r(dup, ";", &save); seg && cont;
+         seg = strtok_r(NULL, ";", &save)) {
+        while (*seg == ' ' || *seg == '\t') seg++;                       /* ltrim */
+        char *e = seg + strlen(seg);
+        while (e > seg && (e[-1] == ' ' || e[-1] == '\t')) *--e = '\0';  /* rtrim */
+        if (*seg) cont = exec_line(seg);
+    }
+    free(dup);
+    return cont;
 }
 
 int main(int argc, char **argv)
@@ -1266,11 +1436,11 @@ int main(int argc, char **argv)
              * and the BLE advertised name ("Fantasi <name>"). */
             snprintf(g_device_name, sizeof(g_device_name), "%s", argv[++i]);
             usb_transport_set_name(g_device_name);
-#ifdef HAS_BLE
+#ifdef HAS_PROTO
             ble_transport_set_name(g_device_name);
 #endif
         }
-#ifdef HAS_BLE
+#ifdef HAS_PROTO
         else if (strncmp(argv[i], "--ble-addr=", 11) == 0) {
             force_ble = true;
             ble_transport_set_addr(argv[i] + 11);
@@ -1289,7 +1459,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-#ifdef HAS_BLE
+#ifdef HAS_PROTO
     if (force_ble) {
         if (ble_transport_open() == 0) {
             use_ble = true;
@@ -1312,7 +1482,7 @@ int main(int argc, char **argv)
             if (!connect_webusb_direct())
 #endif
             {
-#ifdef HAS_BLE
+#ifdef HAS_PROTO
             if (ble_transport_open() == 0) {
                 use_ble = true;
                 ser_connected = true;
@@ -1329,7 +1499,7 @@ int main(int argc, char **argv)
         }
     }
 
-#ifdef HAS_BLE
+#ifdef HAS_PROTO
     if (!use_ble)
 #endif
       if (!use_usb) {   /* skip if case B already connected over the vendor pipe */
@@ -1344,18 +1514,6 @@ int main(int argc, char **argv)
 #endif
         {
         if (!ser_open(g_ser_path)) return 1;
-
-        /* An explicitly-passed block device is mounted for the legacy MSC file
-         * path; the common case auto-mounts on demand and needs no notice. */
-        if (blk_path[0]) {
-            snprintf(g_blk, sizeof(g_blk), "%s", blk_path);
-            if (udisks_mountpoint(g_blk, g_mnt, sizeof(g_mnt))) {
-                msc_active = true;
-            } else {
-                fprintf(stderr, "storage: cannot mount %s\n", g_blk);
-                g_mnt[0] = '\0';
-            }
-        }
 
         usleep(500000);
         ser_write("\r\n", 2);
@@ -1372,6 +1530,12 @@ int main(int argc, char **argv)
         if (!force_serial)
             try_webusb_upgrade(force_usb);
 #endif
+
+        /* Legacy MSC file path (serial transport only). The block device is mounted
+         * lazily on the first file command (fat_mount()), not eagerly here: a mount
+         * costs a couple of seconds on a card-sized drive, and non-file commands
+         * (whoami, version, ...) forwarded to the device's serial CLI never need it.
+         * The WebUSB pipe carries files over protobuf and never mounts at all. */
         }
       }
 
@@ -1380,7 +1544,7 @@ int main(int argc, char **argv)
 
     if (oneshot) {
         g_no_history = true;                             /* -c: run one command, save nothing */
-        exec_line(oneshot);
+        exec_commands(oneshot);
     } else {
         rl_attempted_completion_function = cli_completion;   /* TAB completes the command word */
         /* The idle-reconnect hook is only useful for an interactive session. With
@@ -1416,18 +1580,20 @@ int main(int argc, char **argv)
             line[sizeof(line) - 1] = '\0';
             free(rl);
 
-            if (!exec_line(line)) break;
+            if (!exec_commands(line)) break;
         }
     }
 
     if (msc_active) fat_unmount();
     ser_close();
-#ifdef HAS_BLE
+#ifdef HAS_PROTO
     if (use_ble) ble_transport_close();
 #endif
 #ifdef HAS_USB_VENDOR
     if (use_usb) usb_transport_close();
 #endif
-    printf("\n");
+    /* Terminate the line only if command output left the cursor mid-line, so a
+     * response that already ends in '\n' doesn't get an extra blank line. */
+    if (g_out_pending_nl) printf("\n");
     return 0;
 }

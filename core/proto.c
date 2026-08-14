@@ -1,5 +1,5 @@
-#include "ble_proto.h"
-#include "ble_pipe.h"
+#include "proto.h"
+#include "proto_pipe.h"
 #include "cli.h"
 #include "../hal/hal.h"
 #include "../hal/storage/hal_storage.h"
@@ -37,7 +37,7 @@ static size_t      s_out_len;
 static uint32_t    s_req_id;
 static cli_ctx_t  *s_proto_ctx;
 
-static ble_pipe_t  s_pipe;
+static proto_pipe_t  s_pipe;
 
 /* Framed-response sink for the session currently dispatching (BLE pipe, USB
  * vendor, ...) and a lock serialising handler dispatch across transports that
@@ -55,6 +55,12 @@ static SemaphoreHandle_t s_emit_lock;
 static uint8_t         s_file_cache[FILE_CACHE_SZ];
 static lfs_file_t      s_file;
 static struct lfs_file_config s_fcfg = { .buffer = s_file_cache };
+
+/* handle_file_read gets its own cache: a read can interleave a multi-chunk write
+ * (between chunks the dispatch lock is released), and LittleFS needs each open file
+ * its own buffer - sharing s_file_cache would corrupt both. */
+static uint8_t         s_read_cache[FILE_CACHE_SZ];
+static struct lfs_file_config s_rfcfg = { .buffer = s_read_cache };
 
 /* ---- Send a framed CliResponse into the pipe ---- */
 
@@ -245,8 +251,11 @@ static void handle_command(cli_ctx_t *ctx, CliRequest *req)
 
 static void handle_file_read(cli_ctx_t *ctx, CliRequest *req)
 {
-    if (vfs_is_ramfs(req->payload.file_read.path)) {
-        const char *leaf = vfs_ramfs_leaf(req->payload.file_read.path);
+    const char *leaf;
+    const vfs_mount_t *m = vfs_resolve(req->payload.file_read.path, &leaf);
+    if (!m) { send_error(ctx, req->id, "open failed"); return; }
+
+    if (vfs_mount_is_ramfs(m)) {
         int32_t fsize = ramfs_size(leaf);
         if (fsize < 0) { send_error(ctx, req->id, "open failed"); return; }
         uint32_t offset = req->payload.file_read.offset;
@@ -274,12 +283,45 @@ static void handle_file_read(cli_ctx_t *ctx, CliRequest *req)
         return;
     }
 
-    lfs_t *lfs = hal_storage_lfs();
+    if (vfs_mount_is_fat(m)) {
+        int32_t fsize = vfs_fat_size(m->fatdrv, leaf);
+        if (fsize < 0) { send_error(ctx, req->id, "open failed"); return; }
+        uint32_t offset = req->payload.file_read.offset;
+        if (offset > (uint32_t)fsize) offset = (uint32_t)fsize;
+        uint32_t avail = (uint32_t)fsize - offset;
+        uint32_t remain = req->payload.file_read.size;
+        if (remain == 0 || remain > avail) remain = avail;
+        uint32_t sent = 0;
+        while (sent < remain) {
+            uint32_t chunk = remain - sent;
+            if (chunk > 480) chunk = 480;
+            s_resp = (CliResponse){ .id = req->id,
+                .which_payload = CliResponse_file_data_tag };
+            s_resp.payload.file_data.offset = offset + sent;
+            int32_t n = vfs_fat_pread(m->fatdrv, leaf, offset + sent,
+                s_resp.payload.file_data.data.bytes, chunk);
+            if (n <= 0) break;
+            s_resp.payload.file_data.data.size = (pb_size_t)n;
+            sent += (uint32_t)n;
+            s_resp.payload.file_data.last = (sent >= remain || (uint32_t)n < chunk);
+            s_resp.has_next = !s_resp.payload.file_data.last;
+            send_response(ctx, &s_resp);
+        }
+        if (sent == 0) send_error(ctx, req->id, "read failed");
+        return;
+    }
+
+    lfs_t *lfs = vfs_mount_lfs(m);
     if (!lfs) { send_error(ctx, req->id, "storage unavailable"); return; }
 
+    /* Hold the storage lock only across lfs_* calls, releasing it around each
+     * send_response so the TinyUSB task can drain its TX FIFO (it may be blocked on
+     * this lock in build_model). `f` stays open across the gaps - fine, LittleFS
+     * allows an open handle to persist while other (serialised) ops run. */
     lfs_file_t f;
-    if (lfs_file_opencfg(lfs, &f, req->payload.file_read.path,
-                          LFS_O_RDONLY, &s_fcfg) < 0) {
+    fatrd_store_lock();
+    if (lfs_file_opencfg(lfs, &f, leaf, LFS_O_RDONLY, &s_rfcfg) < 0) {
+        fatrd_store_unlock();
         send_error(ctx, req->id, "open failed");
         return;
     }
@@ -314,10 +356,13 @@ static void handle_file_read(cli_ctx_t *ctx, CliRequest *req)
         sent += (uint32_t)n;
         s_resp.payload.file_data.last = (sent >= remain || (uint32_t)n < chunk);
         s_resp.has_next = !s_resp.payload.file_data.last;
+        fatrd_store_unlock();
         send_response(ctx, &s_resp);
+        fatrd_store_lock();
     }
 
     lfs_file_close(lfs, &f);
+    fatrd_store_unlock();
 
     if (sent == 0)
         send_error(ctx, req->id, "read failed");
@@ -326,14 +371,23 @@ static void handle_file_read(cli_ctx_t *ctx, CliRequest *req)
 /* ---- File write ---- */
 
 static bool s_file_open;
+static lfs_t *s_file_lfs;     /* the instance s_file is open on (multi-mount aware) */
 
 static void handle_file_write(cli_ctx_t *ctx, CliRequest *req)
 {
     FileWriteChunk *fw = &req->payload.file_write;
-    fatrd_invalidate();          /* keep the synthetic-FAT model in sync */
+    /* NB: the synthetic-FAT model is invalidated after each chunk commits, never
+     * before. Invalidating up front bumps the model-cache generation while the data
+     * is still uncommitted, so a concurrent MSC read (the host re-reading on the
+     * media-changed signal this very call raises) can rebuild and cache a model that
+     * lacks the file - under the new generation - and that poisoned cache then
+     * survives. Signalling only post-commit means the model can only ever advance to
+     * a state that includes the write. */
+    const char *leaf;
+    const vfs_mount_t *m = vfs_resolve(fw->path, &leaf);
+    if (!m) { send_error(ctx, req->id, "create failed"); return; }
 
-    if (vfs_is_ramfs(fw->path)) {
-        const char *leaf = vfs_ramfs_leaf(fw->path);
+    if (vfs_mount_is_ramfs(m)) {
         if (fw->offset == 0 && ramfs_truncate(leaf) != 0) {
             send_error(ctx, req->id, "create failed"); return;
         }
@@ -346,47 +400,70 @@ static void handle_file_write(cli_ctx_t *ctx, CliRequest *req)
         if (ramfs_write_at(leaf, fw->offset, fw->data.bytes, fw->data.size) != 0) {
             send_error(ctx, req->id, "write failed"); return;
         }
+        fatrd_invalidate();
         send_ok(ctx, req->id, "ok");
         return;
     }
 
-    lfs_t *lfs = hal_storage_lfs();
+    if (vfs_mount_is_fat(m)) {
+        /* The FAT backend keeps its own persistent FIL open across chunks (see
+         * vfs_fat_wchunk); offset==0 truncates/creates, `last` closes+flushes. */
+        if (vfs_fat_wchunk(m->fatdrv, leaf, fw->offset,
+                           fw->data.bytes, fw->data.size, fw->last) != 0) {
+            send_error(ctx, req->id, "write failed");
+            return;
+        }
+        fatrd_invalidate();
+        send_ok(ctx, req->id, "ok");
+        return;
+    }
+
+    lfs_t *lfs = vfs_mount_lfs(m);
     if (!lfs) { send_error(ctx, req->id, "storage unavailable"); return; }
 
+    /* Hold the storage lock across this chunk's lfs work (open/write/close) so it
+     * can't overlap build_model on the TinyUSB task. No emit happens under the lock;
+     * across chunks s_file stays open with the lock released, which is safe. */
+    fatrd_store_lock();
     if (fw->offset == 0) {
-        if (s_file_open) { lfs_file_close(lfs, &s_file); s_file_open = false; }
-        int rc = lfs_file_opencfg(lfs, &s_file, fw->path,
+        if (s_file_open) { lfs_file_close(s_file_lfs, &s_file); s_file_open = false; }
+        int rc = lfs_file_opencfg(lfs, &s_file, leaf,
                     LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC, &s_fcfg);
-        if (rc < 0) { send_error(ctx, req->id, "create failed"); return; }
-        s_file_open = true;
+        if (rc < 0) { fatrd_store_unlock(); send_error(ctx, req->id, "create failed"); return; }
+        s_file_open = true; s_file_lfs = lfs;
     } else if (!s_file_open) {
         /* A retransmitted chunk (host detected a lost write and rewound) can
          * arrive after a premature `last` already closed the file. Reopen it
          * (no truncate) so the hole can be filled - writes are idempotent and
          * addressed by absolute offset. */
-        int rc = lfs_file_opencfg(lfs, &s_file, fw->path,
+        int rc = lfs_file_opencfg(lfs, &s_file, leaf,
                     LFS_O_WRONLY, &s_fcfg);
-        if (rc < 0) { send_error(ctx, req->id, "reopen failed"); return; }
-        s_file_open = true;
+        if (rc < 0) { fatrd_store_unlock(); send_error(ctx, req->id, "reopen failed"); return; }
+        s_file_open = true; s_file_lfs = lfs;
     }
 
     if (fw->offset > 0)
-        lfs_file_seek(lfs, &s_file, fw->offset, LFS_SEEK_SET);
+        lfs_file_seek(s_file_lfs, &s_file, fw->offset, LFS_SEEK_SET);
 
-    lfs_ssize_t n = lfs_file_write(lfs, &s_file, fw->data.bytes, fw->data.size);
+    lfs_ssize_t n = lfs_file_write(s_file_lfs, &s_file, fw->data.bytes, fw->data.size);
     if (n < 0) {
-        lfs_file_close(lfs, &s_file);
+        lfs_file_close(s_file_lfs, &s_file);
         s_file_open = false;
+        fatrd_store_unlock();
         send_error(ctx, req->id, "write failed");
         return;
     }
 
     if (fw->last) {
-        int crc = lfs_file_close(lfs, &s_file);
+        int crc = lfs_file_close(s_file_lfs, &s_file);
         s_file_open = false;
-        if (crc < 0) { send_error(ctx, req->id, "flush failed"); return; }
+        if (crc < 0) { fatrd_store_unlock(); send_error(ctx, req->id, "flush failed"); return; }
     }
+    fatrd_store_unlock();
 
+    /* Post-commit: on the last chunk this runs after lfs_file_close has flushed the
+     * file's metadata, so the model the host next builds is guaranteed to see it. */
+    fatrd_invalidate();
     send_ok(ctx, req->id, "ok");
 }
 
@@ -434,28 +511,53 @@ static void handle_file_delete(cli_ctx_t *ctx, CliRequest *req)
 
 static void handle_mkdir(cli_ctx_t *ctx, CliRequest *req)
 {
-    fatrd_invalidate();
-    if (vfs_is_ramfs(req->payload.mkdir.path)) {
+    const char *leaf;
+    const vfs_mount_t *m = vfs_resolve(req->payload.mkdir.path, &leaf);
+    if (!m) { send_error(ctx, req->id, "mkdir failed"); return; }
+
+    if (vfs_mount_is_ramfs(m)) {
         /* ramfs is flat: the mount itself always exists, subdirs are unsupported. */
-        const char *leaf = vfs_ramfs_leaf(req->payload.mkdir.path);
         if (leaf[0] == '\0') send_ok(ctx, req->id, "ok");
         else send_error(ctx, req->id, "ramfs has no subdirs");
         return;
     }
 
-    lfs_t *lfs = hal_storage_lfs();
+    if (vfs_mount_is_fat(m)) {
+        if (vfs_fat_mkdir(m->fatdrv, leaf) == 0) { fatrd_invalidate(); send_ok(ctx, req->id, "ok"); }
+        else send_error(ctx, req->id, "mkdir failed");
+        return;
+    }
+
+    lfs_t *lfs = vfs_mount_lfs(m);
     if (!lfs) { send_error(ctx, req->id, "storage unavailable"); return; }
 
-    int rc = lfs_mkdir(lfs, req->payload.mkdir.path);
+    fatrd_store_lock();
+    int rc = lfs_mkdir(lfs, leaf);
+    fatrd_store_unlock();
     if (rc < 0 && rc != LFS_ERR_EXIST)
         send_error(ctx, req->id, "mkdir failed");
-    else
+    else {
+        fatrd_invalidate();          /* after the directory is committed */
         send_ok(ctx, req->id, "ok");
+    }
+}
+
+/* ---- File rename/move (within one backend) ---- */
+
+static void handle_file_rename(cli_ctx_t *ctx, CliRequest *req)
+{
+    int rc = vfs_rename(req->payload.file_rename.src, req->payload.file_rename.dst);
+    if (rc == 0)
+        send_ok(ctx, req->id, "ok");
+    else if (rc == VFS_ERR_XDEV)
+        send_error(ctx, req->id, "cross-device");   /* host falls back to copy+delete */
+    else
+        send_error(ctx, req->id, "rename failed");
 }
 
 /* ---- Main task ---- */
 
-static void pipe_flush(void) { ble_pipe_flush(&s_pipe); }
+static void pipe_flush(void) { proto_pipe_flush(&s_pipe); }
 
 /* ---- Shared protobuf engine (used by BLE + USB vendor transports) ---- */
 
@@ -496,6 +598,7 @@ void fantasi_proto_rx(cli_ctx_t *ctx, uint8_t *accum, size_t cap, size_t *accum_
             case CliRequest_dir_list_tag:    handle_dir_list(ctx, &s_req); break;
             case CliRequest_file_delete_tag: handle_file_delete(ctx, &s_req); break;
             case CliRequest_mkdir_tag:       handle_mkdir(ctx, &s_req); break;
+            case CliRequest_file_rename_tag: handle_file_rename(ctx, &s_req); break;
 #ifdef FANTASI_ENABLE_APPS
             case CliRequest_app_launch_tag:  handle_app_launch(ctx, &s_req); break;
             case CliRequest_app_input_tag:   handle_app_input(ctx, &s_req); break;
@@ -517,15 +620,15 @@ void fantasi_proto_rx(cli_ctx_t *ctx, uint8_t *accum, size_t cap, size_t *accum_
 /* BLE framed-response sink: through the MTU-fragmenting pipe. */
 static size_t ble_emit(const uint8_t *buf, size_t len)
 {
-    return ble_pipe_write(buf, len, &s_pipe);
+    return proto_pipe_write(buf, len, &s_pipe);
 }
 
-void ble_proto_task(void *arg)
+void proto_task(void *arg)
 {
     cli_ctx_t *ctx = (cli_ctx_t *)arg;
     vTaskSetThreadLocalStoragePointer(NULL, PROTO_TLS_SLOT, ctx);
 
-    ble_pipe_init(&s_pipe, ctx->transport.write, ctx->transport.poll,
+    proto_pipe_init(&s_pipe, ctx->transport.write, ctx->transport.poll,
                   ctx->transport.ctx, 20);
     ctx->transport.flush = pipe_flush;
 
@@ -568,7 +671,7 @@ void ble_proto_task(void *arg)
     }
 }
 
-void ble_proto_set_mtu(uint16_t att_mtu)
+void proto_set_mtu(uint16_t att_mtu)
 {
-    ble_pipe_set_mtu(&s_pipe, att_mtu);
+    proto_pipe_set_mtu(&s_pipe, att_mtu);
 }

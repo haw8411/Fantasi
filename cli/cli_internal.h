@@ -11,7 +11,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 
-#ifdef HAS_BLE
+#ifdef HAS_PROTO
 #include "ble_transport.h"
 #include "fantasi.pb.h"
 #include <pb_encode.h>
@@ -42,15 +42,15 @@ typedef struct {
     const char *name;
     const char *help;
     local_fn    fn;
-#ifdef HAS_BLE
-    local_fn    ble_fn;   /* handler when use_ble is set; NULL falls back to fn */
+#ifdef HAS_PROTO
+    local_fn    proto_fn;   /* handler when use_ble is set; NULL falls back to fn */
 #endif
 } local_cmd_t;
 
 #define _CLI_CAT(a, b)  a##b
 #define _CLI_CAT2(a, b) _CLI_CAT(a, b)
 
-#ifdef HAS_BLE
+#ifdef HAS_PROTO
 #define LOCAL_COMMAND(nm, hp, usb_fn)                                   \
     static const local_cmd_t _CLI_CAT2(_lc_, __LINE__)                  \
         __attribute__((used, section("local_cmd"), aligned(8))) =       \
@@ -84,6 +84,10 @@ void cmd_exit(const char *arg);
 
 extern char cwd[256];                       /* device-side working directory */
 void  resolve_path(const char *arg, char *out, size_t len);
+/* Shared by cp/mv: when `dst_raw` denotes a directory (trailing '/', or a '.'/'..'
+ * final component), append basename(src_resolved) to the resolved `dst_resolved`. */
+void  dir_target(const char *src_resolved, const char *dst_raw,
+                 char *dst_resolved, size_t cap);
 
 void  load_client_settings(void);            /* (re)read device-backed client settings, e.g. the theme */
 
@@ -101,24 +105,25 @@ extern int  ser_fd;                          /* serial fd, <0 if not open */
 extern bool msc_active;                      /* MSC mount currently active */
 void  ser_send_cmd(const char *cmd);
 
-#ifdef HAS_BLE
+#ifdef HAS_PROTO
 extern bool     use_ble;                     /* talking over BLE, not USB/MSC */
 #endif
 extern bool     use_usb;                     /* talking over the USB vendor pipe */
 extern bool     g_switch_mode;               /* device is switch-mode (PM3): its SAM7S
                                               * dual-bank OUT can't take pipelined chunks,
                                               * so uploads pace one chunk at a time */
-#ifdef HAS_BLE
-extern uint32_t ble_req_id;                  /* monotonic protobuf request id */
-extern size_t   ble_rx_len;                  /* protobuf RX accumulator length */
-int   ble_send_proto(CliRequest *req);       /* drain stale rx, then send */
-int   ble_write_req(CliRequest *req);        /* send without draining (pipelined) */
-int   ble_recv_proto(CliResponse *resp);
-void  ble_send_cmd(const char *cmd);
-void  ble_drain_quiet(void);                 /* discard rx until the link is quiet */
-void  ble_cmd_rm(const char *arg);           /* in rm.c; reused as rmdir's BLE handler */
-int   ble_download(const char *devpath, FILE *out);            /* windowed download (cat.c) */
-int   ble_upload(const char *localpath, const char *devpath); /* pipelined upload (upload.c) */
+#ifdef HAS_PROTO
+extern uint32_t proto_req_id;                  /* monotonic protobuf request id */
+extern size_t   proto_rx_len;                  /* protobuf RX accumulator length */
+int   proto_send(CliRequest *req);       /* drain stale rx, then send */
+int   proto_write_req(CliRequest *req);        /* send without draining (pipelined) */
+int   proto_recv(CliResponse *resp);
+void  proto_send_cmd(const char *cmd);
+void  proto_drain_quiet(void);                 /* discard rx until the link is quiet */
+void  proto_cmd_rm(const char *arg);           /* in rm.c; reused as rmdir's BLE handler */
+int   proto_download(const char *devpath, FILE *out);            /* windowed download (cat.c) */
+int   proto_upload(const char *localpath, const char *devpath); /* pipelined upload (upload.c) */
+int   proto_copy_dev(const char *devsrc, const char *devdst);   /* device->device copy (cp.c) */
 #define CAT_WINDOW 4096                       /* windowed download chunk size */
 #endif
 

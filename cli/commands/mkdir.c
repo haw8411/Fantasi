@@ -19,22 +19,22 @@ static void cmd_mkdir(const char *arg)
         fat_sync();
 }
 
-#ifdef HAS_BLE
-static void ble_cmd_mkdir(const char *arg)
+#ifdef HAS_PROTO
+static void proto_cmd_mkdir(const char *arg)
 {
     if (!arg) { fprintf(stderr, "usage: mkdir <path>\n"); return; }
     char path[256];
     resolve_path(arg, path, sizeof(path));
     CliRequest req = CliRequest_init_zero;
-    req.id = ++ble_req_id;
+    req.id = ++proto_req_id;
     req.which_payload = CliRequest_mkdir_tag;
     strncpy(req.payload.mkdir.path, path,
             sizeof(req.payload.mkdir.path) - 1);
-    if (ble_send_proto(&req) < 0) return;
+    if (proto_send(&req) < 0) return;
     CliResponse resp;
-    if (ble_recv_proto(&resp) == 0 && resp.which_payload == CliResponse_error_tag)
+    if (proto_recv(&resp) == 0 && resp.which_payload == CliResponse_error_tag)
         fprintf(stderr, "error: %s\n", resp.payload.error.message);
 }
 #endif
 
-LOCAL_COMMAND_BLE("mkdir", "create a directory", cmd_mkdir, ble_cmd_mkdir);
+LOCAL_COMMAND_BLE("mkdir", "create a directory", cmd_mkdir, proto_cmd_mkdir);

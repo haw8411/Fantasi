@@ -17,6 +17,12 @@ void hal_init(void);
  * use this for init that needs FreeRTOS primitives (e.g. BLE stack). */
 void hal_post_init(void);
 
+/* Bring up external storage devices (e.g. a QSPI flash or SD card) and register
+ * them with the VFS as /mnt/extN, in mount order. Called once from the CLI task
+ * right after hal_post_init. Weak no-op default in hal/storage/hal_storage.c;
+ * platforms with external storage provide a strong override. */
+void hal_ext_storage_init(void);
+
 /* Non-blocking: returns number of bytes written (0..len). Safe to call
  * from a FreeRTOS task context. */
 size_t hal_serial_write(const uint8_t *buf, size_t len);

@@ -20,6 +20,7 @@
  * hal_rfid_caps() advertises HF_READ | LF_READ. */
 
 #include "at91sam7s512.h"
+#include "spi_bus.h"                /* SPI0 arbiter: FPGA config reg shares the bus with the flash */
 #include "../../hal/hal_rfid.h"
 #include "../../apps/app_rfid.h"   /* FANTASI_RFID_SNIFF_BUFSZ - shared caller/HAL scratch size */
 #include "../../core/vfs.h"
@@ -488,7 +489,7 @@ const char *hal_rfid_fpga_resource(rfid_mode_t mode)
 /* Load an arbitrary compressed bitstream (fpga_lzss.py format) from a VFS path
  * into the FPGA - exposed so a custom app / Berry script can drive its own design,
  * not just the RFID reader. Invalidates the tracked reader bitstream. */
-int hal_rfid_fpga_load(const char *path)
+static int rfid_fpga_load_u(const char *path)
 {
     if (!path) return RFID_ERR_UNSUPP;
     int rc = fpga_load(path);
@@ -497,7 +498,7 @@ int hal_rfid_fpga_load(const char *path)
     return rc == 0 ? 0 : RFID_ERR_UNSUPP;
 }
 
-int hal_rfid_set_mode(rfid_mode_t mode)
+static int rfid_set_mode_u(rfid_mode_t mode)
 {
     if (mode == s_mode) return 0;
 
@@ -550,13 +551,13 @@ int hal_rfid_set_mode(rfid_mode_t mode)
     return 0;
 }
 
-void hal_rfid_field(bool on)
+static void rfid_field_u(bool on)
 {
     if (s_mode == RFID_HF_READER) hf_energize(on);
     else                          lf_energize(on);
 }
 
-int hal_rfid_lf_field(bool on, uint32_t divisor)
+static int rfid_lf_field_u(bool on, uint32_t divisor)
 {
     (void)divisor;
     if (s_mode != RFID_LF_READER) return RFID_ERR_UNSUPP;
@@ -577,7 +578,7 @@ int hal_rfid_lf_field(bool on, uint32_t divisor)
  * point dc/amp have settled - otherwise the trackers' start-up transient fires spurious edges.
  * Not in a critical section: one LF sample every ~8 us, so the SSC FIFO + deadline tolerate
  * preemption. Returns the interval count, 0 if the envelope is flat (no field/tag), or <0. */
-int hal_rfid_lf_acquire(uint8_t *buf, int max, uint32_t opts)
+static int rfid_lf_acquire_u(uint8_t *buf, int max, uint32_t opts)
 {
     (void)opts;
     if (s_mode != RFID_LF_READER || !buf || max <= 0) return RFID_ERR_UNSUPP;
@@ -710,7 +711,7 @@ static int hf_txrx(const uint8_t *tosend, int tlen, uint8_t *rx, int rx_cap, uin
     return (int)s_demod.len * 8;
 }
 
-int hal_rfid_hf_transceive(const uint8_t *tx, int tx_bits, uint32_t flags,
+static int rfid_hf_transceive_u(const uint8_t *tx, int tx_bits, uint32_t flags,
                            uint8_t *rx, int rx_cap, uint32_t timeout_us)
 {
     (void)flags; (void)timeout_us;
@@ -727,7 +728,7 @@ int hal_rfid_hf_transceive(const uint8_t *tx, int tx_bits, uint32_t flags,
  * parity is keystream-encrypted rather than the byte's own odd parity. The higher-level cipher, auth and
  * read logic lives entirely in the hot-loaded `mfc` module - this only exposes the parity control the FPGA
  * framing already needs. Returns received data bits, or a negative RFID_ERR_*. */
-int hal_rfid_hf_transceive_par(const uint8_t *tx, int nbytes, const uint8_t *par,
+static int rfid_hf_transceive_par_u(const uint8_t *tx, int nbytes, const uint8_t *par,
                                uint8_t *rx, uint8_t *rx_par, int rx_cap, uint32_t timeout_us)
 {
     (void)timeout_us;
@@ -971,7 +972,7 @@ static int sn_compact(char *txt, int pos, int cap)
     return SNIFF_HDR + (pos - cut);
 }
 
-int hal_rfid_hf_sniff_capture(uint8_t *buf, uint32_t cap_bytes, uint32_t quiet_ms, uint32_t max_ms)
+static int rfid_hf_sniff_capture_u(uint8_t *buf, uint32_t cap_bytes, uint32_t quiet_ms, uint32_t max_ms)
 {
     if (s_mode != RFID_HF_READER || !buf) return RFID_ERR_UNSUPP;
     if (cap_bytes < FANTASI_RFID_SNIFF_BUFSZ) return RFID_ERR_UNSUPP;   /* too small to carve safely */
@@ -1213,7 +1214,7 @@ static uint32_t ssp_clk_get(void)
  * byte i (derived from s_u.parerr); returns the byte count, 0 if no command arrived within timeout_ms
  * (reader idle/gone), or <0 on error. The FPGA arms its FDT counter off this frame's end, and s_u is retained
  * so hf_emu_send can pick the 1236-vs-1172 correction bit. */
-int hal_rfid_hf_emu_recv(uint8_t *rx, uint8_t *rx_par, int cap, uint32_t timeout_ms)
+static int rfid_hf_emu_recv_u(uint8_t *rx, uint8_t *rx_par, int cap, uint32_t timeout_ms)
 {
     if (s_mode != RFID_HF_EMU || !rx || !rx_par || cap <= 0) return RFID_ERR_UNSUPP;
 
@@ -1281,7 +1282,7 @@ int hal_rfid_hf_emu_recv(uint8_t *rx, uint8_t *rx_par, int cap, uint32_t timeout
  * received frame's parity (1236 vs 1172), wait for the FPGA fdt_indicator, phase-align to the ssp_clk, then
  * stream the symbols; the FPGA holds them in its delay line and releases them exactly at the FDT. Returns 0.
  * Verbatim port of EmSendCmd14443aRaw. Must directly follow hf_emu_recv. */
-int hal_rfid_hf_emu_send(const uint8_t *tosend, int len)
+static int rfid_hf_emu_send_u(const uint8_t *tosend, int len)
 {
     if (s_mode != RFID_HF_EMU || !tosend || len <= 0) return RFID_ERR_UNSUPP;
     volatile uint8_t b;
@@ -1340,7 +1341,7 @@ int hal_rfid_hf_emu_send(const uint8_t *tosend, int len)
  * (start bit, no crypto) is fed right at the FDT, so even an 18-byte encrypted READ answers at ~a real
  * card's frame delay instead of after computing the whole ciphertext. next() must return exactly nsymbols
  * symbols (start bit + 9 per byte + stop); the correction template is prepended here as for hf_emu_send. */
-int hal_rfid_hf_emu_send_stream(uint8_t (*next)(void *ctx), void *ctx, int nsymbols)
+static int rfid_hf_emu_send_stream_u(uint8_t (*next)(void *ctx), void *ctx, int nsymbols)
 {
     if (s_mode != RFID_HF_EMU || !next || nsymbols <= 0) return RFID_ERR_UNSUPP;
     volatile uint8_t b;
@@ -1430,7 +1431,7 @@ static void lf_tx_cmd(const uint8_t *p, int nbits)
 
 /* T5577 block WRITE downlink (TX only): gap-modulate `p` then hold the field for the EEPROM commit.
  * Returns 0, or RFID_ERR_UNSUPP if not in LF mode. */
-int hal_rfid_lf_modulate(const uint8_t *p, int nbits, uint32_t opts)
+static int rfid_lf_modulate_u(const uint8_t *p, int nbits, uint32_t opts)
 {
     (void)opts;
     if (s_mode != RFID_LF_READER || !p || nbits <= 0) return RFID_ERR_UNSUPP;
@@ -1448,7 +1449,7 @@ int hal_rfid_lf_modulate(const uint8_t *p, int nbits, uint32_t opts)
  * and frames the block. For a
  * T5577 read the command is opcode 10 + lock 0 + 3-bit block address; the field stays on and the tag clocks
  * the block out continuously. Returns the run count, or <0. */
-int hal_rfid_lf_transceive(const uint8_t *cmd, int nbits, uint8_t *buf, int cap)
+static int rfid_lf_transceive_u(const uint8_t *cmd, int nbits, uint8_t *buf, int cap)
 {
     if (s_mode != RFID_LF_READER || !buf || cap <= 0) return RFID_ERR_UNSUPP;
 
@@ -1504,3 +1505,58 @@ int hal_rfid_lf_transceive(const uint8_t *cmd, int nbits, uint8_t *buf, int cap)
     lf_tx_off();
     return count;
 }
+
+/* ---- SPI0 bus arbitration: FPGA config register vs onboard flash --------------
+ * The FPGA config register shares hardware SPI0 with the onboard flash (spi_flash.c),
+ * on different FreeRTOS tasks. Each public RFID op holds the shared bus for its whole
+ * duration and, if the flash touched the bus since, re-runs fpga_spi_setup to restore
+ * the NPCS0/16-bit config. The lock must sit at the operation boundary, not around the
+ * individual config writes: those run inside taskENTER_CRITICAL (interrupts off), where
+ * taking a mutex is illegal - and the critical section itself already blocks the flash
+ * task from preempting mid-write. RFID running alone reconfigures exactly once (the
+ * owner flag stays FPGA), so its behaviour and timing are unchanged; the lock only ever
+ * blocks when a flash access on another task genuinely overlaps an RFID op. The mutex is
+ * recursive, so the (currently flat) call graph is safe even if ops later nest. */
+#define RFID_ENTER() do { spi_bus_lock(); if (spi_bus_claim(SPI_OWNER_FPGA)) fpga_spi_setup(); } while (0)
+#define RFID_LEAVE() spi_bus_unlock()
+
+int hal_rfid_fpga_load(const char *path)
+{ RFID_ENTER(); int r = rfid_fpga_load_u(path); RFID_LEAVE(); return r; }
+
+int hal_rfid_set_mode(rfid_mode_t mode)
+{ RFID_ENTER(); int r = rfid_set_mode_u(mode); RFID_LEAVE(); return r; }
+
+void hal_rfid_field(bool on)
+{ RFID_ENTER(); rfid_field_u(on); RFID_LEAVE(); }
+
+int hal_rfid_lf_field(bool on, uint32_t divisor)
+{ RFID_ENTER(); int r = rfid_lf_field_u(on, divisor); RFID_LEAVE(); return r; }
+
+int hal_rfid_lf_acquire(uint8_t *buf, int max, uint32_t opts)
+{ RFID_ENTER(); int r = rfid_lf_acquire_u(buf, max, opts); RFID_LEAVE(); return r; }
+
+int hal_rfid_hf_transceive(const uint8_t *tx, int tx_bits, uint32_t flags,
+                           uint8_t *rx, int rx_cap, uint32_t timeout_us)
+{ RFID_ENTER(); int r = rfid_hf_transceive_u(tx, tx_bits, flags, rx, rx_cap, timeout_us); RFID_LEAVE(); return r; }
+
+int hal_rfid_hf_transceive_par(const uint8_t *tx, int nbytes, const uint8_t *par,
+                               uint8_t *rx, uint8_t *rx_par, int rx_cap, uint32_t timeout_us)
+{ RFID_ENTER(); int r = rfid_hf_transceive_par_u(tx, nbytes, par, rx, rx_par, rx_cap, timeout_us); RFID_LEAVE(); return r; }
+
+int hal_rfid_hf_sniff_capture(uint8_t *buf, uint32_t cap_bytes, uint32_t quiet_ms, uint32_t max_ms)
+{ RFID_ENTER(); int r = rfid_hf_sniff_capture_u(buf, cap_bytes, quiet_ms, max_ms); RFID_LEAVE(); return r; }
+
+int hal_rfid_hf_emu_recv(uint8_t *rx, uint8_t *rx_par, int cap, uint32_t timeout_ms)
+{ RFID_ENTER(); int r = rfid_hf_emu_recv_u(rx, rx_par, cap, timeout_ms); RFID_LEAVE(); return r; }
+
+int hal_rfid_hf_emu_send(const uint8_t *tosend, int len)
+{ RFID_ENTER(); int r = rfid_hf_emu_send_u(tosend, len); RFID_LEAVE(); return r; }
+
+int hal_rfid_hf_emu_send_stream(uint8_t (*next)(void *ctx), void *ctx, int nsymbols)
+{ RFID_ENTER(); int r = rfid_hf_emu_send_stream_u(next, ctx, nsymbols); RFID_LEAVE(); return r; }
+
+int hal_rfid_lf_modulate(const uint8_t *p, int nbits, uint32_t opts)
+{ RFID_ENTER(); int r = rfid_lf_modulate_u(p, nbits, opts); RFID_LEAVE(); return r; }
+
+int hal_rfid_lf_transceive(const uint8_t *cmd, int nbits, uint8_t *buf, int cap)
+{ RFID_ENTER(); int r = rfid_lf_transceive_u(cmd, nbits, buf, cap); RFID_LEAVE(); return r; }

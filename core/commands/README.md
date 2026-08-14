@@ -8,7 +8,7 @@ emits a descriptor into the `cli_cmd` linker section. The dispatcher
 just dropping in a file and rebuilding.
 
 These commands run on the device and are reachable over **both** transports (USB
-serial and BLE) - `core/ble_proto.c` dispatches through the same `cli_lookup`.
+serial and BLE) - `core/proto.c` dispatches through the same `cli_lookup`.
 
 ## Add a command
 

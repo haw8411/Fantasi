@@ -20,4 +20,4 @@ static void cmd_rmdir(const char *arg)
 }
 
 /* Over BLE, directory removal goes through the same file_delete path as rm. */
-LOCAL_COMMAND_BLE("rmdir", "remove empty directory", cmd_rmdir, ble_cmd_rm);
+LOCAL_COMMAND_BLE("rmdir", "remove empty directory", cmd_rmdir, proto_cmd_rm);

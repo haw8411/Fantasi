@@ -435,14 +435,14 @@ static volatile uint16_t s_dle_tx  = 27;
 
 static void update_notify_size(void)
 {
-    extern void ble_proto_set_mtu(uint16_t);
+    extern void proto_set_mtu(uint16_t);
     uint16_t eff = s_att_mtu;                 /* pipe payload = eff - 3 */
     uint16_t dle_eq = (s_dle_tx > 4) ? (uint16_t)(s_dle_tx - 4) : 23;
     if (dle_eq < eff) eff = dle_eq;
     /* This unit's WS rejects notifications above ~200 B (0x60) regardless of
      * MTU/DLE; cap the payload at 180 so the link is reliable. */
     if (eff > 183) eff = 183;
-    ble_proto_set_mtu(eff);
+    proto_set_mtu(eff);
 }
 
 static void parse_adv_report(const uint8_t *data, uint8_t len)

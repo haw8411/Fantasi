@@ -1,12 +1,12 @@
-#ifndef FANTASI_BLE_PROTO_H
-#define FANTASI_BLE_PROTO_H
+#ifndef FANTASI_PROTO_H
+#define FANTASI_PROTO_H
 
 #include <stdint.h>
 #include <stddef.h>
 #include "cli.h"
 
-void ble_proto_task(void *arg);
-void ble_proto_set_mtu(uint16_t att_mtu);
+void proto_task(void *arg);
+void proto_set_mtu(uint16_t att_mtu);
 
 /* ---- Transport-agnostic protobuf engine ----
  * The frame-parse + dispatch + handlers are shared by every protobuf transport

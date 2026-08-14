@@ -36,4 +36,7 @@ PB_BIND(FileDeleteRequest, FileDeleteRequest, AUTO)
 PB_BIND(MkdirRequest, MkdirRequest, AUTO)
 
 
+PB_BIND(FileRenameRequest, FileRenameRequest, AUTO)
+
+
 

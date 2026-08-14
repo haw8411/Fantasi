@@ -9,6 +9,10 @@ void hal_storage_unmount(void);
 int  hal_storage_mount(void);
 bool hal_storage_mounted(void);
 
+/* Erase the internal LittleFS: unmount, format, remount (recreating /apps).
+ * Destructive - drops every file. Returns 0 on success. */
+int  hal_storage_format(void);
+
 /* Read an entire file into buf. Returns bytes read, or -1 on error. */
 int  hal_storage_read_file(const char *path, void *buf, uint32_t max_len);
 

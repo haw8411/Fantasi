@@ -12,10 +12,13 @@ LDLIBS  := -lreadline
 # picks up new command files automatically.
 SRCS    := main.c theme.c $(wildcard commands/*.c)
 
-# BLE transport (requires libsystemd)
+# Protobuf command path + BLE transport (requires libsystemd). HAS_PROTO enables
+# the shared protobuf CLI/file path used by BOTH the BLE and WebUSB transports;
+# the nanopb + generated proto machinery it needs is compiled here. (The WebUSB
+# block below reuses it, so the USB path is wired only when both libs are present.)
 HAS_SYSTEMD := $(shell pkg-config --exists libsystemd 2>/dev/null && echo 1)
 ifeq ($(HAS_SYSTEMD),1)
-CFLAGS += -DHAS_BLE \
+CFLAGS += -DHAS_PROTO \
           -I$(ROOT)/third_party/nanopb \
           -I$(ROOT)/proto
 SRCS   += ble_transport.c \
@@ -27,7 +30,7 @@ LDLIBS += -lsystemd
 endif
 
 # USB vendor (WebUSB) transport via libusb. The protobuf machinery it shares is
-# compiled under HAS_BLE, so the USB path is wired only when both are present
+# compiled under HAS_PROTO, so the USB path is wired only when both are present
 # (this host has both).
 HAS_USB := $(shell pkg-config --exists libusb-1.0 2>/dev/null && echo 1)
 ifeq ($(HAS_USB),1)

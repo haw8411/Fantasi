@@ -1,10 +1,10 @@
 /* USB vendor-interface (WebUSB) protobuf transport. Carries the same protobuf
  * request/response protocol as BLE - the whole CLI plus file ops - over a
  * dedicated bulk pipe, so structured/bulk data never pollutes the text CLI.
- * Drives the shared engine in ble_proto.c (fantasi_proto_rx). */
+ * Drives the shared engine in proto.c (fantasi_proto_rx). */
 #include "usb_proto.h"
 #include "cli.h"
-#include "ble_proto.h"   /* fantasi_proto_rx / fantasi_proto_init */
+#include "proto.h"   /* fantasi_proto_rx / fantasi_proto_init */
 
 #include "tusb.h"
 

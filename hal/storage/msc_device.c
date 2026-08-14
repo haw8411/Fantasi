@@ -26,35 +26,55 @@ void tud_msc_inquiry_cb(uint8_t lun, uint8_t vendor_id[8],
 
 bool tud_msc_test_unit_ready_cb(uint8_t lun)
 {
-    (void)lun;
+    /* Signal a media change (SCSI UNIT ATTENTION, "medium may have changed") when
+     * the filesystem was mutated by a non-MSC path since the host last polled. The
+     * host clears the attention by re-reading, dropping its stale cached view - so a
+     * file written over proto/BLE becomes visible to a host that has the drive
+     * mounted, without any unmount/remount. Reported once per change, then ready. */
+    if (fatrd_media_changed()) {
+        tud_msc_set_sense(lun, SCSI_SENSE_UNIT_ATTENTION, 0x28, 0x00);
+        return false;
+    }
     return true;                              /* synthetic FAT is always ready */
 }
 
 void tud_msc_capacity_cb(uint8_t lun, uint32_t *block_count, uint16_t *block_size)
 {
     (void)lun;
-    *block_count = FATRD_SECTOR_COUNT;
+    *block_count = fatrd_sector_count();
     *block_size  = FATRD_SECTOR_SIZE;
 }
 
 int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
                           void *buffer, uint32_t bufsize)
 {
-    (void)lun;
-    return fatrd_read(lba, offset, buffer, bufsize) < 0 ? -1 : (int32_t)bufsize;
+    if (fatrd_read(lba, offset, buffer, bufsize) < 0) {
+        tud_msc_set_sense(lun, SCSI_SENSE_MEDIUM_ERROR, 0x11, 0x00);   /* UNRECOVERED READ ERROR */
+        return -1;
+    }
+    return (int32_t)bufsize;
 }
 
 int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
                            uint8_t *buffer, uint32_t bufsize)
 {
-    (void)lun;
-    return fatrd_write(lba, offset, buffer, bufsize) < 0 ? -1 : (int32_t)bufsize;
+    /* A failed capture (low heap or full volume) must report a definitive SCSI error,
+     * else the host retries the same block indefinitely. MEDIUM ERROR / WRITE ERROR makes
+     * it abort the copy cleanly ("I/O error" / disk full). */
+    if (fatrd_write(lba, offset, buffer, bufsize) < 0) {
+        tud_msc_set_sense(lun, SCSI_SENSE_MEDIUM_ERROR, 0x0C, 0x00);   /* WRITE ERROR */
+        return -1;
+    }
+    return (int32_t)bufsize;
 }
 
 int32_t tud_msc_scsi_cb(uint8_t lun, uint8_t const scsi_cmd[16],
                         void *buffer, uint16_t bufsize)
 {
     (void)buffer; (void)bufsize;
+    /* SYNCHRONIZE CACHE (10/16): the host sends this on flush/unmount. Use it to
+     * commit any complete host-over-MSC file writes durably to LittleFS, then ack. */
+    if (scsi_cmd[0] == 0x35 || scsi_cmd[0] == 0x91) { fatrd_sync(); return 0; }
     tud_msc_set_sense(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x20, 0x00);
     return -1;
 }

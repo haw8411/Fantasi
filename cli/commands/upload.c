@@ -47,10 +47,10 @@ static void cmd_upload(const char *args)
     printf("%s -> %s (%zu bytes)\n", local, rpath, total);
 }
 
-#ifdef HAS_BLE
+#ifdef HAS_PROTO
 /* Pipelined upload of `local_path` to device `remote_path` (already resolved). Returns 0, or -1 on error.
  * Shared by `upload` and `edit`'s WebUSB write-back of an edited temp file. */
-int ble_upload(const char *local_path, const char *remote_path)
+int proto_upload(const char *local_path, const char *remote_path)
 {
     FILE *f = fopen(local_path, "rb");
     if (!f) { perror(local_path); return -1; }
@@ -93,7 +93,7 @@ int ble_upload(const char *local_path, const char *remote_path)
      * again or it would eat the acks it depends on. */
     ble_transport_process();
     { char d[256]; while (ble_transport_read(d, sizeof(d)) > 0) {} }
-    ble_rx_len = 0;
+    proto_rx_len = 0;
 
     while (acked < total && !error) {
         while (sent < total && inf_count < window) {
@@ -101,7 +101,7 @@ int ble_upload(const char *local_path, const char *remote_path)
             if (n == 0) { total = sent; break; }   /* short read / EOF */
 
             CliRequest req = CliRequest_init_zero;
-            req.id = ++ble_req_id;
+            req.id = ++proto_req_id;
             req.which_payload = CliRequest_file_write_tag;
             strncpy(req.payload.file_write.path, remote_path,
                     sizeof(req.payload.file_write.path) - 1);
@@ -114,7 +114,7 @@ int ble_upload(const char *local_path, const char *remote_path)
             req.payload.file_write.has_total = true;
             req.payload.file_write.total = (uint32_t)fsize;
 
-            if (ble_write_req(&req) < 0) {
+            if (proto_write_req(&req) < 0) {
                 fprintf(stderr, "send failed\n");
                 error = true;
                 break;
@@ -128,7 +128,7 @@ int ble_upload(const char *local_path, const char *remote_path)
 
         CliResponse resp;
         bool rewind = false;
-        if (ble_recv_proto(&resp) < 0) {
+        if (proto_recv(&resp) < 0) {
             rewind = true;                         /* no ack within timeout */
         } else if (resp.which_payload == CliResponse_error_tag) {
             fprintf(stderr, "error: %s\n", resp.payload.error.message);
@@ -161,7 +161,7 @@ int ble_upload(const char *local_path, const char *remote_path)
             inf_head = inf_count = 0;
             ble_transport_process();           /* discard any stale partial data */
             { char d[256]; while (ble_transport_read(d, sizeof(d)) > 0) {} }
-            ble_rx_len = 0;
+            proto_rx_len = 0;
         }
     }
     fclose(f);
@@ -169,7 +169,7 @@ int ble_upload(const char *local_path, const char *remote_path)
     return error ? -1 : 0;
 }
 
-static void ble_cmd_upload(const char *args)
+static void proto_cmd_upload(const char *args)
 {
     if (!args) { fprintf(stderr, "usage: upload <local> [remote]\n"); return; }
     char local_path[128], remote_arg[64] = "";
@@ -184,8 +184,8 @@ static void ble_cmd_upload(const char *args)
         snprintf(remote_path, sizeof(remote_path), "%s%s%s",
                  cwd, (cwd[strlen(cwd)-1] == '/') ? "" : "/", base);
     }
-    ble_upload(local_path, remote_path);
+    proto_upload(local_path, remote_path);
 }
 #endif
 
-LOCAL_COMMAND_BLE("upload", "copy host file to device", cmd_upload, ble_cmd_upload);
+LOCAL_COMMAND_BLE("upload", "copy host file to device", cmd_upload, proto_cmd_upload);

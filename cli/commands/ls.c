@@ -32,22 +32,22 @@ static void cmd_ls(const char *arg)
     closedir(d);
 }
 
-#ifdef HAS_BLE
-static void ble_cmd_ls(const char *arg)
+#ifdef HAS_PROTO
+static void proto_cmd_ls(const char *arg)
 {
     char path[256];
     resolve_path(arg, path, sizeof(path));
 
     CliRequest req = CliRequest_init_zero;
-    req.id = ++ble_req_id;
+    req.id = ++proto_req_id;
     req.which_payload = CliRequest_dir_list_tag;
     strncpy(req.payload.dir_list.path, path,
             sizeof(req.payload.dir_list.path) - 1);
-    if (ble_send_proto(&req) < 0) { fprintf(stderr, "send failed\n"); return; }
+    if (proto_send(&req) < 0) { fprintf(stderr, "send failed\n"); return; }
 
     CliResponse resp;
     do {
-        if (ble_recv_proto(&resp) < 0) break;
+        if (proto_recv(&resp) < 0) break;
         if (resp.which_payload == CliResponse_dir_entry_tag) {
             DirEntry *e = &resp.payload.dir_entry;
             if (e->is_dir)
@@ -63,4 +63,4 @@ static void ble_cmd_ls(const char *arg)
 }
 #endif
 
-LOCAL_COMMAND_BLE("ls", "list files", cmd_ls, ble_cmd_ls);
+LOCAL_COMMAND_BLE("ls", "list files", cmd_ls, proto_cmd_ls);

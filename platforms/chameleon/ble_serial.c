@@ -584,8 +584,8 @@ static void handle_event(const uint8_t *evt_buf, uint16_t evt_len)
         uint16_t our_mtu = 247;
         svc_gatts_exchange_mtu_reply(ch, our_mtu);
         att_mtu = (client_mtu < our_mtu) ? client_mtu : our_mtu;
-        extern void ble_proto_set_mtu(uint16_t);
-        ble_proto_set_mtu(att_mtu);
+        extern void proto_set_mtu(uint16_t);
+        proto_set_mtu(att_mtu);
         break;
     }
 

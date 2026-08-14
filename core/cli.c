@@ -219,6 +219,7 @@ void cli_task(void *arg)
     usb_ctx.transport.ctx       = NULL;
 
     hal_post_init();
+    hal_ext_storage_init();      /* bring up /mnt/extN external storage, if any */
 
     cli_task_with_transport(&usb_ctx);
 }

@@ -83,6 +83,9 @@ SRCS_C := \
     $(ROOT)/platforms/proxmark3/hal.c \
     $(ROOT)/platforms/proxmark3/flash_storage.c \
     $(ROOT)/platforms/proxmark3/rfid.c \
+    $(ROOT)/platforms/proxmark3/spi_bus.c \
+    $(ROOT)/platforms/proxmark3/spi_flash.c \
+    $(ROOT)/platforms/proxmark3/ext_storage.c \
     $(ROOT)/core/lzss.c \
     $(ROOT)/core/rfid/rfid_crc.c \
     $(ROOT)/core/rfid/rfid_iso14443a.c \
@@ -94,8 +97,8 @@ SRCS_C := \
     $(ROOT)/core/app_run.c \
     $(ROOT)/core/berry_host.c \
     $(ROOT)/core/usb_proto.c \
-    $(ROOT)/core/ble_proto.c \
-    $(ROOT)/core/ble_pipe.c \
+    $(ROOT)/core/proto.c \
+    $(ROOT)/core/proto_pipe.c \
     $(ROOT)/third_party/nanopb/pb_encode.c \
     $(ROOT)/third_party/nanopb/pb_decode.c \
     $(ROOT)/third_party/nanopb/pb_common.c \

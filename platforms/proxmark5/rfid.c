@@ -223,6 +223,18 @@ static void antenna_lf_on(void)
     i2c_write_reg(ANT_ADDR7, ANT_REG_MAP, ANT_MAP_125K);   /* select 125 kHz tap */
 }
 
+/* The composite antenna board carries two extra LEDs - HF and LF - driven by the same
+ * antenna controller (0x51), as bits in its map register: bit2 = HFLED, bit1 = LFLED
+ * (active-high). Writing just the LED bits leaves the LF resonant tap unselected, which
+ * is fine at rest; antenna_lf_on() reasserts the tap (and both LEDs, via 0x87) when LF
+ * operation starts. Returns the I2C ack. */
+bool pm5_ant_led(bool hf, bool lf)
+{
+    i2c_setup();
+    return i2c_write_reg(ANT_ADDR7, ANT_REG_MAP,
+                         (uint8_t)((hf ? 0x04u : 0u) | (lf ? 0x02u : 0u)));
+}
+
 static rfid_mode_t s_mode = RFID_OFF;
 static bool s_setup_done;
 

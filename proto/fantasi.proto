@@ -17,6 +17,7 @@ message CliRequest {
     string app_launch = 8 [(nanopb).max_size = 64];
     bytes app_input = 9 [(nanopb).max_size = 64];
     bool app_stop = 10;
+    FileRenameRequest file_rename = 11;
   }
 }
 
@@ -74,4 +75,9 @@ message FileDeleteRequest {
 
 message MkdirRequest {
   required string path = 1 [(nanopb).max_size = 64];
+}
+
+message FileRenameRequest {
+  required string src = 1 [(nanopb).max_size = 64];
+  required string dst = 2 [(nanopb).max_size = 64];
 }

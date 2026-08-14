@@ -25,12 +25,12 @@ static void cmd_help(void)
     char all_output[2048];
     int all_len = 0;
 
-#ifdef HAS_BLE
+#ifdef HAS_PROTO
     if (use_ble || use_usb) {
-        ble_send_cmd("help");
+        proto_send_cmd("help");
         CliResponse resp;
         do {
-            if (ble_recv_proto(&resp) < 0) break;
+            if (proto_recv(&resp) < 0) break;
             if (resp.which_payload == CliResponse_output_tag) {
                 int slen = strlen(resp.payload.output);
                 if (all_len + slen < (int)sizeof(all_output))

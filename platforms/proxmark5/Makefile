@@ -68,9 +68,9 @@ SRCS := \
     $(ROOT)/core/main.c \
     $(ROOT)/core/cli.c \
     $(wildcard $(ROOT)/core/commands/*.c) \
-    $(ROOT)/core/ble_proto.c \
+    $(ROOT)/core/proto.c \
     $(ROOT)/core/usb_proto.c \
-    $(ROOT)/core/ble_pipe.c \
+    $(ROOT)/core/proto_pipe.c \
     $(ROOT)/core/ramfs.c \
     $(ROOT)/core/vfs.c \
     $(ROOT)/core/elf_loader.c \
@@ -84,6 +84,8 @@ SRCS := \
     $(ROOT)/platforms/proxmark5/hal.c \
     $(ROOT)/platforms/proxmark5/flash_storage.c \
     $(ROOT)/platforms/proxmark5/rfid.c \
+    $(ROOT)/platforms/proxmark5/qspi_flash.c \
+    $(ROOT)/platforms/proxmark5/ext_storage.c \
     $(ROOT)/core/rfid/rfid_crc.c \
     $(ROOT)/core/rfid/rfid_iso14443a.c \
     $(ROOT)/core/rfid/rfid_em4100.c \

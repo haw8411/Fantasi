@@ -70,6 +70,11 @@ typedef struct _MkdirRequest {
     char path[64];
 } MkdirRequest;
 
+typedef struct _FileRenameRequest {
+    char src[64];
+    char dst[64];
+} FileRenameRequest;
+
 typedef PB_BYTES_ARRAY_T(64) CliRequest_app_input_t;
 typedef struct _CliRequest {
     uint32_t id;
@@ -88,6 +93,7 @@ typedef struct _CliRequest {
         char app_launch[64];
         CliRequest_app_input_t app_input;
         bool app_stop;
+        FileRenameRequest file_rename;
     } payload;
 } CliRequest;
 
@@ -107,6 +113,7 @@ extern "C" {
 #define DirEntry_init_default                    {"", 0, 0}
 #define FileDeleteRequest_init_default           {""}
 #define MkdirRequest_init_default                {""}
+#define FileRenameRequest_init_default           {"", ""}
 #define CliRequest_init_zero                     {0, 0, {""}}
 #define CliResponse_init_zero                    {0, 0, 0, {""}}
 #define FileWriteChunk_init_zero                 {"", 0, {0, {0}}, 0, false, 0}
@@ -117,6 +124,7 @@ extern "C" {
 #define DirEntry_init_zero                       {"", 0, 0}
 #define FileDeleteRequest_init_zero              {""}
 #define MkdirRequest_init_zero                   {""}
+#define FileRenameRequest_init_zero              {"", ""}
 
 /* Field tags (for use in manual encoding/decoding) */
 #define FileWriteChunk_path_tag                  1
@@ -144,6 +152,8 @@ extern "C" {
 #define CliResponse_module_request_tag           7
 #define FileDeleteRequest_path_tag               1
 #define MkdirRequest_path_tag                    1
+#define FileRenameRequest_src_tag                1
+#define FileRenameRequest_dst_tag                2
 #define CliRequest_id_tag                        1
 #define CliRequest_command_tag                   2
 #define CliRequest_file_write_tag                3
@@ -154,6 +164,7 @@ extern "C" {
 #define CliRequest_app_launch_tag                8
 #define CliRequest_app_input_tag                 9
 #define CliRequest_app_stop_tag                  10
+#define CliRequest_file_rename_tag               11
 
 /* Struct field encoding specification for nanopb */
 #define CliRequest_FIELDLIST(X, a) \
@@ -166,7 +177,8 @@ X(a, STATIC,   ONEOF,    MESSAGE,  (payload,file_delete,payload.file_delete),   
 X(a, STATIC,   ONEOF,    MESSAGE,  (payload,mkdir,payload.mkdir),   7) \
 X(a, STATIC,   ONEOF,    STRING,   (payload,app_launch,payload.app_launch),   8) \
 X(a, STATIC,   ONEOF,    BYTES,    (payload,app_input,payload.app_input),   9) \
-X(a, STATIC,   ONEOF,    BOOL,     (payload,app_stop,payload.app_stop),  10)
+X(a, STATIC,   ONEOF,    BOOL,     (payload,app_stop,payload.app_stop),  10) \
+X(a, STATIC,   ONEOF,    MESSAGE,  (payload,file_rename,payload.file_rename),  11)
 #define CliRequest_CALLBACK NULL
 #define CliRequest_DEFAULT NULL
 #define CliRequest_payload_file_write_MSGTYPE FileWriteChunk
@@ -174,6 +186,7 @@ X(a, STATIC,   ONEOF,    BOOL,     (payload,app_stop,payload.app_stop),  10)
 #define CliRequest_payload_dir_list_MSGTYPE DirListRequest
 #define CliRequest_payload_file_delete_MSGTYPE FileDeleteRequest
 #define CliRequest_payload_mkdir_MSGTYPE MkdirRequest
+#define CliRequest_payload_file_rename_MSGTYPE FileRenameRequest
 
 #define CliResponse_FIELDLIST(X, a) \
 X(a, STATIC,   REQUIRED, UINT32,   id,                1) \
@@ -239,6 +252,12 @@ X(a, STATIC,   REQUIRED, STRING,   path,              1)
 #define MkdirRequest_CALLBACK NULL
 #define MkdirRequest_DEFAULT NULL
 
+#define FileRenameRequest_FIELDLIST(X, a) \
+X(a, STATIC,   REQUIRED, STRING,   src,               1) \
+X(a, STATIC,   REQUIRED, STRING,   dst,               2)
+#define FileRenameRequest_CALLBACK NULL
+#define FileRenameRequest_DEFAULT NULL
+
 extern const pb_msgdesc_t CliRequest_msg;
 extern const pb_msgdesc_t CliResponse_msg;
 extern const pb_msgdesc_t FileWriteChunk_msg;
@@ -249,6 +268,7 @@ extern const pb_msgdesc_t DirListRequest_msg;
 extern const pb_msgdesc_t DirEntry_msg;
 extern const pb_msgdesc_t FileDeleteRequest_msg;
 extern const pb_msgdesc_t MkdirRequest_msg;
+extern const pb_msgdesc_t FileRenameRequest_msg;
 
 /* Defines for backwards compatibility with code written before nanopb-0.4.0 */
 #define CliRequest_fields &CliRequest_msg
@@ -261,6 +281,7 @@ extern const pb_msgdesc_t MkdirRequest_msg;
 #define DirEntry_fields &DirEntry_msg
 #define FileDeleteRequest_fields &FileDeleteRequest_msg
 #define MkdirRequest_fields &MkdirRequest_msg
+#define FileRenameRequest_fields &FileRenameRequest_msg
 
 /* Maximum encoded size of messages (where known) */
 #define CliRequest_size                          603
@@ -272,6 +293,7 @@ extern const pb_msgdesc_t MkdirRequest_msg;
 #define FileDeleteRequest_size                   65
 #define FileReadChunk_size                       523
 #define FileReadRequest_size                     77
+#define FileRenameRequest_size                   130
 #define FileWriteChunk_size                      594
 #define MkdirRequest_size                        65
 

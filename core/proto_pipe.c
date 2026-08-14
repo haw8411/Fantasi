@@ -1,10 +1,10 @@
-#include "ble_pipe.h"
+#include "proto_pipe.h"
 #include "FreeRTOS.h"
 #include "task.h"
 #include <string.h>
 
-void ble_pipe_init(ble_pipe_t *p, ble_pipe_write_fn wfn,
-                   ble_pipe_poll_fn pfn, void *ctx, uint16_t mtu_payload)
+void proto_pipe_init(proto_pipe_t *p, proto_pipe_write_fn wfn,
+                   proto_pipe_poll_fn pfn, void *ctx, uint16_t mtu_payload)
 {
     memset(p, 0, sizeof(*p));
     p->write_fn    = wfn;
@@ -13,7 +13,7 @@ void ble_pipe_init(ble_pipe_t *p, ble_pipe_write_fn wfn,
     p->mtu_payload = mtu_payload ? mtu_payload : 20;
 }
 
-void ble_pipe_set_mtu(ble_pipe_t *p, uint16_t att_mtu)
+void proto_pipe_set_mtu(proto_pipe_t *p, uint16_t att_mtu)
 {
     uint16_t pl = att_mtu - 3;
     if (pl < 20) pl = 20;
@@ -21,7 +21,7 @@ void ble_pipe_set_mtu(ble_pipe_t *p, uint16_t att_mtu)
     p->mtu_payload = pl;
 }
 
-static void drain_one(ble_pipe_t *p, const uint8_t *data, uint16_t len)
+static void drain_one(proto_pipe_t *p, const uint8_t *data, uint16_t len)
 {
     for (int retries = 0; retries < 200; retries++) {
         size_t w = p->write_fn(data, len, p->write_ctx);
@@ -31,7 +31,7 @@ static void drain_one(ble_pipe_t *p, const uint8_t *data, uint16_t len)
     }
 }
 
-static void drain_full(ble_pipe_t *p)
+static void drain_full(proto_pipe_t *p)
 {
     while (p->len >= p->mtu_payload) {
         drain_one(p, p->buf, p->mtu_payload);
@@ -41,14 +41,14 @@ static void drain_full(ble_pipe_t *p)
     }
 }
 
-size_t ble_pipe_write(const uint8_t *buf, size_t len, void *pipe_ptr)
+size_t proto_pipe_write(const uint8_t *buf, size_t len, void *pipe_ptr)
 {
-    ble_pipe_t *p = (ble_pipe_t *)pipe_ptr;
+    proto_pipe_t *p = (proto_pipe_t *)pipe_ptr;
     const uint8_t *src = buf;
     size_t remaining = len;
 
     while (remaining > 0) {
-        uint16_t space = BLE_PIPE_BUF_SIZE - p->len;
+        uint16_t space = PROTO_PIPE_BUF_SIZE - p->len;
         uint16_t copy = (remaining > space) ? space : (uint16_t)remaining;
         memcpy(&p->buf[p->len], src, copy);
         p->len += copy;
@@ -59,7 +59,7 @@ size_t ble_pipe_write(const uint8_t *buf, size_t len, void *pipe_ptr)
     return len;
 }
 
-void ble_pipe_flush(ble_pipe_t *p)
+void proto_pipe_flush(proto_pipe_t *p)
 {
     if (p->len == 0) return;
     if (p->len < p->mtu_payload) {

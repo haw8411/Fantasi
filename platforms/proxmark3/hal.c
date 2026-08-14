@@ -20,6 +20,9 @@
 #include "../../hal/hal.h"
 #include "../../hal/hal_name.h"
 #include "hal_storage.h"
+#include "flash_storage.h"
+#include "spi_bus.h"
+#include "spi_flash.h"
 
 #include "FreeRTOS.h"
 #include "task.h"
@@ -117,6 +120,7 @@ void hal_init(void)
     AT91C_BASE_PIOA->PIO_SODR = AT91C_PIO_PA8;
 
     hal_storage_init();
+    spi_bus_init();        /* SPI0 arbiter (FPGA config reg vs onboard flash) - before any task runs */
 
 #ifdef FANTASI_ENABLE_APPS
     pm3_launcher_init();   /* button/LED shortcut launcher (owns LED_A/B/C) */
@@ -379,64 +383,21 @@ void hal_post_init(void) {}
 
 const char *hal_device_id(void) { return "PM3"; }
 
-static uint16_t spi_xfer(uint32_t data)
-{
-    AT91C_BASE_SPI->SPI_TDR = data;
-    while (!(AT91C_BASE_SPI->SPI_SR & AT91C_SPI_RDRF)) {}
-    return AT91C_BASE_SPI->SPI_RDR & 0xFFFF;
-}
-
 const char *hal_device_name(void)
 {
     static char name[16];
     if (name[0]) return name;
 
-    /* Read the external SPI flash's 64-bit unique ID (cmd 0x4B).
-     * SPI flash is on NPCS2 (PA10). */
-    AT91C_BASE_PMC->PMC_PCER = (1u << AT91C_ID_SPI);
-    AT91C_BASE_PIOA->PIO_PDR = (1u<<10)|(1u<<11)|(1u<<12)|(1u<<13)|(1u<<14);
-    AT91C_BASE_PIOA->PIO_ASR = (1u<<11)|(1u<<12)|(1u<<13)|(1u<<14);
-    AT91C_BASE_PIOA->PIO_BSR = (1u<<10);
-
-    AT91C_BASE_SPI->SPI_CR = AT91C_SPI_SWRST;
-    AT91C_BASE_SPI->SPI_CR = AT91C_SPI_SWRST;
-    AT91C_BASE_SPI->SPI_CR = AT91C_SPI_SPIEN;
-
-    /* NPCS2 selected, master, fixed peripheral, mode-fault disabled */
-    AT91C_BASE_SPI->SPI_MR = ((~(1u << 2) & 0xF) << 16) |
-                              (1u << 4) | AT91C_SPI_PS_FIXED | AT91C_SPI_MSTR;
-
-    /* CSR2: ~24 MHz (MCK/2), CPOL=0, NCPHA=1, CSAAT=1, 8-bit */
-    AT91C_BASE_SPI->SPI_CSR[2] = (2u << 8) |
-                                  AT91C_SPI_BITS_8 |
-                                  (1u << 1) |  /* NCPHA */
-                                  (1u << 3);   /* CSAAT */
-
-    /* Command 0x4B: Read Unique ID - 1 cmd byte + 4 dummy + 8 data */
-    spi_xfer(0x4B);
-    spi_xfer(0xFF);
-    spi_xfer(0xFF);
-    spi_xfer(0xFF);
-    spi_xfer(0xFF);
+    /* Derive the name from the flash's 64-bit unique id. Routed through the bus-locked
+     * driver so this (run on the USB task for the serial-number descriptor) can't race
+     * the ext-storage mount or RFID on the shared SPI0 bus. Preserve the original byte
+     * order (first id byte -> high byte of the name seed) so a device keeps its name. */
+    uint8_t id[8];
+    spi_flash_unique_id(id);
 
     uint32_t u[2];
     uint8_t *b = (uint8_t *)u;
-    b[7] = (uint8_t)spi_xfer(0xFF);
-    b[6] = (uint8_t)spi_xfer(0xFF);
-    b[5] = (uint8_t)spi_xfer(0xFF);
-    b[4] = (uint8_t)spi_xfer(0xFF);
-    b[3] = (uint8_t)spi_xfer(0xFF);
-    b[2] = (uint8_t)spi_xfer(0xFF);
-    b[1] = (uint8_t)spi_xfer(0xFF);
-    b[0] = (uint8_t)spi_xfer(0xFF | AT91C_SPI_LASTXFER);
-
-    /* Disable SPI */
-    AT91C_BASE_SPI->SPI_CSR[0] = 0;
-    AT91C_BASE_SPI->SPI_CSR[1] = 0;
-    AT91C_BASE_SPI->SPI_CSR[2] = 0;
-    AT91C_BASE_SPI->SPI_CSR[3] = 0;
-    AT91C_BASE_SPI->SPI_MR = 0;
-    AT91C_BASE_SPI->SPI_CR = AT91C_SPI_SPIDIS;
+    for (int i = 0; i < 8; i++) b[7 - i] = id[i];
 
     hal_name_generate(u, 2, name, sizeof(name));
     return name;
@@ -474,21 +435,13 @@ extern uint8_t _eflash;
 
 int32_t hal_flash_free_bytes(void)
 {
-    uint32_t cidr = *AT91C_DBGU_CIDR;
-    uint32_t nvpsiz = (cidr >> 8) & 0xFU;
-    uint32_t total;
-    switch (nvpsiz) {
-        case  3: total =  32U * 1024; break;
-        case  5: total =  64U * 1024; break;
-        case  7: total = 128U * 1024; break;
-        case  9: total = 256U * 1024; break;
-        case 10: total = 512U * 1024; break;
-        default: return -1;
-    }
-    uint32_t flash_end = 0x00100000U + total;
-    uint32_t used_end  = (uint32_t)&_eflash;
-    if (flash_end <= used_end) return 0;
-    return (int32_t)(flash_end - used_end);
+    /* Free space in the program-flash (osimage) region only: 0x102000..STORAGE_BASE.
+     * The 128 KB above STORAGE_BASE is the internal LittleFS (the "/" mount, reported
+     * separately in df), so it must not be counted here. Free = the slack between the end
+     * of the loaded image (_eflash) and the storage region's base. */
+    uint32_t used_end = (uint32_t)&_eflash;
+    if (STORAGE_BASE <= used_end) return 0;
+    return (int32_t)(STORAGE_BASE - used_end);
 }
 
 int hal_battery_percent(void) { return -1; }

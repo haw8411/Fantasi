@@ -41,8 +41,9 @@ DEFS := -DSTM32WB55xx \
         -DFANTASI_DEVICE_ID=\"$(DEVICE_ID)\" \
         -DFANTASI_GIT_HASH=\"$(GIT_HASH)\" \
         -DWEBUSB_PROTO_STACK=1024 \
-        -DBLE_PROTO_STACK=1024 \
+        -DPROTO_STACK=1024 \
         -DUSB_TASK_STACK=2048 \
+        -DCFG_TUD_MSC_EP_BUFSIZE=8192 \
         $(EXTRA_DEFS)
 # USB_TASK_STACK bumped 1024->2048 words (4KB->8KB): the MSC host-write path (tud_task -> fatrd_write ->
 # build_model's littlefs traversal + write_dir + picolibc vsnprintf) overflows the 4KB "usb" task. Flipper has ample RAM.
@@ -60,6 +61,7 @@ INCLUDES := \
     -I$(ROOT)/third_party/FreeRTOS-Kernel/portable/GCC/ARM_CM4F \
     -I$(ROOT)/third_party/tinyusb/src \
     -I$(ROOT)/third_party/littlefs \
+    -I$(ROOT)/third_party/fatfs \
     -I$(ROOT)/third_party/nanopb \
     -I$(ROOT)/proto \
     -I$(ROOT)/third_party/berry \
@@ -83,9 +85,9 @@ SRCS := \
     $(ROOT)/core/main.c \
     $(ROOT)/core/cli.c \
     $(wildcard $(ROOT)/core/commands/*.c) \
-    $(ROOT)/core/ble_proto.c \
+    $(ROOT)/core/proto.c \
     $(ROOT)/core/usb_proto.c \
-    $(ROOT)/core/ble_pipe.c \
+    $(ROOT)/core/proto_pipe.c \
     $(ROOT)/core/ramfs.c \
     $(ROOT)/core/vfs.c \
     $(ROOT)/core/elf_loader.c \
@@ -103,6 +105,12 @@ SRCS := \
     $(ROOT)/platforms/flipper/font_data.c \
     $(ROOT)/platforms/flipper/flash_storage.c \
     $(ROOT)/platforms/flipper/rfid.c \
+    $(ROOT)/platforms/flipper/sd_spi.c \
+    $(ROOT)/platforms/flipper/sd_diskio.c \
+    $(ROOT)/platforms/flipper/vfs_fat.c \
+    $(ROOT)/platforms/flipper/ext_storage.c \
+    $(ROOT)/third_party/fatfs/ff.c \
+    $(ROOT)/third_party/fatfs/ffunicode.c \
     $(ROOT)/core/rfid/rfid_crc.c \
     $(ROOT)/core/rfid/rfid_iso14443a.c \
     $(ROOT)/core/rfid/rfid_em4100.c \

@@ -21,6 +21,10 @@
  * table is full. */
 int      ramfs_truncate(const char *name);
 
+/* Set a file's length to `size` exactly (shrinking drops the tail, growing
+ * zero-fills). Creates the file if absent. Returns 0, -1 on OOM or a full table. */
+int      ramfs_resize(const char *name, uint32_t size);
+
 /* Write len bytes at byte offset off, growing the file (and zero-filling any
  * gap) as needed. Creates the file if absent. Returns 0 on success, -1 on OOM or
  * a full table. */

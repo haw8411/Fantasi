@@ -23,12 +23,12 @@ static void cmd_cat(const char *arg)
     fclose(f);
 }
 
-#ifdef HAS_BLE
+#ifdef HAS_PROTO
 /* Resumable, windowed download of device file `path` to `out`: request the file in bounded CAT_WINDOW
  * ranges so a dropped notification only re-requests one window. See the long note in the protocol docs;
- * ble_drain_quiet() clears stale stream bytes before a resume. Returns 0, or -1 on a hard error (printed).
+ * proto_drain_quiet() clears stale stream bytes before a resume. Returns 0, or -1 on a hard error (printed).
  * Shared by `cat` (out = stdout) and `edit`'s WebUSB temp-file path. `path` must already be resolved. */
-int ble_download(const char *path, FILE *out)
+int proto_download(const char *path, FILE *out)
 {
     uint32_t got = 0;          /* contiguous bytes written so far */
     int stalls = 0;            /* consecutive re-requests with no progress */
@@ -36,19 +36,19 @@ int ble_download(const char *path, FILE *out)
 
     while (!eof) {
         CliRequest req = CliRequest_init_zero;
-        req.id = ++ble_req_id;
+        req.id = ++proto_req_id;
         req.which_payload = CliRequest_file_read_tag;
         strncpy(req.payload.file_read.path, path,
                 sizeof(req.payload.file_read.path) - 1);
         req.payload.file_read.offset = got;
         req.payload.file_read.size = CAT_WINDOW;
-        if (ble_send_proto(&req) < 0) { fprintf(stderr, "send failed\n"); return -1; }
+        if (proto_send(&req) < 0) { fprintf(stderr, "send failed\n"); return -1; }
 
         uint32_t before = got;
         bool last_seen = false, err_seen = false;
         CliResponse resp;
         for (;;) {
-            if (ble_recv_proto(&resp) < 0) break;          /* desync/timeout → resume window */
+            if (proto_recv(&resp) < 0) break;          /* desync/timeout -> resume window */
             if (resp.id != req.id) continue;               /* stale response */
             if (resp.which_payload == CliResponse_error_tag) {
                 err_seen = true; break;
@@ -57,7 +57,7 @@ int ble_download(const char *path, FILE *out)
                 uint32_t off = resp.payload.file_data.offset;
                 uint32_t sz  = resp.payload.file_data.data.size;
                 const uint8_t *b = resp.payload.file_data.data.bytes;
-                if (off > got) break;                      /* gap → resume from `got` */
+                if (off > got) break;                      /* gap -> resume from `got` */
                 if (off + sz > got) {                      /* new (or partially new) bytes */
                     uint32_t skip = got - off;
                     fwrite(b + skip, 1, sz - skip, out);
@@ -83,20 +83,20 @@ int ble_download(const char *path, FILE *out)
                 fprintf(stderr, "download stalled at %u bytes\n", got);
                 return -1;
             }
-            ble_drain_quiet();                             /* clear stale stream before resume */
+            proto_drain_quiet();                             /* clear stale stream before resume */
         }
     }
     fflush(out);
     return 0;
 }
 
-static void ble_cmd_cat(const char *arg)
+static void proto_cmd_cat(const char *arg)
 {
     if (!arg) { fprintf(stderr, "usage: cat <path>\n"); return; }
     char path[256];
     resolve_path(arg, path, sizeof(path));
-    ble_download(path, stdout);
+    proto_download(path, stdout);
 }
 #endif
 
-LOCAL_COMMAND_BLE("cat", "print file contents", cmd_cat, ble_cmd_cat);
+LOCAL_COMMAND_BLE("cat", "print file contents", cmd_cat, proto_cmd_cat);

@@ -66,9 +66,9 @@ SRCS := \
     $(ROOT)/core/main.c \
     $(ROOT)/core/cli.c \
     $(wildcard $(ROOT)/core/commands/*.c) \
-    $(ROOT)/core/ble_proto.c \
+    $(ROOT)/core/proto.c \
     $(ROOT)/core/usb_proto.c \
-    $(ROOT)/core/ble_pipe.c \
+    $(ROOT)/core/proto_pipe.c \
     $(ROOT)/core/ramfs.c \
     $(ROOT)/core/vfs.c \
     $(ROOT)/core/elf_loader.c \

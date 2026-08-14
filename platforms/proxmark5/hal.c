@@ -54,6 +54,9 @@ void hal_init(void)
      * are left to the button launcher (off at rest; binary slot display). */
     pm5_rgb_set(0, 0, 200);
 
+    /* Light the two antenna-board LEDs (HF + LF) as a board indicator. */
+    pm5_ant_led(true, true);
+
     hal_storage_init();
 
     /* Apply the USB interface toggles before USB comes up so the device
@@ -362,7 +365,13 @@ int hal_ble_clear_bonds(void)
  * as the "Fantasi on" indicator. Drive low = LED on, release high = off. */
 #ifdef FANTASI_ENABLE_APPS
 
-#define PM5_HOLD_MS   600      /* same hold-to-launch time as the Proxmark3 */
+/* Button-hold thresholds. A short press cycles the slot. A hold that is released
+ * in the launch window [PM5_HOLD_MS, PM5_LAUNCH_MAX_MS) launches the slot. Holding
+ * past PM5_LAUNCH_MAX_MS abandons the launch (so a user heading for DFU never
+ * fires their shortcut); at PM5_DFU_HOLD_MS the device enters USB DFU. */
+#define PM5_HOLD_MS         600     /* min hold to count as a launch (like the PM3) */
+#define PM5_LAUNCH_MAX_MS   3000    /* release after this = no launch (DFU-intent hold) */
+#define PM5_DFU_HOLD_MS     6000    /* hold this long -> enter DFU */
 
 static void pm5_led(uint32_t pin, bool on)
 {
@@ -422,22 +431,46 @@ static void pm5_launcher_task(void *arg)
     for (int i = 0; i < 40 && !pm5_rgb_set(0, 0, 200); i++) vTaskDelay(pdMS_TO_TICKS(25));
 
     int sel = 0;
-    bool prev = false, launched = false;
+    bool prev = false;
     TickType_t press_start = 0;
 
     for (;;) {
-        pm5_leds_show((uint8_t)sel);
-
         bool now = pm5_button_down();
         TickType_t t = xTaskGetTickCount();
 
-        if (now && !prev) { press_start = t; launched = false; }        /* press edge */
-        if (now && !launched && (t - press_start) >= pdMS_TO_TICKS(PM5_HOLD_MS)) {
-            launched = true;                                            /* fire once per hold */
-            pm5_leds_show(7);                                           /* all A-C on = launching */
-            pm5_launch(sel);
+        if (now && !prev) press_start = t;                             /* press edge */
+
+        if (now) {
+            TickType_t dt = t - press_start;
+            /* Decide by how long the button has been held, not at a single mark,
+             * so the launch can be withheld for a DFU-intent long hold. */
+            if (dt >= pdMS_TO_TICKS(PM5_DFU_HOLD_MS)) {
+                pm5_leds_show(0);                                       /* the ROM resets GPIOC next */
+                hal_reboot_dfu();                                      /* does not return */
+            } else if (dt >= pdMS_TO_TICKS(PM5_LAUNCH_MAX_MS)) {
+                /* Past the launch window: only D lit = "keep holding for DFU". */
+                pm5_led(PM5_LED_A_PIN, false);
+                pm5_led(PM5_LED_B_PIN, false);
+                pm5_led(PM5_LED_C_PIN, false);
+                pm5_led(PM5_LED_D_PIN, true);
+            } else if (dt >= pdMS_TO_TICKS(PM5_HOLD_MS)) {
+                pm5_leds_show(7);                                      /* armed: release to launch */
+            } else {
+                pm5_leds_show((uint8_t)sel);
+            }
+        } else {
+            if (prev) {                                               /* release edge */
+                TickType_t dt = t - press_start;
+                if (dt >= pdMS_TO_TICKS(PM5_HOLD_MS) && dt < pdMS_TO_TICKS(PM5_LAUNCH_MAX_MS)) {
+                    pm5_leds_show(7);
+                    pm5_launch(sel);                                  /* launch on release */
+                } else if (dt < pdMS_TO_TICKS(PM5_HOLD_MS)) {
+                    sel = (sel + 1) & 7;                              /* short press -> next slot */
+                }
+                /* released in [LAUNCH_MAX, DFU): abandoned, do nothing */
+            }
+            pm5_leds_show((uint8_t)sel);
         }
-        if (!now && prev && !launched) sel = (sel + 1) & 7;             /* short press -> next slot */
         prev = now;
 
         vTaskDelay(pdMS_TO_TICKS(20));

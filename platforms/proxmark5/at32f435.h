@@ -427,6 +427,11 @@ void pm5_deinit_and_jump(uint32_t image_base) __attribute__((noreturn));
  * caller run early retries until this is true). */
 bool pm5_rgb_set(uint8_t r, uint8_t g, uint8_t b);
 
+/* Light the two antenna-board LEDs (HF, LF) via the software-I2C antenna controller
+ * (0x51, map register bit2=HFLED / bit1=LFLED, active-high). Defined in rfid.c.
+ * Returns the I2C ack. */
+bool pm5_ant_led(bool hf, bool lf);
+
 /* Set CFGR 2-bit mode field for pin `p` to `m`. */
 static inline void gpio_set_mode(gpio_type *g, int p, uint32_t m)
 {
@@ -448,6 +453,15 @@ static inline void gpio_set_otype(gpio_type *g, int p, uint32_t od)
 {
     if (od) g->OMODE |=  (1u << p);
     else    g->OMODE &= ~(1u << p);
+}
+
+/* Output drive strength (ODRVR, 2 bits/pin): 0 = weak, 1 = stronger, 2 = moderate.
+ * A fast master (e.g. the 24 MHz QSPI) needs stronger drive than the weak reset
+ * default to switch the lines cleanly. */
+#define GPIO_DRIVE_STRONGER 0x1u
+static inline void gpio_set_drive(gpio_type *g, int p, uint32_t drv)
+{
+    g->ODRVR = (g->ODRVR & ~(0x3u << (2 * p))) | ((drv & 0x3u) << (2 * p));
 }
 
 /* Alternate-function (MUX) numbers used by the RFID frontend (DS pin tables). */

@@ -15,6 +15,7 @@
 #include "ble.h"
 #include "display.h"
 #include "hal_storage.h"
+#include "flash_storage.h"
 #include "lfs.h"
 #include "tusb.h"
 
@@ -326,11 +327,14 @@ extern uint8_t _eflash;
 
 int32_t hal_flash_free_bytes(void)
 {
+    /* Free program flash = the slack below the LittleFS storage region, not up to the
+     * BLE secure boundary. The 256 KB LittleFS is placed in the last 256 KB before SFSA
+     * and is the "/" mount reported separately in df, so the ceiling is its base, not
+     * secure_start. */
     uint32_t used_end = (uint32_t)&_eflash;
-    uint32_t sfsa = (FLASH->SFR & FLASH_SFR_SFSA_Msk) >> FLASH_SFR_SFSA_Pos;
-    uint32_t secure_start = sfsa * 4096U + FLASH_BASE;
-    if (secure_start <= used_end) return 0;
-    return (int32_t)(secure_start - used_end);
+    uint32_t base = storage_flash_base();
+    if (!base || base <= used_end) return 0;
+    return (int32_t)(base - used_end);
 }
 
 int hal_battery_percent(void)

@@ -7,8 +7,13 @@
 #include "hal_storage.h"
 #include "flash_storage.h"
 #include "fat_ramdisk.h"   /* fatrd_invalidate() */
+#include "../hal.h"
 #include "lfs.h"
 #include <string.h>
+
+/* Weak no-op default: platforms with external storage (e.g. the Proxmark5 QSPI
+ * flash) override this to bring up the device and register it via vfs_mount_ext_lfs. */
+__attribute__((weak)) void hal_ext_storage_init(void) { }
 
 /* ---- LittleFS callbacks ---- */
 
@@ -106,6 +111,26 @@ void hal_storage_unmount(void)
         lfs_unmount(&lfs);
         mounted = false;
     }
+}
+
+int hal_storage_format(void)
+{
+    /* Serialise against the synthetic-FAT model path (MSC reads/writes) and the VFS
+     * ops, which all touch this instance: the store lock is the same one they take. */
+    fatrd_store_lock();
+    if (mounted) { lfs_unmount(&lfs); mounted = false; }
+    int err = lfs_format(&lfs, &lfs_cfg);
+    if (!err) err = lfs_mount(&lfs, &lfs_cfg);
+    mounted = (err == 0);
+#ifdef FANTASI_ENABLE_APPS
+    if (mounted) lfs_mkdir(&lfs, "/apps");
+#endif
+    /* The tree the synthetic FAT mirrors is now empty: force a rebuild and signal a
+     * media change so a host with the drive mounted re-reads instead of serving its
+     * cached (now-stale) view. */
+    fatrd_invalidate();
+    fatrd_store_unlock();
+    return err;
 }
 
 bool hal_storage_mounted(void)

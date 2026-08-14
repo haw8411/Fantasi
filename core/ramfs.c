@@ -104,6 +104,17 @@ int ramfs_truncate(const char *name)
     return 0;
 }
 
+int ramfs_resize(const char *name, uint32_t size)
+{
+    lock();
+    ramfs_file_t *f = find(name);
+    if (!f) f = alloc_entry(name);
+    if (!f) { unlock(); return -1; }
+    int rc = resize(f, size);
+    unlock();
+    return rc;
+}
+
 int ramfs_reserve(const char *name, uint32_t cap)
 {
     lock();

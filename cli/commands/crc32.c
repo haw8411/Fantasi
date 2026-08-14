@@ -40,10 +40,10 @@ static void cmd_crc32(const char *arg)
     printf("%08x %zu %s\n", crc, total, path);
 }
 
-#ifdef HAS_BLE
+#ifdef HAS_PROTO
 /* crc32 over BLE: read the file in bounded windows (same resume logic as
  * ble cat) and fold each chunk into the running CRC instead of printing. */
-static void ble_cmd_crc32(const char *arg)
+static void proto_cmd_crc32(const char *arg)
 {
     if (!arg) { fprintf(stderr, "usage: crc32 <path>\n"); return; }
     char path[256];
@@ -55,19 +55,19 @@ static void ble_cmd_crc32(const char *arg)
 
     while (!eof) {
         CliRequest req = CliRequest_init_zero;
-        req.id = ++ble_req_id;
+        req.id = ++proto_req_id;
         req.which_payload = CliRequest_file_read_tag;
         strncpy(req.payload.file_read.path, path,
                 sizeof(req.payload.file_read.path) - 1);
         req.payload.file_read.offset = got;
         req.payload.file_read.size = CAT_WINDOW;
-        if (ble_send_proto(&req) < 0) { fprintf(stderr, "send failed\n"); return; }
+        if (proto_send(&req) < 0) { fprintf(stderr, "send failed\n"); return; }
 
         uint32_t before = got;
         bool last_seen = false, err_seen = false;
         CliResponse resp;
         for (;;) {
-            if (ble_recv_proto(&resp) < 0) break;
+            if (proto_recv(&resp) < 0) break;
             if (resp.id != req.id) continue;
             if (resp.which_payload == CliResponse_error_tag) { err_seen = true; break; }
             if (resp.which_payload == CliResponse_file_data_tag) {
@@ -99,11 +99,11 @@ static void ble_cmd_crc32(const char *arg)
                 fprintf(stderr, "crc32: download stalled at %u bytes\n", got);
                 return;
             }
-            ble_drain_quiet();
+            proto_drain_quiet();
         }
     }
     printf("%08x %u %s\n", crc, got, path);
 }
 #endif
 
-LOCAL_COMMAND_BLE("crc32", "CRC32 of a device file", cmd_crc32, ble_cmd_crc32);
+LOCAL_COMMAND_BLE("crc32", "CRC32 of a device file", cmd_crc32, proto_cmd_crc32);

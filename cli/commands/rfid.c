@@ -27,7 +27,7 @@ static void cmd_rfid(const char *arg)
     fprintf(stderr, "rfid: needs the protobuf transport - start the CLI with --usb or --ble\n");
 }
 
-#ifdef HAS_BLE
+#ifdef HAS_PROTO
 #include <pb_encode.h>
 #include <pb_decode.h>
 #include <stdlib.h>
@@ -537,7 +537,7 @@ static void mfc_sniff_finalize(void)
     int fd = mkstemp(tmp);
     if (fd < 0) { printf("collect: mkstemp failed\r\n"); return; }
     FILE *dl = fdopen(fd, "w+"); if (!dl) { close(fd); unlink(tmp); printf("collect: temp-file error\r\n"); return; }
-    if (ble_download("/nfc/mfc.dict", dl) < 0) { rewind(dl); if (ftruncate(fd, 0) != 0) { /* fresh if no existing dict */ } }
+    if (proto_download("/nfc/mfc.dict", dl) < 0) { rewind(dl); if (ftruncate(fd, 0) != 0) { /* fresh if no existing dict */ } }
 
     uint64_t existing[512]; int nex = 0;                   /* dedup against keys already in the dict */
     rewind(dl); char ln[64];
@@ -549,7 +549,7 @@ static void mfc_sniff_finalize(void)
         if (!dup) { fprintf(dl, "%012llX\n", (unsigned long long)g_ms_keys[i]); added++; }
     }
     fflush(dl);
-    if (ble_upload(tmp, "/nfc/mfc.dict") < 0) printf("collect: failed to write /nfc/mfc.dict\r\n");
+    if (proto_upload(tmp, "/nfc/mfc.dict") < 0) printf("collect: failed to write /nfc/mfc.dict\r\n");
     else printf("collect: recovered %d key(s), %d new -> /nfc/mfc.dict\r\n", g_ms_nkeys, added);
     fclose(dl); unlink(tmp);
 }
@@ -1626,7 +1626,7 @@ static void rfid_dispatch_line(uint32_t sid, char *line)
     }
 }
 
-void ble_cmd_rfid(const char *arg)
+void proto_cmd_rfid(const char *arg)
 {
     /* Non-interactive one-shot: `fantasi --usb -c "rfid <cmd...>"` runs <cmd> (e.g. `emulate <json>`) without a
      * pty - dispatched host-side exactly like a typed line, then output streams until the app ends (a streaming
@@ -1759,6 +1759,6 @@ void ble_cmd_rfid(const char *arg)
     for (int i = 0; i < NMODS; i++) delete_ram(RFID_MODS[i].ram);
     printf("\n");
 }
-#endif /* HAS_BLE */
+#endif /* HAS_PROTO */
 
-LOCAL_COMMAND_BLE("rfid", "launch RFID app", cmd_rfid, ble_cmd_rfid);
+LOCAL_COMMAND_BLE("rfid", "launch RFID app", cmd_rfid, proto_cmd_rfid);

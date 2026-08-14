@@ -36,13 +36,13 @@ TUSB_MARKER := $(TUSB_DIR)/src/tusb.c
 #   *.patch          edits to upstream files, applied via `git apply` with a
 #                    reverse-check guard (already-applied → skip; conflicts → warn,
 #                    never clobber).
-#   dcd_at91sam7s.c  a NEW upstream file (SAM7S DCD). Copied in ONLY when absent,
+#   dcd_at91sam7s.c  a new upstream file (SAM7S DCD). Copied in only when absent,
 #                    so a locally-edited clone driver is never overwritten (the
 #                    stash is refreshed from the clone by hand - see the README).
 TUSB_PATCHES  := $(wildcard third_party/tinyusb_patches/*.patch)
 SAM7S_DCD_SRC := third_party/tinyusb_patches/dcd_at91sam7s.c
 SAM7S_DCD_DST := $(TUSB_DIR)/src/portable/microchip/at91sam7s/dcd_at91sam7s.c
-# AT32F435 DWC2 port header (Proxmark5). A NEW upstream file, copied in only
+# AT32F435 DWC2 port header (Proxmark5). A new upstream file, copied in only
 # when absent - same discipline as the SAM7S DCD above. The two register
 # edits it needs (OPT_MCU_AT32F435, the dcd_dwc2.c include) ride in via the
 # *.patch glob.

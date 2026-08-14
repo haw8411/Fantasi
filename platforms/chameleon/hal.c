@@ -13,6 +13,7 @@
 #include "ble.h"
 #include "ble_serial.h"
 #include "hal_storage.h"
+#include "flash_storage.h"
 #include "tusb.h"
 #include "FreeRTOS.h"
 #include "task.h"
@@ -156,9 +157,13 @@ extern uint8_t _eflash;
 
 int32_t hal_flash_free_bytes(void)
 {
+    /* Free program flash = the slack below the LittleFS storage region, not up to the
+     * bootloader. The 256 KB LittleFS sits at the top of the app region (~0xB3000, just
+     * below the bootloader) and is the "/" mount reported separately in df, so the ceiling
+     * is its base, not the bootloader address. */
     uint32_t used_end  = (uint32_t)&_eflash;
-    uint32_t flash_end = 0x00027000U + 0xCC000U;
-    if (flash_end <= used_end) return 0;
+    uint32_t flash_end = storage_flash_base();
+    if (!flash_end || flash_end <= used_end) return 0;
     return (int32_t)(flash_end - used_end);
 }
 

@@ -37,22 +37,44 @@ static bool vendor_connected(void *c) { (void)c; return tud_vendor_mounted(); }
 
 static void vendor_flush(void) { tud_vendor_write_flush(); }
 
+/* RX-event wait: block until the vendor RX callback signals new data (or
+ * timeout), so the task - and the CPU - can idle between requests. Single
+ * waiter: usb_proto_task. */
+static volatile TaskHandle_t s_vendor_waiter;
+
+static void vendor_wait(uint32_t timeout_ms)
+{
+    s_vendor_waiter = xTaskGetCurrentTaskHandle();
+    if (!tud_vendor_available())   /* re-check: data may have raced in */
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(timeout_ms));
+    s_vendor_waiter = NULL;
+}
+
+void tud_vendor_rx_cb(uint8_t itf, uint8_t const *buffer, uint16_t bufsize)
+{
+    (void)itf; (void)buffer; (void)bufsize;
+    TaskHandle_t t = s_vendor_waiter;
+    if (t) xTaskNotifyGive(t);
+}
+
 /* Framed-response sink: push the whole buffer through the bulk FIFO, draining as
  * needed so a response larger than the FIFO can't be truncated. */
 static size_t vendor_emit(const uint8_t *buf, size_t len)
 {
     size_t sent = 0;
-    int stalls = 0;
+    /* Tick-deadline, not a retry counter: tickless idle can make one
+     * vTaskDelay span many ticks. ~250 ms of no progress = peer gone. */
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(250);
     while (sent < len) {
         if (!tud_vendor_mounted()) break;
         uint32_t w = tud_vendor_write(buf + sent, len - sent);
         if (w == 0) {
             tud_vendor_write_flush();
-            if (++stalls > 250) break;   /* peer gone: drop rest rather than hang */
+            if ((int32_t)(xTaskGetTickCount() - deadline) >= 0) break;   /* peer gone: drop rest rather than hang */
             vTaskDelay(pdMS_TO_TICKS(1));
             continue;
         }
-        stalls = 0;
+        deadline = xTaskGetTickCount() + pdMS_TO_TICKS(250);
         sent += w;
     }
     tud_vendor_write_flush();
@@ -70,6 +92,7 @@ void usb_proto_task(void *arg)
     ctx.transport.connected = vendor_connected;
     ctx.transport.poll      = NULL;          /* tud_task() runs in platform_usb_task */
     ctx.transport.flush     = vendor_flush;
+    ctx.transport.wait      = vendor_wait;
     ctx.transport.ctx       = NULL;
 
     static uint8_t accum[VPROTO_ACCUM];
@@ -80,7 +103,9 @@ void usb_proto_task(void *arg)
         uint8_t tmp[256];
         size_t n = vendor_read(tmp, sizeof(tmp), NULL);
         if (n == 0) {
-            vTaskDelay(pdMS_TO_TICKS(2));
+            /* Block until the vendor RX callback signals data (timeout only
+             * bounds a missed wakeup). */
+            vendor_wait(100);
             continue;
         }
         fantasi_proto_rx(&ctx, accum, VPROTO_ACCUM, &accum_len, vendor_emit, tmp, n);

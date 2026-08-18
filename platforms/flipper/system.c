@@ -87,3 +87,20 @@ void SystemInit(void)
 
     SystemCoreClock = 32000000u;
 }
+
+/* Restore the USB 48 MHz clock (HSI48 + CRS) after a Stop 2 deep sleep, which
+ * stops HSI48. */
+void fz_usb_clock_restore(void)
+{
+    if (RCC->CRRCR & RCC_CRRCR_HSI48RDY) return;   /* already running */
+    RCC->CRRCR |= RCC_CRRCR_HSI48ON;
+    while ((RCC->CRRCR & RCC_CRRCR_HSI48RDY) == 0) { }
+    RCC->CCIPR &= ~RCC_CCIPR_CLK48SEL;             /* CLK48 mux = HSI48 */
+    PWR->CR2 |= PWR_CR2_USV;                        /* VDDUSB monitor */
+    RCC->APB1ENR1 |= RCC_APB1ENR1_CRSEN;
+    (void)RCC->APB1ENR1;
+    CRS->CFGR = (47999U << CRS_CFGR_RELOAD_Pos)
+              | (0x22U   << CRS_CFGR_FELIM_Pos)
+              | (0x2U    << CRS_CFGR_SYNCSRC_Pos);
+    CRS->CR |= CRS_CR_AUTOTRIMEN | CRS_CR_CEN;
+}

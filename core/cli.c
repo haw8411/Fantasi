@@ -1,5 +1,6 @@
 #include "cli.h"
 #include "../hal/hal.h"
+#include "../hal/hal_power.h"
 
 #include "FreeRTOS.h"
 #include "task.h"
@@ -35,11 +36,12 @@ static void cli_write_raw(cli_ctx_t *ctx, const uint8_t *p, size_t len)
     /* Bound the wait for transport drain. transport.write() returns 0 while the
      * TX FIFO is full - and stays 0 forever if the host/peer stopped reading or
      * disconnected (e.g. the USB serial is open elsewhere, or a BLE peer went
-     * away). Retrying unconditionally hung this task indefinitely, stalling the
-     * CLI: it could never get back to servicing input. Give up after ~250 ms of
-     * no progress and drop the rest - losing output to a dead reader is far
-     * better than locking the CLI. */
-    int stalls = 0;
+     * away). Retrying unconditionally would hang this task indefinitely,
+     * stalling the CLI so it never services input again. Give up after ~250 ms
+     * of no progress and drop the rest - losing output to a dead reader is far
+     * better than locking the CLI. (Deadline on the tick count, not a retry
+     * counter: tickless idle can make a single vTaskDelay span many ticks.) */
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(250);
     while (len) {
         /* Bail at once if the link is gone - don't sit here draining into a dead
          * reader (the host closed the port / the BLE peer left). */
@@ -47,11 +49,11 @@ static void cli_write_raw(cli_ctx_t *ctx, const uint8_t *p, size_t len)
             return;
         size_t wrote = ctx->transport.write(p, len, ctx->transport.ctx);
         if (wrote == 0) {
-            if (++stalls > 250) return;
+            if ((int32_t)(xTaskGetTickCount() - deadline) >= 0) return;
             vTaskDelay(pdMS_TO_TICKS(1));
             continue;
         }
-        stalls = 0;
+        deadline = xTaskGetTickCount() + pdMS_TO_TICKS(250);
         p += wrote;
         len -= wrote;
     }
@@ -127,6 +129,7 @@ static void dispatch(char *line)
     int argc = tokenize(line, argv, CLI_ARGC_MAX);
     if (argc == 0) return;
 
+    hal_power_activity();   /* a typed command = the device is in use */
     cli_frame(0x01);
     const cli_command_t *cmd = cli_lookup(argv[0]);
     if (cmd) {
@@ -189,7 +192,11 @@ void cli_task_with_transport(void *arg)
         if (ctx->transport.poll) ctx->transport.poll();
         size_t n = ctx->transport.read(buf, sizeof(buf), ctx->transport.ctx);
         if (n == 0) {
-            vTaskDelay(pdMS_TO_TICKS(5));
+            /* Event-driven transports block here until their RX callback
+             * signals (the timeout only bounds a missed wakeup); others keep
+             * the historical 5 ms poll. */
+            if (ctx->transport.wait) ctx->transport.wait(100);
+            else                     vTaskDelay(pdMS_TO_TICKS(5));
             continue;
         }
         for (size_t i = 0; i < n; i++) handle_byte(ctx, buf[i]);
@@ -207,6 +214,14 @@ static bool usb_connected(void *c) {
     (void)c; return hal_serial_connected();
 }
 
+/* Poll fallback for platforms whose serial has no RX-event wait (PM3's
+ * interrupt CDC glue): keep the historical 5 ms cadence. */
+__attribute__((weak)) void hal_serial_wait(uint32_t timeout_ms)
+{
+    uint32_t ms = timeout_ms > 5 ? 5 : timeout_ms;
+    if (ms) vTaskDelay(pdMS_TO_TICKS(ms));
+}
+
 static cli_ctx_t usb_ctx;
 
 void cli_task(void *arg)
@@ -216,6 +231,7 @@ void cli_task(void *arg)
     usb_ctx.transport.write     = usb_write;
     usb_ctx.transport.read      = usb_read;
     usb_ctx.transport.connected = usb_connected;
+    usb_ctx.transport.wait      = hal_serial_wait;
     usb_ctx.transport.ctx       = NULL;
 
     hal_post_init();

@@ -9,6 +9,7 @@
 
 #include "flash_storage.h"
 #include "ble.h"
+#include "../../hal/hal_power.h"
 #include "stm32wbxx.h"
 #include "FreeRTOS.h"
 #include "task.h"
@@ -33,11 +34,11 @@ static void flash_unlock(void);
 
 /* ---- CPU1/CPU2 flash↔radio coordination (mirrors furi_hal_flash.c) ----
  * The STM32WB shares a single flash bank between both cores; a CPU1 erase or
- * program stalls the bus for BOTH cores. The reference firmware follows a
+ * program stalls the bus for both cores. The reference firmware follows a
  * precise ST sequence (AN5289 / STM32CubeWB flash_driver.c) so the BLE radio
- * (CPU2) stays alive AND the host doesn't lose in-flight writes during a long
+ * (CPU2) stays alive and the host doesn't lose in-flight writes during a long
  * erase. The critical mechanism: SHCI_C2_FLASH_EraseActivity(ON) makes CPU2
- * RESCHEDULE its connection events away from the erase window - so the host
+ * reschedule its connection events away from the erase window - so the host
  * gets no events to send into during the stall and simply waits, instead of
  * its writes being silently dropped. The full handshake is required: without
  * the flash mutex (SEM2) and the PESD wait, EraseActivity does not take effect
@@ -78,12 +79,12 @@ static void flush_icache(void)
 }
 
 /* Acquire flash for a CPU1 op, coordinating with CPU2 when it is running.
- * Returns true if CPU2 coordination was used - then the caller is INSIDE a
+ * Returns true if CPU2 coordination was used - then the caller is inside a
  * FreeRTOS critical section and must call flash_end(erase, true). When CPU2 is
  * down (boot-time format) there is no radio to protect: just unlock. */
 static bool flash_begin(bool erase)
 {
-    /* Coordinate with CPU2 whenever it is RUNNING - not just when BLE is active.
+    /* Coordinate with CPU2 whenever it is running - not just when BLE is active.
      * `ble off` leaves CPU2 running (it only stops advertising), so a write on
      * the uncoordinated path would still race CPU2 and corrupt a double-word. */
     if (!ble_cpu2_running()) {
@@ -172,6 +173,7 @@ int storage_flash_erase(uint32_t page_index)
     uint32_t abs_page = (s_base - FLASH_BASE) / STORAGE_PAGE_SIZE
                       + page_index;
 
+    pwr_inhibit_enter(PWR_CLIENT_FLASH);   /* never sleep mid-erase */
     bool c2 = flash_begin(true);   /* EraseActivity ON + SEM2/SEM7 (in critical) */
     FLASH->SR = FLASH_ALL_ERRORS;
     while (FLASH->SR & FLASH_SR_BSY) {}
@@ -182,6 +184,7 @@ int storage_flash_erase(uint32_t page_index)
     CLEAR_BIT(FLASH->CR, FLASH_CR_PER | FLASH_CR_PNB);
     flush_icache();                /* data consistency after erase */
     flash_end(true, c2);
+    pwr_inhibit_exit(PWR_CLIENT_FLASH);
     return err;
 }
 
@@ -195,7 +198,7 @@ int storage_flash_program(uint32_t offset, const void *buf, size_t len)
     size_t dwords = len / 8;
     int err = 0;
 
-    /* ONE flash<->radio handshake (SEM2 + PESD wait + SEM7 + critical section)
+    /* One flash<->radio handshake (SEM2 + PESD wait + SEM7 + critical section)
      * per program call, then program every double-word inside it.
      * Avoid these implementations:
      *   - per-double-word begin/end (mirroring furi_hal_flash_write_dword):
@@ -204,19 +207,20 @@ int storage_flash_program(uint32_t offset, const void *buf, size_t len)
      *     upload-ack path and makes BLE transfers unreliable; one handshake per
      *     call avoids it.
      *   - holding one lock but programming raw 0xFF padding: see skip below.
-     * A single short lock per lfs prog call keeps up with the BLE upload AND
+     * A single short lock per lfs prog call keeps up with the BLE upload and
      * leaves the radio enough windows (lfs writes are small; the 4 KB MSC
      * page write-back is the only large caller and it tolerates one lock since
      * it is not concurrent with a high-rate BLE stream). */
+    pwr_inhibit_enter(PWR_CLIENT_FLASH);   /* never sleep mid-program */
     bool c2 = flash_begin(false);
     FLASH->SR = FLASH_ALL_ERRORS;
     SET_BIT(FLASH->CR, FLASH_CR_PG);
 
     for (size_t i = 0; i < dwords; i++) {
-        /* NEVER program an all-ones double-word. The data would not change
+        /* Never program an all-ones double-word. The data would not change
          * (erased flash already reads 0xFF), but the STM32WB flash ECC for
-         * 0xFFFFFFFFFFFFFFFF is NOT all-ones, so a program cycle writes ECC
-         * bits and leaves the location NON-erased: a later attempt to program
+         * 0xFFFFFFFFFFFFFFFF is not all-ones, so a program cycle writes ECC
+         * bits and leaves the location non-erased: a later attempt to program
          * real data there fails with PROGERR ("not previously erased"), even
          * though the data still reads 0xFF. lfs never asks to program padding,
          * but the MSC page write-back programs a full 4 KB page including its
@@ -230,9 +234,9 @@ int storage_flash_program(uint32_t offset, const void *buf, size_t len)
             continue;
         }
 
-        /* The two 32-bit stores of a double-word MUST be consecutive flash
-         * accesses; the critical section only raises BASEPRI and does NOT mask
-         * the high-priority USB IRQ on this port, so mask ALL interrupts
+        /* The two 32-bit stores of a double-word must be consecutive flash
+         * accesses; the critical section only raises BASEPRI and does not mask
+         * the high-priority USB IRQ on this port, so mask all interrupts
          * (PRIMASK) across the two stores. */
         uint32_t pm = __get_PRIMASK();
         __disable_irq();
@@ -252,5 +256,6 @@ int storage_flash_program(uint32_t offset, const void *buf, size_t len)
 
     CLEAR_BIT(FLASH->CR, FLASH_CR_PG);
     flash_end(false, c2);
+    pwr_inhibit_exit(PWR_CLIENT_FLASH);
     return err;
 }

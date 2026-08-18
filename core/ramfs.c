@@ -39,6 +39,8 @@ static ramfs_file_t *find(const char *name)
 
 static ramfs_file_t *alloc_entry(const char *name)
 {
+    if (!name || !name[0]) return NULL;   /* no nameless entry: a write to a bare mount path
+                                           * ("/ramfs") has an empty leaf - reject, don't create garbage */
     for (int i = 0; i < RAMFS_MAX_FILES; i++) {
         if (!s_files[i].used) {
             s_files[i].used = true;
@@ -178,6 +180,22 @@ int ramfs_remove(const char *name)
     ramfs_file_t *f = find(name);
     if (!f) { unlock(); return -1; }
     free_entry(f);
+    unlock();
+    return 0;
+}
+
+int ramfs_rename(const char *from, const char *to)
+{
+    if (!from || !from[0] || !to || !to[0] ||
+        strlen(from) >= RAMFS_NAME_MAX || strlen(to) >= RAMFS_NAME_MAX) return -1;
+    lock();
+    ramfs_file_t *src = find(from);
+    if (!src) { unlock(); return -1; }
+    if (strncmp(from, to, RAMFS_NAME_MAX) == 0) { unlock(); return 0; }
+
+    ramfs_file_t *dst = find(to);
+    if (dst) free_entry(dst);
+    strcpy(src->name, to);
     unlock();
     return 0;
 }

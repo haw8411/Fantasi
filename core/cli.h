@@ -13,6 +13,11 @@ typedef struct cli_transport {
     bool   (*connected)(void *ctx);
     void   (*poll)(void);
     void   (*flush)(void);
+    /* Optional: block until input may be available or timeout_ms elapsed
+     * (event-driven transports signal it from their RX callback/ISR). NULL ->
+     * the reader falls back to its historical fixed-period poll. May return
+     * early (spurious wake); callers must re-check read(). */
+    void   (*wait)(uint32_t timeout_ms);
     void   *ctx;
 } cli_transport_t;
 

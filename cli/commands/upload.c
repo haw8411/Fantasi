@@ -169,18 +169,60 @@ int proto_upload(const char *local_path, const char *remote_path)
     return error ? -1 : 0;
 }
 
+/* True if device `path` is a directory. Checks the PARENT listing for an entry named
+ * `path`'s basename with is_dir set - a plain dir_list on `path` itself can't tell a
+ * directory from a file or a missing path (it never errors, and flat ramfs lists its
+ * whole root for any subpath), but the per-entry is_dir flag the device already sends
+ * is reliable. */
+static bool proto_path_is_dir(const char *path)
+{
+    const char *slash = strrchr(path, '/');
+    if (!slash) return false;                          /* resolved paths are absolute */
+    const char *base = slash + 1;
+    if (!*base) return true;                            /* trailing slash: a directory path */
+
+    char parent[256];
+    size_t pl = (slash == path) ? 1 : (size_t)(slash - path);   /* root parent stays "/" */
+    if (pl >= sizeof parent) return false;
+    memcpy(parent, path, pl);
+    parent[pl] = '\0';
+
+    CliRequest req = CliRequest_init_zero;
+    req.id = ++proto_req_id;
+    req.which_payload = CliRequest_dir_list_tag;
+    strncpy(req.payload.dir_list.path, parent, sizeof(req.payload.dir_list.path) - 1);
+    if (proto_send(&req) < 0) return false;
+    CliResponse resp;
+    bool is_dir = false;
+    do {
+        if (proto_recv(&resp) < 0) return false;
+        if (resp.which_payload == CliResponse_dir_entry_tag &&
+            resp.payload.dir_entry.is_dir &&
+            strcmp(resp.payload.dir_entry.name, base) == 0)
+            is_dir = true;
+    } while (resp.has_next);
+    return is_dir;
+}
+
 static void proto_cmd_upload(const char *args)
 {
     if (!args) { fprintf(stderr, "usage: upload <local> [remote]\n"); return; }
     char local_path[128], remote_arg[64] = "";
     sscanf(args, "%127s %63s", local_path, remote_arg);
 
+    const char *base = strrchr(local_path, '/');
+    base = base ? base + 1 : local_path;
+
     char remote_path[256];
     if (remote_arg[0]) {
         resolve_path(remote_arg, remote_path, sizeof(remote_path));
+        // `upload x /dir` -> /dir/x
+        if (proto_path_is_dir(remote_path)) {
+            size_t l = strlen(remote_path);
+            snprintf(remote_path + l, sizeof(remote_path) - l, "%s%s",
+                     (l && remote_path[l-1] == '/') ? "" : "/", base);
+        }
     } else {
-        const char *base = strrchr(local_path, '/');
-        base = base ? base + 1 : local_path;
         snprintf(remote_path, sizeof(remote_path), "%s%s%s",
                  cwd, (cwd[strlen(cwd)-1] == '/') ? "" : "/", base);
     }

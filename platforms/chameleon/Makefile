@@ -28,7 +28,15 @@ DEFS := -DNRF52840_XXAA \
         -DFANTASI_FAT_STORAGE \
         -DLFS_NO_MALLOC \
         -DLFS_NO_DEBUG -DLFS_NO_WARN -DLFS_NO_ERROR \
-        -DFANTASI_GIT_HASH=\"$(GIT_HASH)\"
+        -DFANTASI_GIT_HASH=\"$(GIT_HASH)\" \
+        -DCLI_TASK_STACK=1024 \
+        -DUSB_TASK_STACK=2048 \
+        -DWEBUSB_PROTO_STACK=4096 \
+        -DPROTO_STACK=4096
+# Subject to scaling.
+# Reducing proto further may introduce issues (LittleFS flash write
+# nested under the SoftDevice, overflowed at 8KB). usb 8KB for the
+# MSC host-write path.
 
 INCLUDES := \
     -I$(ROOT)/core \
@@ -76,6 +84,7 @@ SRCS := \
     $(ROOT)/core/log.c \
     $(ROOT)/core/libc_glue.c \
     $(ROOT)/core/berry_host.c \
+    $(ROOT)/core/power.c \
     $(ROOT)/platforms/chameleon/startup.c \
     $(ROOT)/platforms/chameleon/system.c \
     $(ROOT)/platforms/chameleon/ble.c \
@@ -87,11 +96,13 @@ SRCS := \
     $(ROOT)/core/rfid/rfid_em4100.c \
     $(ROOT)/core/rfid/rfid_api.c \
     $(ROOT)/platforms/chameleon/flash_storage.c \
+    $(ROOT)/platforms/chameleon/power.c \
     $(ROOT)/hal/storage/hal_storage.c \
     $(ROOT)/hal/storage/msc_device.c \
     $(ROOT)/hal/storage/fat_ramdisk.c \
     $(ROOT)/hal/tinyusb/usb_descriptors.c \
     $(ROOT)/hal/tinyusb/hal_serial_tinyusb.c \
+    $(ROOT)/hal/tinyusb/usb_power.c \
     $(ROOT)/third_party/FreeRTOS-Kernel/tasks.c \
     $(ROOT)/third_party/FreeRTOS-Kernel/queue.c \
     $(ROOT)/third_party/FreeRTOS-Kernel/list.c \

@@ -19,6 +19,7 @@
 #include "at91sam7s512.h"
 #include "../../hal/hal.h"
 #include "../../hal/hal_name.h"
+#include "../../hal/hal_power.h"
 #include "hal_storage.h"
 #include "flash_storage.h"
 #include "spi_bus.h"
@@ -546,6 +547,47 @@ void fantasi_reset(void)
 int hal_shutdown(void)
 {
     return HAL_SHUTDOWN_UNSUPPORTED;
+}
+
+/* ---- Idle-mode light sleep (the HAL_SLEEP_LIGHT tier) ----------------------
+ * The ARM7TDMI has no WFI, but the AT91 PMC has an Idle Mode: writing PCK to
+ * PMC_SCDR halts the processor clock until any enabled AIC interrupt (the 1 kHz
+ * PIT tick at minimum, or a USB IRQ) re-enables it. Peripheral clocks and the
+ * UDP block keep running, so USB stays live and wake latency is ~one
+ * instruction. There is no DEEP tier: the part is USB-powered with no off state.
+ *
+ * IRQs are masked at the core across the sleep so the woken ISR runs only after
+ * we read the wake source and the sleep delta - Idle Mode still wakes on any
+ * AIC-enabled interrupt (the PMC watches nIRQ, not the CPSR I-bit), the same
+ * masked-sleep shape PM5 uses. AIC_IPR then names what woke us: level-sensitive
+ * sources stay asserted until their (deferred) ISR runs, so SYS is the PIT tick
+ * and UDP is USB. The button is polled, not an IRQ, so it never appears.
+ *
+ * Sleep time is measured off the PIT image counter (PITC_PIIR, MCK/16) exactly
+ * as spin_us() reads it. Each sleep lasts at most one tick, so at most one CPIV
+ * wrap; PIV counts span one tick, so each whole PIV credits one 1 kHz tick to
+ * pwr_note_slept(). */
+static uint32_t s_sleep_counts;
+
+void vApplicationIdleHook(void)
+{
+    if (pwr_allowed_depth() == HAL_SLEEP_NONE) return;   /* power sleep off */
+    pwr_note_light_sleep();
+
+    uint32_t piv = AT91C_BASE_PITC->PITC_PIMR & 0xFFFFFu;   /* counts per tick */
+    uint32_t t0  = AT91C_BASE_PITC->PITC_PIIR & 0xFFFFFu;
+
+    portDISABLE_INTERRUPTS();
+    AT91C_BASE_PMC->PMC_SCDR = AT91C_PMC_PCK;             /* halt core until IRQ */
+    uint32_t ipr = AT91C_BASE_AIC->AIC_IPR;              /* pending = what woke us */
+    uint32_t t1  = AT91C_BASE_PITC->PITC_PIIR & 0xFFFFFu;
+    portENABLE_INTERRUPTS();                             /* now the deferred ISR runs */
+
+    pwr_note_wake((ipr & (1u << AT91C_ID_UDP)) ? PWR_WAKE_USB   :
+                  (ipr & (1u << AT91C_ID_SYS)) ? PWR_WAKE_TIMER : PWR_WAKE_OTHER);
+
+    s_sleep_counts += (t1 >= t0) ? (t1 - t0) : (t1 + piv - t0);   /* one wrap max */
+    while (s_sleep_counts >= piv) { pwr_note_slept(1); s_sleep_counts -= piv; }
 }
 
 void hal_set_dfu_magic(void)

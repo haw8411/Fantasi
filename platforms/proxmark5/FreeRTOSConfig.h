@@ -7,11 +7,22 @@
 #define configUSE_PREEMPTION            1
 #define configUSE_PORT_OPTIMISED_TASK_SELECTION 1
 /* Idle hook issues WFI so the 288 MHz core halts between interrupts instead of
- * busy-spinning in the idle task - the single biggest power/heat win short of a
- * full tickless/low-power implementation. See vApplicationIdleHook in system.c. */
+ * busy-spinning in the idle task. It covers idle windows shorter than the
+ * tickless threshold (< 2 ticks); longer windows go through tickless below.
+ * See vApplicationIdleHook in system.c. */
 #define configUSE_IDLE_HOOK             1
 #define configUSE_TICK_HOOK             0
 #define configCPU_CLOCK_HZ              ((unsigned long)288000000)  /* see platforms/proxmark5/system.c */
+
+/* Tickless idle is off, and deliberately so: the kernel's
+ * vPortSuppressTicksAndSleep sizes its sleep from the compile-time
+ * configCPU_CLOCK_HZ, but the core clock now scales at runtime (288 <-> 48 MHz,
+ * see the clock-scaling block in system.c), so a tickless sleep computed for
+ * 288 MHz would run 6x long at 48 MHz and wreck timing. Instead the idle-hook
+ * WFI (system.c) sleeps to the next 1 kHz SysTick, and SysTick is reprogrammed
+ * on every clock switch so the tick stays 1 kHz regardless of SCLK. The
+ * DWT-measured asleep fraction stays ~99% either way. */
+#define configUSE_TICKLESS_IDLE         0
 #define configTICK_RATE_HZ              ((TickType_t)1000)
 #define configMAX_PRIORITIES            5
 #define configMINIMAL_STACK_SIZE        ((unsigned short)128)

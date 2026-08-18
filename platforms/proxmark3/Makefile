@@ -80,6 +80,7 @@ SRCS_C := \
     $(wildcard $(ROOT)/core/commands/*.c) \
     $(ROOT)/core/log.c \
     $(ROOT)/core/libc_glue.c \
+    $(ROOT)/core/power.c \
     $(ROOT)/platforms/proxmark3/hal.c \
     $(ROOT)/platforms/proxmark3/flash_storage.c \
     $(ROOT)/platforms/proxmark3/rfid.c \

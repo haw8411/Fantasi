@@ -11,6 +11,11 @@ static int cmd_free(int argc, char **argv)
     cli_printf("heap: %u/%u B free (min-ever: %u)\r\n",
                (unsigned)now, (unsigned)configTOTAL_HEAP_SIZE, (unsigned)lo);
 
+    extern volatile uint32_t g_oom_count, g_oom_free_at_fail;
+    if (g_oom_count)
+        cli_printf("OOM: %u alloc failure(s), %u B free at last fail\r\n",
+                   (unsigned)g_oom_count, (unsigned)g_oom_free_at_fail);
+
     hal_mem_region_t regions[HAL_MEM_REGIONS_MAX];
     int n = hal_mem_regions(regions, HAL_MEM_REGIONS_MAX);
     uint32_t app_free = 0;

@@ -8,7 +8,7 @@ index 0a4462a..35d09b0 100644
  
 +#elif TU_CHECK_MCU(OPT_MCU_AT91SAM7S)
 +  /* SAM7S UDP has 4 hardware endpoints (EP0-EP3). Same direction
-+   * restriction as SAMG — the CSR EPTYPE field encodes direction,
++   * restriction as SAMG - the CSR EPTYPE field encodes direction,
 +   * so a given EP number is either IN or OUT. */
 +  #define TUP_DCD_ENDPOINT_MAX    4
 +  #define TUD_ENDPOINT_ONE_DIRECTION_ONLY

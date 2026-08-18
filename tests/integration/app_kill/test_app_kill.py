@@ -8,8 +8,10 @@ things: the launch session actually ends after Ctrl-C (a failed kill would hang
 the streaming session), and `free` returns to the pre-launch baseline (the kill
 path reclaims everything, not just the clean-exit path).
 
-Unlike the other app tests this drives the CLI interactively (Popen): the Ctrl-C
-has to arrive *while* the app is running, which a single piped script can't time.
+RAMFS launch sources are consumed after relocation, so a source-resident heap
+figure is not the post-kill baseline. Run twice, re-uploading each time, and
+require identical post-kill resting states. Unlike the other app tests this
+drives the CLI interactively because Ctrl-C must arrive while the app is running.
 """
 
 import argparse
@@ -75,71 +77,59 @@ def main():
         return 1
     print(f"  CDC: {cdc_port}  app: {os.path.relpath(elf, REPO_ROOT)}")
 
-    # Upload spin, then capture the pre-launch baseline (app resident, idle).
-    r, out = cli(cdc_port, f"upload {elf} {RAMFS_PATH}\nexit\n")
-    if RAMFS_PATH not in out and "spin" not in out:
-        print("FAIL: upload did not report success")
-        print(f"  stdout: {r.stdout[:400]}")
-        return 1
+    cli(cdc_port, f"rm {RAMFS_PATH}\nexit\n", timeout=60)
+    post_kill = []
+    for attempt in range(2):
+        r, out = cli(cdc_port, f"upload {elf} {RAMFS_PATH}\nexit\n")
+        if RAMFS_PATH not in out and "spin" not in out:
+            print(f"FAIL: upload {attempt + 1} did not report success")
+            print(f"  stdout: {r.stdout[:400]}")
+            return 1
 
-    baseline = read_free(cdc_port)
-    if baseline is None:
-        print("FAIL: could not read baseline free")
-        return 1
-    print(f"  baseline free (spin resident, not running): {baseline} B")
-
-    # Launch interactively: let it tick, then send Ctrl-C while it runs.
-    print("  [Launching spin, then sending Ctrl-C]")
-    p = subprocess.Popen([CLI_BIN, cdc_port], stdin=subprocess.PIPE,
-                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                         text=True, bufsize=1)
-    killed_cleanly = True
-    try:
-        p.stdin.write(f"launch {RAMFS_PATH}\n"); p.stdin.flush()
-        time.sleep(2.5)                       # let it spin/tick a while
-        p.stdin.write("\x03"); p.stdin.flush()  # Ctrl-C
-        time.sleep(0.5)
+        print(f"  [Launching spin, then sending Ctrl-C; run {attempt + 1}]")
+        p = subprocess.Popen([CLI_BIN, cdc_port], stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, bufsize=1)
+        killed_cleanly = True
         try:
-            p.stdin.write("exit\n"); p.stdin.flush()
-        except (BrokenPipeError, OSError):
-            pass
-        out, _ = p.communicate(timeout=20)
-    except subprocess.TimeoutExpired:
-        # The session never ended → Ctrl-C did not stop the app.
-        p.kill()
-        out, _ = p.communicate()
-        killed_cleanly = False
-    out = strip_ansi(out)
+            p.stdin.write(f"launch {RAMFS_PATH}\n"); p.stdin.flush()
+            time.sleep(2.5)
+            p.stdin.write("\x03"); p.stdin.flush()
+            time.sleep(0.5)
+            try:
+                p.stdin.write("exit\n"); p.stdin.flush()
+            except (BrokenPipeError, OSError):
+                pass
+            out, _ = p.communicate(timeout=20)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            out, _ = p.communicate()
+            killed_cleanly = False
+        out = strip_ansi(out)
 
-    if not killed_cleanly:
-        print("FAIL: launch session did not end after Ctrl-C")
-        print(f"  stdout tail: {out[-400:]}")
-        return 1
-    if "tick" not in out:
-        print("FAIL: spin produced no output - did it run?")
-        print(f"  stdout: {out[:400]}")
-        return 1
-    ticks = out.count("tick")
-    print(f"  spin ran ({ticks} ticks seen), then Ctrl-C sent")
-    # Note: the host CLI stops reading the moment it forwards 0x03, so the
-    # device's "^C aborted" line isn't captured here - the proof the kill worked
-    # is below: the device is responsive again AND the heap is fully reclaimed.
-    # (A failed kill would leave the CLI task stuck in the stream loop, so the
-    #  following `free` would get no response and read_free() would return None.)
+        if not killed_cleanly:
+            print("FAIL: launch session did not end after Ctrl-C")
+            print(f"  stdout tail: {out[-400:]}")
+            return 1
+        if "tick" not in out:
+            print("FAIL: spin produced no output - did it run?")
+            print(f"  stdout: {out[:400]}")
+            return 1
+        print(f"  spin ran ({out.count('tick')} ticks seen), then Ctrl-C sent")
 
-    after = read_free(cdc_port)
-    if after is None:
-        print("FAIL: device unresponsive after Ctrl-C (kill did not return to CLI)")
-        return 1
-    print(f"  device responsive after kill; free: {after} B (baseline {baseline})")
+        after = read_free(cdc_port)
+        if after is None:
+            print("FAIL: device unresponsive after Ctrl-C (kill did not return to CLI)")
+            return 1
+        post_kill.append(after)
+        print(f"  post-kill resting heap: {after} B")
 
     cli(cdc_port, f"rm {RAMFS_PATH}\nexit\n", timeout=60)
-
-    if after != baseline:
-        print(f"FAIL: kill did not fully reclaim - {baseline - after} B unreturned")
+    if post_kill[1] != post_kill[0]:
+        print(f"FAIL: kill heap drift: {post_kill}")
         return 1
 
-    print("  Ctrl-C stopped the app and reclaimed all its memory")
+    print("  Ctrl-C stopped the app; post-kill heap is stable across runs")
     print("PASS")
     return 0
 

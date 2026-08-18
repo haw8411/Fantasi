@@ -11,8 +11,10 @@
 #include "ble.h"
 #include "ble_serial.h"
 #include "display.h"
+#include "power.h"
 #include "../../core/cli.h"
 #include "../../hal/hal.h"
+#include "../../hal/hal_power.h"
 #include "stm32wbxx.h"
 #include "FreeRTOS.h"
 #include "task.h"
@@ -362,7 +364,7 @@ static inline void ipcc_mask_tx(uint32_t ch)
 /* ------------------------------------------------------------------ */
 
 /* CPU1-private staging queue for buffers waiting to be handed back to CPU2.
- * The shared free_buf_queue is drained by CPU2; CPU1 must NOT insert into it
+ * The shared free_buf_queue is drained by CPU2; CPU1 must not insert into it
  * while CPU2 is draining (MM channel still active) or the unsynchronised list
  * corrupts and event buffers leak - after ~31 events the WS event pool is
  * exhausted and CPU2 silently stops delivering RX writes (the upload stall).
@@ -424,7 +426,7 @@ static void handle_sys_evt(void)
     portYIELD_FROM_ISR(woken);
 }
 
-/* Notification sizing: the WS sends a GATT notification as ONE LL packet (no
+/* Notification sizing: the WS sends a GATT notification as one LL packet (no
  * fragmentation), so the value must fit in the negotiated data length:
  *   value ≤ MaxTxOctets - 4 (L2CAP) - 3 (ATT) , and also ≤ ATT_MTU - 3.
  * Track both the negotiated ATT MTU and TX data length and feed the smaller to
@@ -506,6 +508,7 @@ static void handle_connection_complete(const uint8_t *p, uint8_t len,
     s_att_mtu = 23;
     s_dle_tx  = 27;
     if (status == 0) {
+        pwr_inhibit_enter(PWR_CLIENT_BLE_LINK);   /* atomic - ISR-safe */
         for (int i = 0; i < BLE_MAX_CONN; i++) {
             if (!ble_conns[i].active) {
                 ble_conns[i].handle    = handle;
@@ -519,14 +522,12 @@ static void handle_connection_complete(const uint8_t *p, uint8_t len,
          * context from ble_serial_poll - hci_send can't run from here). */
         ble_serial_on_connect(handle);
     } else {
-        /* Connection attempt FAILED/aborted (status != 0) - e.g. the central
+        /* Connection attempt failed/aborted (status != 0) - e.g. the central
          * aborted pairing (le-connection-abort-by-local). The peripheral
          * already stopped advertising the instant it received CONNECT_IND, but
          * no usable link exists and no HCI_DISCONNECTION_COMPLETE will follow,
          * so handle_disconnection() never runs. Without restarting advertising
-         * here, the device would stay silent (un-discoverable) until reboot.
-         * Regression risk: handling only the success path leaves the device
-         * dark after any aborted connection attempt. */
+         * here, the device would stay silent (un-discoverable) until reboot. */
         adv_restart_needed = true;
         if (adv_timer)
             xTimerStartFromISR(adv_timer, woken);
@@ -550,6 +551,7 @@ static void handle_disconnection(const uint8_t *p, uint8_t len,
     for (int i = 0; i < BLE_MAX_CONN; i++) {
         if (ble_conns[i].active && ble_conns[i].handle == handle) {
             ble_conns[i].active = false;
+            pwr_inhibit_exit(PWR_CLIENT_BLE_LINK);   /* atomic - ISR-safe */
             break;
         }
     }
@@ -721,6 +723,8 @@ static void handle_ble_evt(void)
         mm_return_evt(evt);
     }
     ipcc_c1_clear_flag(IPCC_CH_BLE);
+    /* Wake the BLE proto task: it blocks in ble_serial_wait between events. */
+    ble_serial_wake_from_isr(&woken);
     portYIELD_FROM_ISR(woken);
 }
 
@@ -761,6 +765,11 @@ void HSEM_IRQHandler(void)
 
 static int shci_send(uint16_t opcode, const void *params, uint8_t plen)
 {
+    /* Vote out of deep sleep for the whole CPU2 round-trip: sleeping between
+     * command and response risks a missed/misordered SHCI handshake. Phase A
+     * never deep-sleeps, but the vote makes Phase B safe. */
+    pwr_inhibit_enter(PWR_CLIENT_SD_OP);
+
     sys_cmd_buf.type    = TL_SYSCMD_PKT;
     sys_cmd_buf.cmdcode = opcode;
     sys_cmd_buf.plen    = plen;
@@ -773,10 +782,13 @@ static int shci_send(uint16_t opcode, const void *params, uint8_t plen)
     /* Wait up to 33 seconds for CPU2 to process the command. */
     TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(33000);
     while (ipcc_c1_flag_active(IPCC_CH_SYS)) {
-        if (xTaskGetTickCount() >= deadline)
+        if (xTaskGetTickCount() >= deadline) {
+            pwr_inhibit_exit(PWR_CLIENT_SD_OP);
             return -2;
+        }
         taskYIELD();
     }
+    pwr_inhibit_exit(PWR_CLIENT_SD_OP);
 
     uint8_t *rsp = (uint8_t *)&sys_cmd_buf + sizeof(list_node_t);
     /* rsp: [type][evtcode=0x0E][plen][numcmd][cmdcode_lo][cmdcode_hi][status] */
@@ -998,7 +1010,7 @@ bool ble_init(void)
         if (PWR->SR2 & PWR_SR2_SMPSF) break;
 
     /* ---------- HSE (32 MHz) + LSE (32.768 kHz) ---------- */
-    /* Capacitor tuning MUST be set before HSE enable (Flipper hw = 0x26) */
+    /* Capacitor tuning must be set before HSE enable (Flipper hw = 0x26) */
     RCC->HSECR = (RCC->HSECR & ~RCC_HSECR_HSETUNE_Msk)
                | (0x26U << RCC_HSECR_HSETUNE_Pos);
     RCC->CR |= RCC_CR_HSEON;
@@ -1105,7 +1117,7 @@ c2_ok:
     uint8_t txpow[] = { 0x01, 0x19 };
     hci_send(0xFC0F, txpow, sizeof(txpow));
 
-    /* GATT Init (0xFD01) - MUST be called before GAP Init */
+    /* GATT Init (0xFD01) - must be called before GAP Init */
     rc = hci_send(0xFD01, NULL, 0);
     if (rc != 0) { cli_printf("ble: gatt_init rc=%d\r\n", rc); goto fail; }
 
@@ -1118,9 +1130,9 @@ c2_ok:
 
     /* Set default security for incoming connections (peripheral role).
      * DISPLAY_ONLY forces Passkey Entry: the device generates and displays a
-     * random 6-digit passkey that the peer MUST enter - there is no path that
+     * random 6-digit passkey that the peer must enter - there is no path that
      * grants access without proving knowledge of that code. DISPLAY_YES_NO must
-     * NOT be used here: it negotiates Numeric Comparison, whose MITM protection
+     * not be used here: it negotiates Numeric Comparison, whose MITM protection
      * relies on a human comparing the two displayed numbers and confirming on
      * the device. A headless device cannot do that meaningfully, and any
      * auto-confirm would let an attacker bond (and reach the CLI/file service)
@@ -1174,9 +1186,14 @@ static void ble_start_background_adv(void)
     uint8_t name_field_len = nlen + 1;
     uint8_t p[13 + 29];
     uint8_t plen = 13 + name_field_len;
+    /* Idle power policy: 160-320 ms while in use, 1000-1200 ms when idle
+     * (~6x less radio duty; discovery still works, any activity restores
+     * the fast interval via ble_adv_refresh). Units: 0.625 ms. */
+    uint16_t adv_min = fz_power_adv_slow() ? 0x0640 : 0x0100;
+    uint16_t adv_max = fz_power_adv_slow() ? 0x0780 : 0x0200;
     p[0] = 0x00;                   /* ADV_IND */
-    p[1] = 0x00; p[2] = 0x01;     /* adv_interval_min = 0x0100 (160 ms) */
-    p[3] = 0x00; p[4] = 0x02;     /* adv_interval_max = 0x0200 (320 ms) */
+    p[1] = (uint8_t)adv_min; p[2] = (uint8_t)(adv_min >> 8);
+    p[3] = (uint8_t)adv_max; p[4] = (uint8_t)(adv_max >> 8);
     p[5] = 0x00;                   /* own_addr_type */
     p[6] = 0x00;
     p[7] = name_field_len;
@@ -1188,7 +1205,7 @@ static void ble_start_background_adv(void)
     p[off+3] = 0x00; p[off+4] = 0x00;
 
     /* Clear any stale GAP advertising state first (harmless / ignored if not
-     * advertising), then (re)start. The result MUST be checked: right after a
+     * advertising), then (re)start. The result must be checked: right after a
      * disconnect the stack may still be finishing teardown and SET_DISCOVERABLE
      * returns an error. Clearing adv_restart_needed unconditionally would then
      * leave the device silently non-advertising - never connectable again until
@@ -1197,6 +1214,18 @@ static void ble_start_background_adv(void)
     hci_send(ACI_GAP_SET_NON_DISCOVERABLE, NULL, 0);
     int rc = hci_send(ACI_GAP_SET_DISCOVERABLE, p, plen);
     adv_restart_needed = (rc != 0);
+}
+
+/* Idle-policy hook (platforms/flipper/power.c, timer-task context): re-issue
+ * background advertising so the interval matches the current idle state.
+ * With a link up the caller skips this - the new interval applies on the
+ * next advertising restart after disconnect. */
+void ble_adv_refresh(void)
+{
+    if (ble_state != BLE_READY) return;
+    for (int i = 0; i < BLE_MAX_CONN; i++)
+        if (ble_conns[i].active) return;
+    ble_start_background_adv();
 }
 
 void ble_shutdown(void)
@@ -1218,10 +1247,10 @@ bool ble_is_active(void)
     return ble_state == BLE_READY;
 }
 
-/* CPU2 (the wireless coprocessor) is RUNNING and can touch the shared flash bus
+/* CPU2 (the wireless coprocessor) is running and can touch the shared flash bus
  * whenever it has been started - which is both BLE_READY (advertising/connected)
- * AND BLE_DISABLED (`ble off` only stops advertising; it does NOT halt CPU2).
- * Flash writes must coordinate with CPU2 (SEM2/SEM7) in BOTH states, else an
+ * and BLE_DISABLED (`ble off` only stops advertising; it does not halt CPU2).
+ * Flash writes must coordinate with CPU2 (SEM2/SEM7) in both states, else an
  * uncoordinated write races CPU2 and corrupts a double-word. Only BLE_UNINIT
  * (pre-ble_init, e.g. boot-time mkfs) is truly CPU2-free. */
 bool ble_cpu2_running(void)
@@ -1332,7 +1361,7 @@ int ble_pair_setup_security(uint8_t io_cap)
         0x00,       /* keypress notifications off */
         0x07,       /* min encryption key size */
         0x10,       /* max encryption key size (16) */
-        0x01,       /* do NOT use fixed pin - request from app */
+        0x01,       /* do not use fixed pin - request from app */
         0x00, 0x00, 0x00, 0x00,  /* fixed pin (unused) */
         0x00,       /* public identity address */
     };

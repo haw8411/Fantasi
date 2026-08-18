@@ -37,6 +37,7 @@ typedef struct {
 
 bool     ble_init(void);
 void     ble_shutdown(void);
+void     ble_adv_refresh(void);   /* re-issue background adv at the idle-policy interval */
 bool     ble_is_active(void);
 bool     ble_cpu2_running(void);
 int      ble_flash_erase_activity(int on);

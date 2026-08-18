@@ -408,9 +408,37 @@ const char *fat_path(const char *vpath)
     return host;
 }
 
+static bool fat_scsi_sync(const char *blk)
+{
+    int fd = open(blk, O_RDWR | O_NONBLOCK);
+    if (fd < 0) return false;
+
+    unsigned char cdb[10] = { 0x35 };       /* SYNCHRONIZE CACHE(10) */
+    unsigned char sense[32] = { 0 };
+    sg_io_hdr_t io;
+    memset(&io, 0, sizeof io);
+    io.interface_id = 'S';
+    io.dxfer_direction = SG_DXFER_NONE;
+    io.cmdp = cdb;
+    io.cmd_len = sizeof cdb;
+    io.sbp = sense;
+    io.mx_sb_len = sizeof sense;
+    io.timeout = 5000;
+
+    int rc = ioctl(fd, SG_IO, &io);
+    bool ok = rc == 0 && (io.info & SG_INFO_OK_MASK) == SG_INFO_OK;
+    int sync_errno = rc < 0 ? errno : EIO;
+    close(fd);
+    if (!ok) errno = sync_errno;
+    return ok;
+}
+
 void fat_sync(void)
 {
-    if (g_mnt[0]) sync();
+    if (!g_mnt[0]) return;
+    sync();
+    if (!fat_scsi_sync(g_blk))
+        fprintf(stderr, "device filesystem sync failed: %s\n", strerror(errno));
 }
 
 /* ---- Command dispatch ---- */
@@ -1416,7 +1444,6 @@ int main(int argc, char **argv)
     bool force_usb = false;
     bool force_serial = false;
     const char *oneshot = NULL;              /* -c: run this one command, then exit (no history) */
-    (void)force_usb;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) { oneshot = argv[++i]; continue; }
         if (strncmp(argv[i], "/dev/tty", 8) == 0)
@@ -1447,15 +1474,15 @@ int main(int argc, char **argv)
         }
 #endif
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
-            printf("usage: fantasi [--ble[=ADDR]] [--usb|--serial] [--name NAME] [-c <command>] [/dev/ttyACMx] [/dev/sdX]\n");
+            printf("usage: fantasi [--ble[=ADDR]|--usb|--serial] [--name NAME] [-c <command>] [/dev/ttyACMx] [/dev/sdX]\n");
             printf("  --name NAME   select a specific device by name (see `whoami`) when several are connected;\n");
             printf("                works over USB and BLE\n");
             return 0;
         }
     }
 
-    if (force_serial && force_usb) {
-        fprintf(stderr, "--serial and --usb are mutually exclusive\n");
+    if ((int)force_serial + (int)force_usb + (int)force_ble > 1) {
+        fprintf(stderr, "--serial, --usb, and --ble are mutually exclusive\n");
         return 1;
     }
 
@@ -1476,25 +1503,27 @@ int main(int argc, char **argv)
         if (!find_fantasi_device(g_ser_path, sizeof(g_ser_path),
                                  blk_path[0] ? NULL : blk_path,
                                  sizeof(blk_path))) {
+            bool connected = false;
 #ifdef HAS_USB_VENDOR
-            /* No CDC serial found - a switch-mode device (PM3) already in WebUSB
-               mode exposes only the vendor interface; connect to it directly. */
-            if (!connect_webusb_direct())
+            /* No CDC serial found - a switch-mode device (PM3) already in WebUSB mode
+               exposes only the vendor interface; connect to it directly. --serial stays
+               on the CDC path and never touches the vendor pipe. */
+            if (!force_serial) connected = connect_webusb_direct();
 #endif
-            {
 #ifdef HAS_PROTO
-            if (ble_transport_open() == 0) {
+            /* BLE is an auto-detect fallback only: --usb (WebUSB only) and --serial
+               (serial only) never reach it. */
+            if (!connected && !force_usb && !force_serial && ble_transport_open() == 0) {
                 use_ble = true;
                 ser_connected = true;
                 printf("transport: BLE\n");
-            } else {
-                fprintf(stderr, "no Fantasi device found (USB or BLE)\n");
-                return 1;
+                connected = true;
             }
-#else
-            fprintf(stderr, "no Fantasi device found\n");
-            return 1;
 #endif
+            if (!connected) {
+                fprintf(stderr, "no Fantasi device found (%s)\n",
+                        force_usb ? "USB" : force_serial ? "serial" : "USB or BLE");
+                return 1;
             }
         }
     }
@@ -1527,8 +1556,8 @@ int main(int argc, char **argv)
          * can't be opened. --usb makes a failure a hard error; --serial opts out
          * of the upgrade entirely and stays on this CDC + MSC path (e.g. to leave
          * the vendor interface free for a second, independent channel). */
-        if (!force_serial)
-            try_webusb_upgrade(force_usb);
+        if (!force_serial && !try_webusb_upgrade(force_usb) && force_usb)
+            return 1;                    /* --usb is WebUSB only: no silent serial fallback */
 #endif
 
         /* Legacy MSC file path (serial transport only). The block device is mounted

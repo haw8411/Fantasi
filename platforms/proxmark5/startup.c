@@ -368,12 +368,27 @@ static void pm5_board_power_latch(void)
     gpio_set_mode (GPIOC, PM5_LED_A_PIN, GPIO_MODE_OUTPUT);
 }
 
+static void pm5_stop_dfu_latch_refresh(void)
+{
+    if (CRM->APB1EN & CRM_APB1EN_TMR7EN) {
+        TMR7->CTRL1 &= ~TMR_CTRL1_TMREN;
+        TMR7->IDEN &= ~TMR_IDEN_OVFDEN;
+        CRM->APB1EN &= ~CRM_APB1EN_TMR7EN;
+    }
+    if (CRM->AHBEN1 & CRM_AHBEN1_DMA1EN) {
+        DMA1->CH[0].CTRL &= ~DMA_CTRL_CHEN;
+        DMA1->CLR = DMA_CLR_CH1;
+        CRM->AHBEN1 &= ~CRM_AHBEN1_DMA1EN;
+    }
+}
+
 __attribute__((noreturn))
 void Reset_Handler(void)
 {
     pm5_board_power_latch();   /* hold PB0 before anything else, or the board powers off */
+    pm5_stop_dfu_latch_refresh();
 
-    /* Point VTOR at our table. After a DFU `:leave` the CPU may still have
+    /* Point VTOR at our table. After a ROM DFU jump the CPU may still have
      * VTOR at the ROM bootloader base; without this write every exception
      * (SVC, PendSV, SysTick, any IRQ) would vector into the ROM's handlers.
      * VTOR is at 0xE000ED08; bits 31:7 are the table base, so the table must

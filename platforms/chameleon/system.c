@@ -2,9 +2,9 @@
  *
  * The nRF52840 needs HFCLK from the external 32 MHz XTAL for the USB
  * peripheral to be spec-compliant; the internal RC isn't precise
- * enough. The DCDC regulator is left in default LDO mode - DCDC gives
- * better power efficiency but requires the external inductors, which
- * are present on the Chameleon but aren't needed for USB operation.
+ * enough. The DCDC regulator is enabled (the Chameleon has the external
+ * inductors; stock also runs DCDC) - it roughly halves active current
+ * vs the LDO default.
  *
  * FPU is enabled for the Cortex-M4F port. SystemCoreClock is fixed at
  * 64 MHz (nRF52840 runs core at a fixed 64 MHz - no PLL to configure). */
@@ -18,6 +18,12 @@ void SystemInit(void)
 {
     SCB->CPACR |= ((3U << (10*2)) | (3U << (11*2)));
     __DSB(); __ISB();
+
+    /* DCDC regulator: left in LDO mode. Empirically, enabling DCDC here (raw
+     * DCDCEN pre-SD, with or without sd_power_dcdc_mode_set post-SD) stalls
+     * boot on this board even though stock runs DCDC - stock only ever sets it
+     * through the SD SVC after SoftDevice init. Halving active current this
+     * way is future work. */
 
     /* Disable the hardware APPROTECT enforcement introduced on post-2021
      * nRF52840 silicon (revision E and later, build codes QIAA-E*).

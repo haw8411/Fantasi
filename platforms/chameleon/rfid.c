@@ -11,6 +11,7 @@
  *   CS=P1.06 MISO=P0.11 MOSI=P1.07 SCK=P1.04  HF_ANT_SEL=P1.10  READER_POWER=P1.15
  */
 #include "nrf.h"
+#include "ble.h"
 #include "../../hal/hal_rfid.h"
 #include "../../core/vfs.h"
 
@@ -625,15 +626,18 @@ int hal_rfid_hf_sniff(const char *dump_path, uint32_t timeout_ms)
     char *txt = pvPortMalloc((size_t)cap);        /* heap only for the sniff's duration (idle-RAM discipline) */
     if (!txt) return RFID_ERR_UNSUPP;
 
+    /* S140 owns CLOCK while BLE is enabled. A direct TASKS_HFCLKSTART write is
+     * trapped as APP_MEMACC, so acquire the crystal through the SoftDevice. */
+    if (!cu_hfclk_request()) {
+        vPortFree(txt);
+        return RFID_ERR_UNSUPP;
+    }
+
     /* ---- both receivers on the coil, passive ---- */
     pin_out(PIN_HF_ANTSEL, 1);                    /* route the shared antenna to the NFCT tap (was reader-only) */
     pin_out(PIN_RDR_POWER, 1);                    /* Ci522 alive (already on in HF_READER) */
     rc522_reset();
     vTaskDelay(pdMS_TO_TICKS(60));
-    NRF_CLOCK->EVENTS_HFCLKSTARTED = 0;
-    NRF_CLOCK->TASKS_HFCLKSTART = 1;
-    for (uint32_t g = 0; g < 200000 && !NRF_CLOCK->EVENTS_HFCLKSTARTED; g++) { }
-
     /* Ci522 -> passive card RX. Operating point picked by an on-device sweep vs a pm3 reading a tag (bad-frame
      * rate ~17% -> ~4%): RxModeReg=0x0E is the big win - RxMultiple(bit3)=1 makes the receiver delimit frames
      * properly (free-running byte-drain otherwise glued leading Miller-pause noise onto each response); RxCRCEn
@@ -770,6 +774,7 @@ int hal_rfid_hf_sniff(const char *dump_path, uint32_t timeout_ms)
     pin_out(PIN_HF_ANTSEL, 0);
 
     if (valid == 0) {                             /* silent window: clear the file so the app doesn't reprint a stale trace */
+        cu_hfclk_release();
         vPortFree(txt);
         vfs_write_file(dump_path, "", 0);
         return RFID_ERR_TIMEOUT;
@@ -785,6 +790,7 @@ int hal_rfid_hf_sniff(const char *dump_path, uint32_t timeout_ms)
     int hl = snprintf(h, sizeof h, "L9 v%d p1000\n", valid);
     memcpy(txt + (FSTART - hl), h, (size_t)hl);
     vfs_write_file(dump_path, txt + (FSTART - hl), (uint32_t)(pos - (FSTART - hl)));
+    cu_hfclk_release();
     vPortFree(txt);
     return valid;
 }

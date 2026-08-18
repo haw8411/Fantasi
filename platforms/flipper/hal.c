@@ -14,6 +14,8 @@
 #include "../../hal/hal_name.h"
 #include "ble.h"
 #include "display.h"
+#include "power.h"
+#include "../../hal/hal_power.h"
 #include "hal_storage.h"
 #include "flash_storage.h"
 #include "lfs.h"
@@ -100,6 +102,40 @@ static uint16_t i2c_read_reg16(uint8_t addr, uint8_t reg)
     return (uint16_t)hi << 8 | lo;
 }
 
+static uint8_t i2c_read_reg8(uint8_t addr, uint8_t reg)
+{
+    I2C1->ICR = I2C_ICR_STOPCF | I2C_ICR_NACKCF;
+
+    I2C1->CR2 = addr
+              | (1U << I2C_CR2_NBYTES_Pos)
+              | I2C_CR2_START_Msk;
+    I2C_WAIT(I2C1->ISR & (I2C_ISR_TXIS | I2C_ISR_NACKF));
+    if (I2C1->ISR & I2C_ISR_NACKF) { I2C1->ICR = I2C_ICR_NACKCF; return 0; }
+    I2C1->TXDR = reg;
+    I2C_WAIT(I2C1->ISR & I2C_ISR_TC);
+
+    I2C1->CR2 = addr
+              | I2C_CR2_RD_WRN_Msk
+              | (1U << I2C_CR2_NBYTES_Pos)
+              | I2C_CR2_AUTOEND_Msk
+              | I2C_CR2_START_Msk;
+    I2C_WAIT(I2C1->ISR & I2C_ISR_RXNE);
+    uint8_t v = (uint8_t)I2C1->RXDR;
+    I2C_WAIT(I2C1->ISR & I2C_ISR_STOPF);
+    I2C1->ICR = I2C_ICR_STOPCF;
+    return v;
+}
+
+/* BQ25896 charger, 7-bit 0x6B. REG11 bit7 = VBUS_GD ("VBUS good"): the only
+ * VBUS presence source on this board (the WB55 USB core cannot sense VBUS).
+ * Polled by the idle-policy timer to gate Stop 2 to battery operation. */
+#define BQ25896_ADDR 0xD6U   /* 8-bit address */
+
+bool fz_hal_vbus_present(void)
+{
+    return (i2c_read_reg8(BQ25896_ADDR, 0x11) & 0x80U) != 0;
+}
+
 static void lp5562_init(void)
 {
     i2c_write_reg(LP5562_ADDR, 0x0D, 0xFF);
@@ -126,7 +162,7 @@ static bool splash_loaded;
  * then skips its periodic status/splash redraw so it can't paint over them.
  * A counter, not a flag, because holds nest - the GUI keeps the display for
  * as long as its menu is open, and app_run acquires again on top of that for
- * an app launched from the menu (its release must NOT repaint the splash
+ * an app launched from the menu (its release must not repaint the splash
  * then; the menu redraws itself). */
 static volatile int display_owners;
 
@@ -171,7 +207,7 @@ static void display_refresh(void)
 
 #ifdef FANTASI_ENABLE_APPS
 /* app_run.c (and the GUI menu) bracket screen use with these so our periodic
- * redraw yields the screen; the splash returns when the LAST holder lets go. */
+ * redraw yields the screen; the splash returns when the last holder lets go. */
 void hal_app_display_acquire(void)
 {
     taskENTER_CRITICAL();
@@ -250,6 +286,10 @@ void hal_init(void)
     NVIC_EnableIRQ(USB_LP_IRQn);
     NVIC_EnableIRQ(USB_HP_IRQn);
 
+    /* Sleep governance: reset forensics + idle-policy timer (Phase A is
+     * WFI-only / CPU2-safe; see platforms/flipper/power.c). */
+    fz_power_init();
+
     hal_storage_init();
 
     /* Apply the USB interface toggles before USB comes up so the device
@@ -297,6 +337,8 @@ void hal_init(void)
 
 void hal_post_init(void)
 {
+    fz_power_boot_log();   /* previous boot's reset flags + crash fingerprint */
+
     char v[4] = "1";
     hal_settings_get("ble", v, sizeof(v));
     if (v[0] == '0') return;
@@ -639,16 +681,38 @@ int hal_test_regions(hal_test_region_t *out, int max)
 
 #define BACKLIGHT_TIMEOUT_MS  60000
 #define DISPLAY_REFRESH_MS    30000
-#define LP5562_REG_W_PWM     0x0E
+#define LP5562_REG_B_PWM     0x02   /* blue notification LED */
+#define LP5562_REG_W_PWM     0x0E   /* white LCD backlight   */
 
 /* Button pins:
  *   UP=PB10  DOWN=PC6  LEFT=PB11  RIGHT=PB12  BACK=PC13  OK=PH3
- * All active-LOW with pull-up except OK which is active-HIGH pull-down. */
+ * All active-low with pull-up except OK which is active-high pull-down. */
 #define BTN_EXTI_MASK  ((1U<<3)|(1U<<6)|(1U<<10)|(1U<<11)|(1U<<12)|(1U<<13))
 
 static void backlight_set(uint8_t val)
 {
     i2c_write_reg(LP5562_ADDR, LP5562_REG_W_PWM, val);
+}
+
+/* The blue notification LED tracks the backlight (both lit in use, both fade
+ * on idle) - the Flipper analog of the CU's idle LED fade. */
+static void notif_led_set(uint8_t val)
+{
+    i2c_write_reg(LP5562_ADDR, LP5562_REG_B_PWM, val);
+}
+
+/* Smooth idle fade of the backlight + blue LED down to off over ~600 ms,
+ * like cu_leds_fade_out. The display panel stays on. Paced by vTaskDelay so
+ * the core idles between steps. */
+static void backlight_fade_out(void)
+{
+    for (int v = 240; v >= 0; v -= 10) {
+        backlight_set((uint8_t)v);
+        notif_led_set((uint8_t)v);
+        vTaskDelay(pdMS_TO_TICKS(25));
+    }
+    backlight_set(0);
+    notif_led_set(0);
 }
 
 static void buttons_init(void)
@@ -685,7 +749,7 @@ static void buttons_init(void)
     SYSCFG->EXTICR[3] = (SYSCFG->EXTICR[3] & ~(SYSCFG_EXTICR4_EXTI12 | SYSCFG_EXTICR4_EXTI13))
                        | SYSCFG_EXTICR4_EXTI12_PB | SYSCFG_EXTICR4_EXTI13_PC;
 
-    /* Falling edge for active-LOW buttons, rising edge for OK. */
+    /* Falling edge for active-low buttons, rising edge for OK. */
     EXTI->FTSR1 |= (1U<<6)|(1U<<10)|(1U<<11)|(1U<<12)|(1U<<13);
     EXTI->RTSR1 |= (1U<<3);
 
@@ -730,11 +794,14 @@ static void backlight_task(void *arg)
 
         if (got == pdTRUE) {
             off_at = now + pdMS_TO_TICKS(BACKLIGHT_TIMEOUT_MS);
-            if (!bl_lit) { backlight_set(0xFF); bl_lit = true; }
+            if (!bl_lit) { backlight_set(0xFF); notif_led_set(0xFF); bl_lit = true; }
         }
 
         if (bl_lit && (int32_t)(now - off_at) >= 0) {
-            backlight_set(0);
+            /* Fade the backlight down smoothly on timeout (like the CU LED
+             * fade), rather than snapping to 0. The display panel stays on -
+             * only the backlight dims. A press brings it straight back. */
+            backlight_fade_out();
             bl_lit = false;
         }
 
@@ -748,6 +815,9 @@ static void backlight_task(void *arg)
 static void button_irq_common(uint32_t btn_mask)
 {
     BaseType_t woken = pdFALSE;
+    /* Wake hal_button_wait blockers (pwr button task) + note user activity
+     * for the idle policy (restores fast advertising). */
+    fz_power_buttons_wake(&woken);
     if (bl_task_handle)
         xTaskNotifyFromISR(bl_task_handle, 1, eSetBits, &woken);
 #ifdef FANTASI_ENABLE_GUI
@@ -816,7 +886,7 @@ void hal_reboot_dfu(void)
  * Wake by holding BACK (wired to the PMIC /QON pin) or by plugging in USB.
  *
  * This path is Flipper hardware. The Kiisu reuses this HAL but has different
- * power hardware - no BQ25896 gating the system rail - so we must NOT blindly
+ * power hardware - no BQ25896 gating the system rail - so we must not blindly
  * write BATFET_DIS and spin forever waiting for a rail that never drops. Two
  * guards make this safe on any board:
  *   1. REG0B bit 1 ("RES") always reads 1 on a real BQ25896; if it's clear the

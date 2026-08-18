@@ -11,6 +11,7 @@
 
 #include "at32f435.h"
 #include "../../hal/hal.h"
+#include "../../hal/hal_rfid.h"
 #include "../../hal/hal_name.h"
 #include "hal_storage.h"
 #include "flash_storage.h"
@@ -56,6 +57,11 @@ void hal_init(void)
 
     /* Light the two antenna-board LEDs (HF + LF) as a board indicator. */
     pm5_ant_led(true, true);
+
+    /* Park the RF FPGA OFF. It self-loads its bitstream at power-on in a default
+     * mode that can leave the antenna field energized - a large idle draw nothing
+     * clears until the first RFID op. Force OFF now (also gates its 24 MHz clock). */
+    hal_rfid_set_mode(RFID_OFF);
 
     hal_storage_init();
 
@@ -240,7 +246,7 @@ void hal_set_dfu_magic(void) {}
  * held and the ROM DFU (2e3c:df11) enumerates normally. */
 
 /* GPIOB register image (CFGR..MUXH, offsets 0x00..0x24), source of truth in
- * flash. It is COPIED into SRAM (PM5_DFU_DMA_IMG) before the jump and the DMA
+ * flash. It is copied into SRAM (PM5_DFU_DMA_IMG) before the jump and the DMA
  * reads it from there - never from flash: DFU erases/programs bank1, during which
  * flash reads stall, so a flash source would starve the DMA mid-erase and drop
  * PB0. It also cannot live at the bottom of SRAM, where the Artery ROM places its
@@ -291,11 +297,17 @@ static void pm5_start_gpiob_refresh_dma(void)
 
 void hal_reboot_dfu(void)
 {
+    /* Full speed for the DFU trick: the TMR7->DMA1 refresh must re-establish PB0
+     * within ~1 us of the ROM's GPIOB reset (before the power-latch hold-up cap
+     * drains), and that rate scales with HCLK - the idle clock is too slow to
+     * hold PB0 and the board drops. No unboost; we don't return. */
+    pm5_clk_boost();
+
     /* Arm the self-repairing PB0 refresh, then jump to the ROM. The DMA must
      * outlive us so PB0 stays held through the ROM's GPIOB reset (see above). */
     pm5_start_gpiob_refresh_dma();
 
-    /* MINIMAL deinit: mask interrupts + SysTick only. Do not reset or clock-gate
+    /* Minimal deinit: mask interrupts + SysTick only. Do not reset or clock-gate
      * DMA1/TMR7/GPIOB/GPIOC or the refresh stops. */
     __disable_irq();
     for (int i = 0; i < 8; i++) { NVIC->ICER[i] = 0xFFFFFFFFu; NVIC->ICPR[i] = 0xFFFFFFFFu; }
@@ -372,6 +384,7 @@ int hal_ble_clear_bonds(void)
 #define PM5_HOLD_MS         600     /* min hold to count as a launch (like the PM3) */
 #define PM5_LAUNCH_MAX_MS   3000    /* release after this = no launch (DFU-intent hold) */
 #define PM5_DFU_HOLD_MS     6000    /* hold this long -> enter DFU */
+#define PM5_IDLE_FADE_MS    30000   /* fade all LEDs out after this much inactivity */
 
 static void pm5_led(uint32_t pin, bool on)
 {
@@ -386,6 +399,85 @@ static void pm5_leds_show(uint8_t slot)
     pm5_led(PM5_LED_C_PIN, slot & 4);
     pm5_led(PM5_LED_D_PIN, false);      /* D stays off; blue is the RGB LED */
 }
+
+/* ---- Idle LED fade (all 7 LEDs) ----
+ * Dim all seven like the CU/FZ. The blue RGB (I2C 0x48) has a brightness
+ * register and fades in hardware; the A/B/C (GPIOC) and HF/LF antenna pair
+ * (I2C 0x51) are on/off only and PWM'd. The PWM uses a short busy-wait, not
+ * vTaskDelay (1 ms grain caps at ~50 Hz, visibly flickering), to reach ~150 Hz.
+ * Busy-waiting at idle is safe here: no watchdog or power-lock refresh to
+ * starve. ~600 ms envelope. */
+static void pm5_udelay(uint32_t us)
+{
+    for (volatile uint32_t n = us * 48u; n; n--) { __asm volatile("nop"); }
+}
+
+/* PWM on/off time for a perceptually-even fade. Eye response is ~logarithmic,
+ * so the level is squared (~gamma-2) to spend most of the fade in the low-duty
+ * zone where dimming is visible. `pk` is the peak on-time (us) at full
+ * brightness; the period is held ~constant to keep the PWM frequency fixed. */
+#define PM5_FADE_PERIOD_US 2600u
+static void pm5_pwm_step(uint32_t lvl, uint32_t n, uint32_t pk,
+                         void (*set)(bool on, uint8_t sel), uint8_t sel, int reps)
+{
+    uint32_t on = pk * lvl * lvl / (n * n);          /* gamma ~2 */
+    uint32_t off = (on < PM5_FADE_PERIOD_US) ? PM5_FADE_PERIOD_US - on : 0u;
+    for (int p = 0; p < reps; p++) {
+        set(true, sel);  pm5_udelay(on);
+        set(false, sel); pm5_udelay(off);
+    }
+}
+static void pm5_set_ad(bool on, uint8_t sel)  { pm5_leds_show(on ? sel : 0); }
+
+static void pm5_leds_fade_out(uint8_t sel)
+{
+    /* Two phases. Separating them keeps the blue's slow I2C write from chopping
+     * the antenna PWM into ~40 Hz modulation.
+     *   Phase 1 - blue (hardware brightness ramp) + A/B/C (GPIO PWM).
+     *   Phase 2 - HF/LF antenna PWMs down continuously (~300 Hz), gamma-shaped. */
+    const int N = 32;
+    for (int lvl = N; lvl >= 0; lvl--) {                 /* phase 1: blue + A-D */
+        pm5_rgb_set(0, 0, (uint8_t)(200 * lvl * lvl / (N * N)));
+        pm5_pwm_step((uint32_t)lvl, N, 2500u, pm5_set_ad, sel, 4);
+    }
+    /* Phase 2 - antenna. Fast I2C (~240 kHz) shrinks the toggle; the PWM period
+     * grows as it dims (2.5 ms -> ~10 ms) so the fixed ~130 us write becomes a
+     * shrinking duty %, reaching ~1% (near black) before the final off. Low
+     * frequency at the dim end is invisible. On-time is gamma-shaped. */
+    pm5_i2c_set_fast(true);
+    for (int lvl = N; lvl >= 0; lvl--) {
+        uint32_t P  = 2500u + (uint32_t)(N - lvl) * 240u;        /* period grows */
+        uint32_t on = (uint32_t)((uint64_t)P * lvl * lvl / (N * N)); /* gamma ~2 */
+        uint32_t off = (on < P) ? P - on : 0u;
+        for (int p = 0; p < 3; p++) {
+            pm5_ant_led(true, true);  pm5_udelay(on);
+            pm5_ant_led(false, false); pm5_udelay(off);
+        }
+    }
+    pm5_i2c_set_fast(false);
+
+    pm5_ant_led(false, false);
+    pm5_leds_show(0);
+    pm5_rgb_set(0, 0, 0);
+}
+
+static void pm5_leds_restore(uint8_t sel)
+{
+    /* Re-light the blue. The RGB controller is a separate slow MCU; after the
+     * fade drives it to 0 a single write can silently fail (it ACKs the address
+     * but count/data don't land), so push the full sequence a few times. */
+    for (int i = 0; i < 4; i++) {
+        pm5_rgb_set(0, 0, 200);
+        vTaskDelay(pdMS_TO_TICKS(15));
+    }
+    pm5_ant_led(true, true);
+    pm5_leds_show(sel);
+}
+
+/* Last user/host activity (button, CLI command, proto frame). hal_power_activity
+ * overrides the weak core stub; the launcher uses it for the idle-fade timer. */
+static volatile TickType_t s_pm5_last_activity;
+void hal_power_activity(void) { s_pm5_last_activity = xTaskGetTickCount(); }
 
 static bool pm5_button_down(void)
 {
@@ -432,11 +524,50 @@ static void pm5_launcher_task(void *arg)
 
     int sel = 0;
     bool prev = false;
+    bool faded = false;
     TickType_t press_start = 0;
+    s_pm5_last_activity = xTaskGetTickCount();
+
+    /* Re-park the RF FPGA now that it has finished self-loading its bitstream.
+     * The early park in hal_init() can fire during the GW1N's config load and be
+     * ignored, leaving the carrier driving the antenna (a heat source `field
+     * status` hides - it reports OFF while the hardware field is on). Spaced
+     * retries guarantee one lands after the FPGA is ready. */
+    for (int i = 0; i < 4; i++) {
+        vTaskDelay(pdMS_TO_TICKS(150));
+        hal_rfid_set_mode(RFID_OFF);
+    }
 
     for (;;) {
         bool now = pm5_button_down();
         TickType_t t = xTaskGetTickCount();
+
+        hal_rfid_field_tick();   /* auto-park the RF carrier if left on + idle */
+
+        if (now) s_pm5_last_activity = t;   /* button counts as activity */
+
+        /* Idle-fade policy: after 30 s with no button or host activity, fade
+         * all seven LEDs out; any activity restores them. */
+        bool idle = (uint32_t)(t - s_pm5_last_activity) >= pdMS_TO_TICKS(PM5_IDLE_FADE_MS);
+        if (idle && !faded) {
+            /* The fade's PWM timing is busy-wait (pm5_udelay) calibrated for
+             * 288 MHz; boost so it runs at speed even though we idle at 48. */
+            pm5_clk_boost();
+            pm5_leds_fade_out((uint8_t)sel);
+            pm5_clk_unboost();
+            faded = true;
+        } else if (!idle && faded) {
+            /* Woken (button/host): restore, and if a button press did the
+             * waking, consume it so it doesn't also advance the slot. */
+            faded = false;
+            pm5_clk_boost();
+            pm5_leds_restore((uint8_t)sel);
+            pm5_clk_unboost();
+            while (pm5_button_down()) vTaskDelay(pdMS_TO_TICKS(20));
+            prev = false;
+            continue;
+        }
+        if (faded) { vTaskDelay(pdMS_TO_TICKS(100)); continue; }   /* dark: poll slowly */
 
         if (now && !prev) press_start = t;                             /* press edge */
 

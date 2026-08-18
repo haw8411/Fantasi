@@ -42,12 +42,6 @@ PLATFORMS = {
         "dfu_pid": "df11",
         "msc_mode": "composite",
         "app_arch": "cm4",
-        # The AT32 ROM DFU can't hand control back to the app over USB the way the
-        # Flipper's STM32 ROM does: `:leave` is a full system reset that wipes the
-        # GPIOB-refresh DMA holding the PB0 power-latch, so the board powers off in
-        # the ROM's post-reset boot window and needs a manual BOOT0-low power-cycle.
-        # Tests that reflash and expect the app to re-enumerate unattended must skip.
-        "no_auto_dfu_return": True,
     },
 }
 
@@ -244,5 +238,4 @@ def send_serial_cmd(port, cmd, timeout=2):
         and "CLI ready" not in l
     ]
     return "\n".join(lines)
-
 

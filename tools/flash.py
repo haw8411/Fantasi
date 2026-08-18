@@ -72,8 +72,8 @@ PLATFORMS = {
     },
     # Proxmark5 (AT32F435). USB is composite (CDC+MSC+HID+vendor). Reboot-to-DFU
     # jumps to the AT32 ROM system bootloader, which enumerates as an Artery USB
-    # DFU device (2e3c:df11) and flashes internal flash at 0x08000000 - the same
-    # dfu-util flow as the Flipper's STM32 ROM DFU. No device-side storage
+    # DFU device (2e3c:df11) and flashes internal flash at 0x08000000. Returning
+    # uses the Artery ROM's Jump command rather than STM's DfuSe leave. No storage
     # resources yet (the RFID FPGA gateware is a later phase), so has_storage is
     # False.
     "proxmark5": {
@@ -283,12 +283,24 @@ def prompt_platform(candidates):
                  "(OTP name field is not padding) and no terminal to prompt.\n"
                  "  Re-run with an explicit target, e.g. make PLATFORM=" + opts[0]
                  + " flash")
+    # Force TTY to be canonical
+    try:
+        fd = sys.stdin.fileno()
+        attrs = termios.tcgetattr(fd)
+        attrs[0] |= termios.ICRNL              # iflag: CR -> NL on input
+        attrs[3] |= termios.ICANON | termios.ECHO | termios.ISIG   # lflag
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+    except (termios.error, OSError):
+        pass
     while True:
         # Prompt on stderr so --detect's stdout stays a bare platform name
         # (the Makefile captures stdout as `plat`).
         print("DFU device is ambiguous - flash which platform? ["
               + "/".join(opts) + "]: ", end="", file=sys.stderr, flush=True)
-        ans = input().strip().lower()
+        line = sys.stdin.readline()
+        if line == "":                         # EOF (^D / closed stdin)
+            sys.exit("\nerror: no selection")
+        ans = line.strip().lower()
         if ans in opts:
             return ans
         print("  please type one of: " + ", ".join(opts), file=sys.stderr)
@@ -493,18 +505,66 @@ def flash_flipper(bin_path):
         sys.exit(1)
 
 
+def at32_dfu_jump(address=0x08000000):
+    try:
+        import usb.core
+        import usb.util
+    except ImportError:
+        sys.exit("error: pyusb is required to leave Proxmark5 DFU (pip install pyusb)")
+
+    dev = usb.core.find(idVendor=0x2E3C, idProduct=0xDF11)
+    if dev is None:
+        sys.exit("error: Proxmark5 DFU device disappeared before application jump")
+
+    cfg = dev.get_active_configuration()
+    intf = next((i for i in cfg
+                 if i.bInterfaceClass == 0xFE and i.bInterfaceSubClass == 1), None)
+    if intf is None:
+        sys.exit("error: Proxmark5 DFU interface not found")
+    inum = intf.bInterfaceNumber
+
+    try:
+        if dev.is_kernel_driver_active(inum):
+            dev.detach_kernel_driver(inum)
+    except (NotImplementedError, usb.core.USBError):
+        pass
+    usb.util.claim_interface(dev, inum)
+
+    payload = b"\x18" + address.to_bytes(4, "little")
+    try:
+        n = dev.ctrl_transfer(0x21, 0x01, 0, inum, payload, timeout=5000)
+        if n != len(payload):
+            sys.exit(f"error: Proxmark5 DFU accepted only {n}/{len(payload)} jump bytes")
+    except usb.core.USBError as exc:
+        try:
+            usb.util.dispose_resources(dev)
+        except usb.core.USBError:
+            pass
+        sys.exit(f"error: Proxmark5 DFU rejected application jump: {exc}")
+
+    try:
+        status = bytes(dev.ctrl_transfer(0xA1, 0x03, 0, inum, 6, timeout=5000))
+        if len(status) != 6 or status[0] != 0:
+            sys.exit(f"error: Proxmark5 DFU jump status {status.hex(' ')}")
+    except usb.core.USBError:
+        pass                         # ROM may jump before completing the status transfer
+    finally:
+        try:
+            usb.util.dispose_resources(dev)
+        except usb.core.USBError:
+            pass
+
+
 def flash_proxmark5(bin_path):
-    # AT32F435 ROM system bootloader (Artery USB DFU, 2e3c:df11), internal flash
-    # at 0x08000000 - same dfu-util flow as the Flipper's STM32 ROM DFU. The
-    # :leave sublet resets into the freshly flashed app; dfu-util often returns
-    # exit 74 there (device resets before the final get_status), which is fine.
     r = subprocess.run(
         ["dfu-util", "-a", "0", "-d", "2e3c:df11",
-         "-s", "0x08000000:leave", "-D", bin_path],
+         "-s", "0x08000000", "-D", bin_path],
     )
-    if r.returncode not in (0, 74):
+    if r.returncode != 0:
         sys.exit(r.returncode)
 
+    print("Returning to application...")
+    at32_dfu_jump()
     if not wait_for_usb(USB_VID, USB_PID, timeout=15):
         print("error: device did not re-enumerate after flashing - still in DFU?",
               file=sys.stderr)

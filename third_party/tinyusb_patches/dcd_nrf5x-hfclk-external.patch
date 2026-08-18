@@ -1,0 +1,26 @@
+diff --git a/src/portable/nordic/nrf5x/dcd_nrf5x.c b/src/portable/nordic/nrf5x/dcd_nrf5x.c
+index a63e442..7d7e11e 100644
+--- a/src/portable/nordic/nrf5x/dcd_nrf5x.c
++++ b/src/portable/nordic/nrf5x/dcd_nrf5x.c
+@@ -826,7 +826,13 @@ TU_ATTR_ALWAYS_INLINE static inline bool is_sd_enabled(void) {
+ }
+ #endif
+ 
++/* Weak hook: a platform whose SoftDevice owns and keeps the HFCLK running
++ * overrides this to return true, so this driver never touches NRF_CLOCK itself
++ * (the SD traps a direct NRF_CLOCK write as APP_MEMACC). Default: not external. */
++TU_ATTR_WEAK bool tud_nrf_hfclk_external(void) { return false; }
++
+ static bool hfclk_running(void) {
++  if ( tud_nrf_hfclk_external() ) return true;
+ #ifdef SOFTDEVICE_PRESENT
+   if ( is_sd_enabled() ) {
+     uint32_t is_running = 0;
+@@ -873,6 +879,7 @@ static void hfclk_disable(void) {
+   usb_clock_release();
+   return;
+ #else
++  if ( tud_nrf_hfclk_external() ) return;
+ 
+ #ifdef SOFTDEVICE_PRESENT
+   if ( is_sd_enabled() ) {

@@ -12,7 +12,7 @@ index 1582999..f059ddd 100644
 +     * "not cleared by bus reset" line, and neither tu_memclr (itf_num only) nor
 +     * tu_edpt_stream_clear (fifo only) resets it. So the 2nd enumeration of the vendor
 +     * config saw the interface still mounted, vendord_open found no free interface, and
-+     * SET_CONFIGURATION stalled — the CDC<->vendor switch stall on the 2nd+ switch. */
++     * SET_CONFIGURATION stalled - the CDC<->vendor switch stall on the 2nd+ switch. */
 +    p_itf->rx.stream.ep_addr = 0;
 +    p_itf->tx.stream.ep_addr = 0;
    }

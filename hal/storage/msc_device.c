@@ -91,8 +91,11 @@ bool tud_msc_start_stop_cb(uint8_t lun, uint8_t power_condition,
 }
 
 /* USB unplugged: the host can no longer mount the drive, so free the synthetic-FAT model. Runs on the usb
- * task (tud_task), same context as the MSC read/write callbacks, so it can't race a transfer. */
-void tud_umount_cb(void) { fatrd_release(); }
+ * task (tud_task), same context as the MSC read/write callbacks, so it can't race a transfer.
+ * usb_power_umount (hal/tinyusb/usb_power.c) releases the USB sleep-inhibitor vote; weak no-op
+ * for platforms that don't build the vote glue. */
+__attribute__((weak)) void usb_power_umount(void) {}
+void tud_umount_cb(void) { usb_power_umount(); fatrd_release(); }
 
 void tud_msc_write10_complete_cb(uint8_t lun)
 {

@@ -65,6 +65,8 @@ static void cmd_mv(const char *args)
     snprintf(from, sizeof from, "%s", fat_path(sp));
     if (rename(from, fat_path(dp)) != 0)
         fprintf(stderr, "mv: %s\n", strerror(errno));
+    else
+        fat_sync();
 }
 
 LOCAL_COMMAND_BLE("mv", "move/rename a file", cmd_mv, proto_cmd_mv);

@@ -24,6 +24,29 @@ size_t hal_serial_read(uint8_t *buf, size_t len)
     return (size_t)tud_cdc_read(buf, len);
 }
 
+/* ---- RX-event wait (overrides the poll-fallback weak in core/cli.c) ----
+ * The CLI task blocks here between commands instead of polling every 5 ms;
+ * tud_cdc_rx_cb (below, USB-task context) wakes it. Single waiter: the USB
+ * CDC serial has exactly one reader, the CLI task. */
+static volatile TaskHandle_t s_cdc_waiter;
+
+void hal_serial_wait(uint32_t timeout_ms)
+{
+    s_cdc_waiter = xTaskGetCurrentTaskHandle();
+    /* Re-check after registering: data that raced in between the caller's
+     * read() and here would otherwise sleep a full timeout. */
+    if (!tud_cdc_available())
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(timeout_ms));
+    s_cdc_waiter = NULL;
+}
+
+void tud_cdc_rx_cb(uint8_t itf)
+{
+    (void)itf;
+    TaskHandle_t t = s_cdc_waiter;
+    if (t) xTaskNotifyGive(t);
+}
+
 bool hal_serial_connected(void)
 {
     return tud_cdc_connected();
@@ -54,15 +77,15 @@ void platform_usb_task(void *arg)
 {
     (void)arg;
     for (;;) {
-        tud_task();
+        /* Block on TinyUSB's internal event queue (CFG_TUSB_OS=OPT_OS_FREERTOS;
+         * tud_int_handler wakes it) so the CPU idles between events. The 100 ms
+         * timeout only bounds the reenum-flag fallback below. */
+        tud_task_ext(100, false);
         if (s_reenum_req) {
             s_reenum_req = false;
             tud_disconnect();
             vTaskDelay(pdMS_TO_TICKS(300));
             tud_connect();
         }
-        /* Yield so lower-priority tasks (the CLI) can run. tud_task()
-         * is already event-driven internally. */
-        vTaskDelay(pdMS_TO_TICKS(1));
     }
 }

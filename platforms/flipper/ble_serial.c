@@ -263,7 +263,7 @@ size_t ble_serial_write(const uint8_t *buf, size_t len, void *ctx)
      * the WS notification pool is momentarily full mid-stream; wait for the
      * TX-pool-available event (0x0C16 → tx_sem) and retry so the byte stream
      * stays intact. Any other non-zero status (e.g. notifications not enabled
-     * because the peer never wrote the CCCD, or the link dropping) is NOT
+     * because the peer never wrote the CCCD, or the link dropping) is not
      * transient and must fail fast: retrying a permanent error forever would
      * block the proto task until the watchdog reset the device. */
     int rc = ble_hci_send(0xFD2C, cmd, (uint8_t)(12 + chunk));
@@ -287,6 +287,27 @@ size_t ble_serial_read(uint8_t *buf, size_t len, void *ctx)
 {
     (void)ctx;
     return xStreamBufferReceive(rx_stream, buf, len, 0);
+}
+
+/* Event-driven wait: the IPCC RX ISR (ble.c handle_ble_evt) wakes the proto
+ * task via ble_serial_wake_from_isr. The timeout bounds ble_serial_poll. */
+static volatile TaskHandle_t s_ble_waiter;
+
+void ble_serial_wait(uint32_t timeout_ms)
+{
+    s_ble_waiter = xTaskGetCurrentTaskHandle();
+    /* Re-check after registering: bytes/flags that raced in between the
+     * caller's read() and here must not sleep a full timeout. */
+    if (!(rx_stream && xStreamBufferBytesAvailable(rx_stream) > 0) &&
+        !conn_param_pending && !pair_pending)
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(timeout_ms));
+    s_ble_waiter = NULL;
+}
+
+void ble_serial_wake_from_isr(BaseType_t *woken)
+{
+    TaskHandle_t t = s_ble_waiter;
+    if (t) vTaskNotifyGiveFromISR(t, woken);
 }
 
 void ble_serial_poll(void)
@@ -316,7 +337,7 @@ void ble_serial_poll(void)
         ble_hci_send(0xFD81, cp, sizeof(cp));
 
         /* HCI LE Set Data Length (0x2022): request 251-byte LL payload so a
-         * full 244-byte ATT notification fits in ONE link-layer packet.
+         * full 244-byte ATT notification fits in one link-layer packet.
          * Without this the connection may negotiate a smaller data length and
          * the WS rejects a 244-byte notification with 0x60 (invalid handle) -
          * the max single-packet value is DLE_payload - 4 (L2CAP) - 3 (ATT). */
@@ -337,7 +358,7 @@ void ble_serial_poll(void)
         /* Numeric comparison request. The peripheral IO capability is
          * DISPLAY_ONLY (see ble.c), so the stack negotiates Passkey Entry and
          * this event must not occur. If it ever does (e.g. a peer/stack that
-         * forces Numeric Comparison), REJECT it - never auto-confirm. Blindly
+         * forces Numeric Comparison), reject it - never auto-confirm. Blindly
          * confirming would bond an unverified peer (no human compared the
          * codes) and expose the CLI/file service: a remote-code-execution risk.
          * Reply "no" (0x00) to ACI_GAP_NUMERIC_COMPARISON_VALUE_CONFIRM_YESNO. */
@@ -346,7 +367,7 @@ void ble_serial_poll(void)
     } else {
         /* Passkey request - generate, display, and respond.
          * With DISPLAY_ONLY IO cap, the host enters this passkey.
-         * Output to display + USB serial BEFORE hci_send so the
+         * Output to display + USB serial before hci_send so the
          * host agent can read it while the HCI command blocks. */
         uint32_t pin = ble_generate_passkey() % 1000000;
         char pkstr[8];

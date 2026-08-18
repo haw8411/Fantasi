@@ -10,6 +10,7 @@
 #include "../../core/cli.h"
 #include "../../core/log.h"
 #include "../../hal/hal.h"
+#include "../../hal/hal_power.h"
 #include "hal_storage.h"
 #include "FreeRTOS.h"
 #include "task.h"
@@ -271,8 +272,8 @@ static QueueHandle_t     pair_queue;
 /* ---- Bonding (persisted across reboot so a paired host reconnects without
  * re-pairing). Single bond: only one peripheral link exists at a time. ----
  *
- * The SoftDevice fills `s_keyset` ASYNCHRONOUSLY between sec_params_reply and
- * AUTH_STATUS, so the keyset and its key buffers MUST be static (not stack).
+ * The SoftDevice fills `s_keyset` asynchronously between sec_params_reply and
+ * AUTH_STATUS, so the keyset and its key buffers must be static (not stack).
  * On AUTH_STATUS success we copy our distributed enc key (LTK+EDIV+RAND) into
  * s_bond and flag a deferred flash write - the write can't run inside the
  * event handler (it pumps ble_serial_poll re-entrantly). On reconnect the
@@ -324,6 +325,9 @@ static uint16_t att_mtu = 23;
 
 /* Advertising data buffers (must persist - SD references them) */
 static uint8_t adv_buf[31];
+
+/* Idle advertising policy flag - slow (1 s) vs fast (100 ms) interval. */
+static volatile bool adv_slow;
 static uint8_t sr_buf[31];
 
 /* ---- Advertising ---- */
@@ -356,7 +360,10 @@ static void start_advertising(void)
     ble_gap_adv_params_t params;
     memset(&params, 0, sizeof(params));
     params.properties.type = BLE_GAP_ADV_TYPE_CONNECTABLE_SCANNABLE_UNDIRECTED;
-    params.interval = 160;   /* 100ms in 625µs units */
+    /* Fast 100 ms while the device is in use; the idle power policy drops to
+     * 1 s (ble_serial_set_adv_slow) - ~10x less radio duty, discovery still
+     * works, and any activity restores fast advertising. 625 µs units. */
+    params.interval = adv_slow ? 1600 : 160;
     params.duration = 0;     /* forever */
     params.primary_phy = 1;  /* 1 Mbps */
 
@@ -371,13 +378,49 @@ static void start_advertising(void)
  * to the scan loop running on the CLI task. */
 volatile bool ble_scan_active;
 
+/* Idle advertising policy (set by platforms/chameleon/power.c). */
+SVCALL(0x74, uint32_t, svc_gap_adv_stop_ps(uint8_t adv_handle))
+
+void ble_serial_set_adv_slow(bool slow)
+{
+    if (slow == adv_slow) return;
+    adv_slow = slow;
+    if (!service_ready || !serial_enabled) return;
+    if (conn_handle != BLE_CONN_HANDLE_INVALID) return;  /* takes effect on next adv start */
+    /* Reconfigure needs advertising stopped; rc ignored (not advertising is
+     * fine - the next start_advertising picks the new interval up anyway). */
+    svc_gap_adv_stop_ps(adv_handle);
+    start_advertising();
+}
+
 /* ---- SWI2 handler (SoftDevice event signal) ---- */
 
 static volatile bool sd_evt_pending;
 
+/* Task blocked in ble_serial_wait, if any - the BLE proto task between
+ * requests. SWI2 wakes it so BLE events (and SoC events: flash completions,
+ * USB VBUS) are pumped on demand. */
+static volatile TaskHandle_t s_sd_waiter;
+
 void SWI2_EGU2_IRQHandler(void)
 {
     sd_evt_pending = true;
+    TaskHandle_t t = s_sd_waiter;
+    if (t) {
+        BaseType_t woken = pdFALSE;
+        vTaskNotifyGiveFromISR(t, &woken);
+        portYIELD_FROM_ISR(woken);
+    }
+}
+
+void ble_serial_wait(uint32_t timeout_ms)
+{
+    s_sd_waiter = xTaskGetCurrentTaskHandle();
+    /* Re-check after registering: an event that raced in between the caller's
+     * poll/read and here must not sleep a full timeout. */
+    if (!sd_evt_pending)
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(timeout_ms));
+    s_sd_waiter = NULL;
 }
 
 /* ---- Init ---- */
@@ -408,7 +451,7 @@ int ble_serial_init(void)
     /* sm=1 lv=3: MITM-authenticated encryption. The client cannot write
      * commands (or, below, subscribe to / read responses) until the link is
      * encrypted by an authenticated passkey pairing - i.e. the PIN is
-     * required to use the CLI. lv=1 (open) left the service usable unpaired. */
+     * required to use the CLI. */
     ble_gatts_attr_md_t rx_attr_md;
     memset(&rx_attr_md, 0, sizeof(rx_attr_md));
     rx_attr_md.read_perm = (ble_gap_conn_sec_mode_t){ .sm = 1, .lv = 3 };
@@ -482,6 +525,7 @@ static void handle_event(const uint8_t *evt_buf, uint16_t evt_len)
     switch (evt_id) {
     case BLE_GAP_EVT_CONNECTED:
         conn_handle = ch;
+        pwr_inhibit_enter(PWR_CLIENT_BLE_LINK);
         /* peer_addr is the first field of the connected-event params (GAP
          * params sit at offset 8 after the 2-byte conn_handle padding). */
         memcpy(&s_conn_peer, &evt_buf[8], sizeof(s_conn_peer));
@@ -505,6 +549,7 @@ static void handle_event(const uint8_t *evt_buf, uint16_t evt_len)
 
     case BLE_GAP_EVT_DISCONNECTED:
         conn_handle = BLE_CONN_HANDLE_INVALID;
+        pwr_inhibit_exit(PWR_CLIENT_BLE_LINK);
         tx_credits = 4;
         att_mtu = 23;
         if (pair_in_progress && pair_queue) {

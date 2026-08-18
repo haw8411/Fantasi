@@ -34,6 +34,11 @@ size_t hal_serial_read(uint8_t *buf, size_t len);
  * without DTR semantics may always return true once enumerated. */
 bool hal_serial_connected(void);
 
+/* Block until serial RX data may be available or timeout_ms elapsed. May
+ * return early. Weak default (core/cli.c) delays min(timeout_ms, 5 ms) so
+ * platforms without an RX-event serial keep their historical poll cadence. */
+void hal_serial_wait(uint32_t timeout_ms);
+
 /* Bytes currently free on the FreeRTOS heap. Thin wrapper so the "free"
  * command doesn't need to know which heap_N.c the platform chose. */
 size_t hal_free_heap_bytes(void);

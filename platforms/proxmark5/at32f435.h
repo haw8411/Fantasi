@@ -202,6 +202,9 @@ typedef struct {
 #define CRM_CFG_APB1DIV_POS  10
 #define CRM_CFG_APB2DIV_POS  13
 #define CRM_AHB_DIV1   0x0u
+#define CRM_AHB_DIV2   0x8u      /* 0b1000 = /2  (idle HICK-48 -> HCLK 24 MHz) */
+#define CRM_AHB_DIV4   0x9u      /* 0b1001 = /4 */
+#define CRM_AHB_DIV8   0xAu      /* 0b1010 = /8 */
 #define CRM_APB_DIV2   0x4u      /* 0b100 */
 
 #define CRM_AHBEN1_GPIOAEN   (1u << 0)
@@ -213,7 +216,10 @@ typedef struct {
 
 #define CRM_APB1EN_PWCEN     (1u << 28)
 
+#define CRM_MISC1_HICKDIV       (1u << 12)   /* 0=HICK/6 (8 MHz); 1=HICK (48 MHz) */
 #define CRM_MISC1_HICK_TO_USB   (1u << 13)   /* 0=PLL(div) sources USB, 1=HICK */
+#define CRM_MISC1_HICK_TO_SCLK  (1u << 14)   /* 1=SCLK-from-HICK is 48 MHz (needs HICKDIV=1) */
+#define CRM_APB2EN_ACCEN        (1u << 29)   /* auto clock calibration clock enable */
 #define CRM_MISC2_USBDIV_POS    12           /* [15:12] PLL->USB divider */
 #define CRM_MISC2_USBDIV_MSK    (0xFu << 12)
 #define CRM_USBDIV_6            0xBu          /* 0b1011 = /6 -> 288/6 = 48 MHz */
@@ -280,6 +286,15 @@ typedef struct {
 
 #define PWC_LDOOV_1P2V   0x0u   /* default; caps SCLK at 240 MHz */
 #define PWC_LDOOV_1P3V   0x1u   /* required for 288 MHz */
+#define PWC_LDOOV_1P1V   0x4u   /* LDOOVSEL=100; low-power idle (SCLK <= 108 MHz) */
+
+/* ACC (auto clock calibration): trims HICK to 48 MHz +/-0.25% against the USB
+ * SOF so USB runs crystal-less on HICK while the PLL is powered down at idle.
+ * Reset compare-values (C1/C2/C3) are already set for the 48 MHz USB path, so
+ * bring-up is just: clock-enable + set ENTRIM|CALON. */
+#define ACC_CTRL1        (*(volatile uint32_t *)(0x40017400UL + 0x04u))
+#define ACC_CTRL1_ENTRIM (1u << 1)   /* calibrate HICKTRIM (finer, 20 kHz/step) */
+#define ACC_CTRL1_CALON  (1u << 0)   /* start calibrating off USB_SOF */
 
 /* ======================================================================
  * GPIO  (RM Table 6-10, p139)
@@ -431,6 +446,20 @@ bool pm5_rgb_set(uint8_t r, uint8_t g, uint8_t b);
  * (0x51, map register bit2=HFLED / bit1=LFLED, active-high). Defined in rfid.c.
  * Returns the I2C ack. */
 bool pm5_ant_led(bool hf, bool lf);
+
+/* Switch the software-I2C bit-bang between spec (~100 kHz, false) and fast
+ * (tens of microseconds/toggle, true) so the idle LED fade can PWM the on/off
+ * LEDs smoothly. Safe: scl() honours any clock-stretch the slave asserts.
+ * Defined in rfid.c. */
+void pm5_i2c_set_fast(bool fast);
+
+/* Dynamic core-clock scaling (system.c). The core idles at 48 MHz to cut heat
+ * and boosts to 288 MHz only for timing-critical work; boost/unboost is
+ * refcounted, so wrap any span that needs full speed (RFID, busy-wait PWM) in a
+ * boost/unboost pair. pm5_clk_settle() is the idle-hook's one-shot boot drop. */
+void pm5_clk_boost(void);
+void pm5_clk_unboost(void);
+void pm5_clk_settle(void);
 
 /* Set CFGR 2-bit mode field for pin `p` to `m`. */
 static inline void gpio_set_mode(gpio_type *g, int p, uint32_t m)

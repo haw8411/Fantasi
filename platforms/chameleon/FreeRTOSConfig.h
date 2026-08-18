@@ -2,12 +2,27 @@
 #define FREERTOS_CONFIG_H
 
 #define configUSE_PREEMPTION            1
+/* No idle-hook WFE: on nRF52 the CPU clock (and SysTick with it) stops during
+ * WFE, so an un-accounted idle-hook sleep silently freezes the tick. All
+ * idle sleeping goes through the tickless hook,
+ * which measures elapsed time on RTC1 and credits it with vTaskStepTick. */
 #define configUSE_IDLE_HOOK             0
 #define configUSE_TICK_HOOK             0
+
+/* Tickless idle, custom implementation (platforms/chameleon/power.c): RTC1 on
+ * the LFXO as the wake timer, SysTick suppressed, SoftDevice-safe sleep. */
+#define configUSE_TICKLESS_IDLE         2
+#ifndef __ASSEMBLER__
+extern void cu_suppress_ticks_and_sleep(uint32_t expected_idle_ticks);
+#endif
+#define portSUPPRESS_TICKS_AND_SLEEP(x) cu_suppress_ticks_and_sleep(x)
 #define configCPU_CLOCK_HZ              ((unsigned long)64000000)
 #define configTICK_RATE_HZ              ((TickType_t)1000)
 #define configMAX_PRIORITIES            5
-#define configMINIMAL_STACK_SIZE        ((unsigned short)128)
+/* 256: idle needs it for the tickless sleep path + FPU exception frame. cli/usb/
+ * proto pin their stacks in the Makefile; only idle, pwrbtn, and timer still size
+ * off this. */
+#define configMINIMAL_STACK_SIZE        ((unsigned short)256)
 /* Elastic app heap. ucHeap (heap_4.c) is aliased onto the linker heap region,
  * and this size is its runtime span - end of .bss to the stack - so the FreeRTOS
  * heap uses all app RAM above the SoftDevice with nothing stranded. libc malloc

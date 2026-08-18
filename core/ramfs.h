@@ -48,6 +48,9 @@ const uint8_t *ramfs_get(const char *name, uint32_t *len);
 
 int      ramfs_remove(const char *name);
 
+/* Rename by relabeling the existing entry; the data buffer is not moved. */
+int      ramfs_rename(const char *from, const char *to);
+
 typedef void (*ramfs_iter_fn)(const char *name, uint32_t size, void *ctx);
 void     ramfs_iterate(ramfs_iter_fn fn, void *ctx);
 

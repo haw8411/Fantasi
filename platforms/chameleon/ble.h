@@ -66,6 +66,11 @@ typedef struct {
 bool cu_ble_sd_init(void);
 bool cu_ble_sd_is_active(void);
 
+/* Acquire/release the external HF crystal through the SoftDevice when it owns
+ * CLOCK. The direct-register fallback is only for pre-SoftDevice operation. */
+bool cu_hfclk_request(void);
+void cu_hfclk_release(void);
+
 /* Drain pending SoftDevice SoC events (flash completions + USB VBUS events).
  * Defined in flash_storage.c (co-located with the sd_evt_get SVC); the single
  * consumer, called from ble_serial_poll. */

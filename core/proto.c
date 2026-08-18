@@ -2,6 +2,7 @@
 #include "proto_pipe.h"
 #include "cli.h"
 #include "../hal/hal.h"
+#include "../hal/hal_power.h"
 #include "../hal/storage/hal_storage.h"
 #include "../hal/storage/fat_ramdisk.h"   /* fatrd_invalidate() */
 #include "ramfs.h"
@@ -20,8 +21,7 @@
 
 #define PROTO_TLS_SLOT 0
 /* Must exceed the largest framed CliRequest. CliRequest_size is 597
- * (FileWriteChunk with up to 480 B of data), so 512 truncated every
- * upload chunk at the msg_len > ACCUM_SIZE-2 guard and dropped it. */
+ * (FileWriteChunk with up to 480 B of data). */
 #define ACCUM_SIZE     1024
 #define OUT_BUF_SIZE   499
 #define FILE_CACHE_SZ  256
@@ -105,6 +105,7 @@ static void send_ok(cli_ctx_t *ctx, uint32_t id, const char *msg)
  * per-dispatch s_emit (which may belong to another channel by the time the app
  * prints). One session at a time (app_launch_async enforces it). */
 static size_t (*s_session_emit)(const uint8_t *, size_t);
+static void   (*s_session_flush)(void);
 static CliResponse s_sresp;
 static uint8_t     s_sencode[2 + CliResponse_size];   /* pump's own buffer (not shared) */
 
@@ -118,6 +119,8 @@ static void session_send(void)
     s_sencode[1] = (uint8_t)(len >> 8);
     if (s_emit_lock) xSemaphoreTake(s_emit_lock, portMAX_DELAY);
     s_session_emit(s_sencode, 2 + len);
+    /* Async output bypasses fantasi_proto_rx()'s per-request flush. */
+    if (s_session_flush) s_session_flush();
     if (s_emit_lock) xSemaphoreGive(s_emit_lock);
 }
 
@@ -148,6 +151,7 @@ static void session_done_cb(uint32_t id, int code)
     s_sresp.payload.output[0] = '\0';
     session_send();
     s_session_emit = NULL;
+    s_session_flush = NULL;
 }
 
 static const app_session_cb_t s_session_cb = {
@@ -157,9 +161,11 @@ static const app_session_cb_t s_session_cb = {
 static void handle_app_launch(cli_ctx_t *ctx, CliRequest *req)
 {
     s_session_emit = s_emit;                 /* stream this session over this channel */
+    s_session_flush = ctx->transport.flush;
     int rc = app_launch_async(req->payload.app_launch, req->id, &s_session_cb);
     if (rc < 0) {
         s_session_emit = NULL;
+        s_session_flush = NULL;
         send_error(ctx, req->id,
             rc == -1 ? "an app is already running" :
             rc == -2 ? "not found" : "load failed");
@@ -571,6 +577,7 @@ void fantasi_proto_rx(cli_ctx_t *ctx, uint8_t *accum, size_t cap, size_t *accum_
                       size_t (*emit)(const uint8_t *, size_t),
                       const uint8_t *in, size_t n)
 {
+    hal_power_activity();   /* proto traffic = the device is in use */
     size_t copy = n;
     if (*accum_len + copy > cap) copy = cap - *accum_len;
     memcpy(accum + *accum_len, in, copy);
@@ -607,7 +614,12 @@ void fantasi_proto_rx(cli_ctx_t *ctx, uint8_t *accum, size_t cap, size_t *accum_
             default: send_error(ctx, s_req.id, "unknown request"); break;
             }
         }
-        if (ctx->transport.flush) ctx->transport.flush();
+        /* The pump task shares this pipe; serialize writes and flushes. */
+        if (ctx->transport.flush) {
+            if (s_emit_lock) xSemaphoreTake(s_emit_lock, portMAX_DELAY);
+            ctx->transport.flush();
+            if (s_emit_lock) xSemaphoreGive(s_emit_lock);
+        }
         if (s_proto_lock) xSemaphoreGive(s_proto_lock);
 
         size_t consumed = 2 + msg_len;
@@ -634,13 +646,13 @@ void proto_task(void *arg)
 
     while (!ctx->transport.connected(ctx->transport.ctx)) {
         if (ctx->transport.poll) ctx->transport.poll();
-        /* Block briefly instead of taskYIELD(). taskYIELD() only re-runs the
-         * scheduler; this task stays Ready, so with nothing higher-priority
-         * waiting the loop just spins at 100% CPU and the core never idles.
-         * Waiting for a connection isn't time-critical (setup takes hundreds of
-         * ms), so a 5 ms sleep polls plenty often while letting the idle task /
-         * low-power sleep run. */
-        vTaskDelay(pdMS_TO_TICKS(5));
+        /* Event-driven transports block until the radio signals (connect,
+         * SoC event); the timeout bounds housekeeping like advertising
+         * restarts. Poll-only transports keep the historical 5 ms sleep -
+         * either way this task must not taskYIELD() (it would stay Ready and
+         * spin at 100% CPU, and the core would never idle). */
+        if (ctx->transport.wait) ctx->transport.wait(100);
+        else                     vTaskDelay(pdMS_TO_TICKS(5));
     }
     /* Wait for GATT service discovery + MTU exchange (~1.5s on BlueZ) */
     for (int i = 0; i < 40; i++) {
@@ -654,16 +666,28 @@ void proto_task(void *arg)
     accum_len = 0;
 
     for (;;) {
+        /* Drop partial RX/TX frames from the previous connection. */
+        if (!ctx->transport.connected(ctx->transport.ctx)) {
+            accum_len = 0;
+            s_pipe.len = 0;
+            while (!ctx->transport.connected(ctx->transport.ctx)) {
+                if (ctx->transport.poll) ctx->transport.poll();
+                if (ctx->transport.wait) ctx->transport.wait(100);
+                else                     vTaskDelay(pdMS_TO_TICKS(5));
+            }
+            continue;
+        }
         if (ctx->transport.poll) ctx->transport.poll();
 
         uint8_t tmp[256];
         size_t n = ctx->transport.read(tmp, sizeof(tmp), ctx->transport.ctx);
         if (n == 0) {
-            /* No data: block briefly instead of taskYIELD(). taskYIELD() keeps
-             * this task Ready and just busy-spins the loop at 100% CPU; data
-             * only arrives about once per connection interval (~45 ms), so a
-             * 2 ms sleep adds negligible latency while letting the core idle. */
-            vTaskDelay(pdMS_TO_TICKS(2));
+            /* No data: block until the radio event ISR signals (or the
+             * timeout for a missed wakeup); poll-only transports keep the
+             * historical 2 ms sleep. Never taskYIELD() here - the task would
+             * stay Ready and busy-spin at 100% CPU. */
+            if (ctx->transport.wait) ctx->transport.wait(100);
+            else                     vTaskDelay(pdMS_TO_TICKS(2));
             continue;
         }
 

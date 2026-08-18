@@ -10,8 +10,11 @@
 #include "nrf.h"
 #include "../../hal/hal.h"
 #include "../../hal/hal_name.h"
+#include "../../hal/hal_power.h"
+#include "../../core/log.h"
 #include "ble.h"
 #include "ble_serial.h"
+#include "power.h"
 #include "hal_storage.h"
 #include "flash_storage.h"
 #include "tusb.h"
@@ -34,7 +37,7 @@ extern void tusb_hal_nrf_power_event(uint32_t event);
 
 /* The CU's visible LEDs are a multiplexed matrix: 8 slot-position
  * pins (active-low cathode select) × 3 RGB colour pins (active-low
- * anode select). Both a slot pin AND a colour pin must be driven LOW
+ * anode select). Both a slot pin and a colour pin must be driven LOW
  * for any light to appear. */
 static void gpio_output_low(NRF_GPIO_Type *port, uint32_t pin)
 {
@@ -54,8 +57,29 @@ static void gpio_output_high(NRF_GPIO_Type *port, uint32_t pin)
 void cu_launcher_init(void);   /* A-button shortcut launcher, defined below */
 #endif
 
+/* Previous-boot diagnostics, stashed pre-SoftDevice and logged from
+ * hal_post_init (the logger isn't up during hal_init). */
+static uint32_t s_resetreas;
+static uint8_t  s_crash_note;
+
+void hal_crash_note(uint8_t code)
+{
+    NRF_POWER->GPREGRET2 = code;   /* retained across soft reset */
+}
+
 void hal_init(void)
 {
+    /* Reset forensics: reason + any crash fingerprint from the previous run.
+     * Registers are unrestricted here (SoftDevice not up yet). Also clear
+     * GPREGRET: stale DFU magic (0xB1) left after a `dfu` session makes every
+     * later reset - including crash resets - detour ~30 s through the
+     * bootloader's DFU mode before chaining to the app. */
+    s_resetreas  = NRF_POWER->RESETREAS;
+    NRF_POWER->RESETREAS = 0xFFFFFFFFu;    /* write-1-to-clear */
+    s_crash_note = (uint8_t)NRF_POWER->GPREGRET2;
+    NRF_POWER->GPREGRET2 = 0;
+    NRF_POWER->GPREGRET  = 0;
+
     /* Pass the raw priority level to NVIC_SetPriority - CMSIS shifts it
      * up by (8 - __NVIC_PRIO_BITS) internally. Pre-shifting here would
      * double-shift to near-zero (highest priority) and trip FreeRTOS's
@@ -71,6 +95,10 @@ void hal_init(void)
     NVIC_SetPriority(USBD_IRQn,        irq_prio);
     NVIC_EnableIRQ(POWER_CLOCK_IRQn);
     NVIC_EnableIRQ(USBD_IRQn);
+
+    /* Sleep machinery: RTC1 (tickless), button-wake GPIOTE, idle policy
+     * timer. Before the SoftDevice, so registers are unrestricted. */
+    cu_power_init();
 
     /* Steady blue on all 8 slot LEDs.
      * Colour channels (active low, sink side): blue LOW = on.
@@ -117,6 +145,7 @@ void POWER_CLOCK_IRQHandler(void)
     /* Translate the three USB power events TinyUSB cares about. */
     if (NRF_POWER->EVENTS_USBDETECTED) {
         NRF_POWER->EVENTS_USBDETECTED = 0;
+        cu_power_vbus(true);
         tusb_hal_nrf_power_event(FANTASI_USB_EVT_DETECTED);
     }
     if (NRF_POWER->EVENTS_USBPWRRDY) {
@@ -125,12 +154,19 @@ void POWER_CLOCK_IRQHandler(void)
     }
     if (NRF_POWER->EVENTS_USBREMOVED) {
         NRF_POWER->EVENTS_USBREMOVED = 0;
+        cu_power_vbus(false);
         tusb_hal_nrf_power_event(FANTASI_USB_EVT_REMOVED);
     }
 }
 
 void hal_post_init(void)
 {
+    /* Log the previous boot's exit: reset reason (RESETREAS: bit0 pin-reset,
+     * bit2 soft-reset/SYSRESETREQ, bit3 CPU lockup, ...) and any crash
+     * fingerprint (0xA1 stack overflow, 0xA2 SoftDevice fault). */
+    fantasi_log(LOG_INFO, "resetreas 0x%lx crash 0x%02x",
+                (unsigned long)s_resetreas, s_crash_note);
+
     /* Bring BLE up at boot unless the persisted setting says off, mirroring
      * the Flipper's hal_post_init. Default on when the key is absent.
      * cu_ble_sd_init() masks USBD across its VTOR-swap window, so SoftDevice
@@ -367,6 +403,34 @@ static bool cu_button_a_down(void)
     return (CU_BUTTON_A_PORT->IN & (1UL << CU_BUTTON_A_PIN)) != 0;   /* active-high */
 }
 
+/* Everything dark: colour sinks high (off), slot sources low. Unlike
+ * cu_leds_show(0) this also releases the blue rail. */
+static void cu_leds_dark(void)
+{
+    gpio_output_high(NRF_P0, 24);
+    gpio_output_high(NRF_P0, 22);
+    gpio_output_high(NRF_P1,  0);
+    for (int i = 0; i < 8; i++)
+        gpio_output_low(cu_slot_led[i].port, cu_slot_led[i].pin);
+}
+
+/* Idle fade-out: soft-PWM the shared blue sink (P1.00) down in coarse duty
+ * steps - every lit LED fades together since they share that rail. 4 ms
+ * frames (250 Hz, no visible flicker) paced by the tick, so no busy-waiting:
+ * 75% -> 50% -> 25% over ~600 ms, then dark. */
+static void cu_leds_fade_out(void)
+{
+    for (int duty = 3; duty >= 1; duty--) {
+        for (int i = 0; i < 50; i++) {
+            gpio_output_low (NRF_P1, 0);              /* blue rail on  */
+            vTaskDelay(pdMS_TO_TICKS(duty));
+            gpio_output_high(NRF_P1, 0);              /* blue rail off */
+            vTaskDelay(pdMS_TO_TICKS(4 - duty));
+        }
+    }
+    cu_leds_dark();
+}
+
 /* Discarding CLI session so app_run() works from this task (like the Flipper's
  * gui task). No abort channel here - launcher-run apps run to completion (or are
  * stopped with `kill` over USB/BLE). */
@@ -382,7 +446,8 @@ static void cu_launcher_task(void *arg)
     CU_BUTTON_A_PORT->PIN_CNF[CU_BUTTON_A_PIN] =
         (GPIO_PIN_CNF_DIR_Input     << GPIO_PIN_CNF_DIR_Pos)   |
         (GPIO_PIN_CNF_INPUT_Connect << GPIO_PIN_CNF_INPUT_Pos) |
-        (GPIO_PIN_CNF_PULL_Pulldown << GPIO_PIN_CNF_PULL_Pos);
+        (GPIO_PIN_CNF_PULL_Pulldown << GPIO_PIN_CNF_PULL_Pos)  |
+        (GPIO_PIN_CNF_SENSE_High    << GPIO_PIN_CNF_SENSE_Pos);   /* keep the GPIOTE PORT wake */
 
     cu_launcher_ctx.transport.write     = cu_tp_write;
     cu_launcher_ctx.transport.read      = cu_tp_read;
@@ -390,18 +455,44 @@ static void cu_launcher_task(void *arg)
     cli_bind_ctx(&cu_launcher_ctx);
 
     int sel = 0;
-    bool prev = false, launched = false;
+    bool prev = false, launched = false, leds_dark = false;
     TickType_t press_start = 0;
 
     for (;;) {
-        /* LED_8 is always on and doubles as the position-0 marker; slots 1..7
-         * additionally light LED_1..LED_7. So slot 0 = LED_8 only. */
-        uint8_t mask = 1u << 7;
-        if (sel > 0) mask |= 1u << (sel - 1);
-        cu_leds_show(mask);
+        /* Idle LED policy (platforms/chameleon/power.c drives the flag; this
+         * task owns the pins). Fade down when the device goes idle; any
+         * activity (button, USB attach, BLE connect) brings them back. */
+        bool idle = cu_power_led_idle();
+        if (idle && !leds_dark) {
+            cu_leds_fade_out();
+            leds_dark = true;
+        } else if (!idle && leds_dark) {
+            leds_dark = false;               /* redrawn below */
+        }
+
+        if (!leds_dark) {
+            /* LED_8 is always on and doubles as the position-0 marker; slots
+             * 1..7 additionally light LED_1..LED_7. So slot 0 = LED_8 only. */
+            uint8_t mask = 1u << 7;
+            if (sel > 0) mask |= 1u << (sel - 1);
+            cu_leds_show(mask);
+        }
 
         bool now = cu_button_a_down();
         TickType_t t = xTaskGetTickCount();
+
+        if (now && leds_dark) {
+            /* Wake press: restore the LEDs and consume the press - waking the
+             * display must not also advance the launcher selection. (The
+             * GPIOTE ISR already noted the activity.) */
+            leds_dark = false;
+            uint8_t mask = 1u << 7;
+            if (sel > 0) mask |= 1u << (sel - 1);
+            cu_leds_show(mask);
+            while (cu_button_a_down()) vTaskDelay(pdMS_TO_TICKS(20));
+            prev = false;
+            continue;
+        }
 
         if (now && !prev) { press_start = t; launched = false; }        /* press edge */
         if (now && !launched && (t - press_start) >= pdMS_TO_TICKS(CU_HOLD_MS)) {
@@ -413,13 +504,20 @@ static void cu_launcher_task(void *arg)
         if (!now && prev && !launched) sel = (sel + 1) & 7;             /* short press */
         prev = now;
 
-        vTaskDelay(pdMS_TO_TICKS(20));
+        if (now)
+            vTaskDelay(pdMS_TO_TICKS(20));   /* press in progress: poll the hold */
+        else
+            /* Block until a button edge (GPIOTE PORT) or an idle-policy nudge
+             * (power.c wakes the waiters on LED-state transitions); the
+             * timeout is only a backstop against a missed nudge. */
+            hal_button_wait(5000);
     }
 }
 
 void cu_launcher_init(void)
 {
-    xTaskCreate(cu_launcher_task, "sclaunch", configMINIMAL_STACK_SIZE * 8,
+    /* pinned absolute (not configMINIMAL * 8); launcher only polls + spawns the app task */
+    xTaskCreate(cu_launcher_task, "sclaunch", 1024,
                 NULL, tskIDLE_PRIORITY + 1, NULL);
 }
 #endif /* FANTASI_ENABLE_APPS */
@@ -542,13 +640,20 @@ int hal_shutdown(void)
     gpio_output_high(NRF_P0, 22);   /* LED_G off */
     gpio_output_high(NRF_P1,  0);   /* LED_B off */
 
-    /* Wait for release first: entering System OFF while the button is still
+    /* Wait for release first: entering System OFF while a button is still
      * held (e.g. the long-hold that triggered this) would latch an immediate
-     * wake and loop. */
-    while (NRF_P1->IN & (1UL << CU_BUTTON_B_PIN))
+     * wake and loop. Both buttons are armed as wake sources below, so both
+     * must be released. */
+    while ((NRF_P1->IN & (1UL << CU_BUTTON_B_PIN)) ||
+           (NRF_P0->IN & (1UL << 26 /* button A */)))
         ;
 
     NRF_P1->PIN_CNF[CU_BUTTON_B_PIN] =
+        (GPIO_PIN_CNF_DIR_Input     << GPIO_PIN_CNF_DIR_Pos)   |
+        (GPIO_PIN_CNF_INPUT_Connect << GPIO_PIN_CNF_INPUT_Pos) |
+        (GPIO_PIN_CNF_PULL_Pulldown << GPIO_PIN_CNF_PULL_Pos)  |
+        (GPIO_PIN_CNF_SENSE_High    << GPIO_PIN_CNF_SENSE_Pos);
+    NRF_P0->PIN_CNF[26 /* button A */] =
         (GPIO_PIN_CNF_DIR_Input     << GPIO_PIN_CNF_DIR_Pos)   |
         (GPIO_PIN_CNF_INPUT_Connect << GPIO_PIN_CNF_INPUT_Pos) |
         (GPIO_PIN_CNF_PULL_Pulldown << GPIO_PIN_CNF_PULL_Pos)  |
@@ -570,7 +675,8 @@ bool hal_shutdown_button_held(void)
         NRF_P1->PIN_CNF[CU_BUTTON_B_PIN] =
             (GPIO_PIN_CNF_DIR_Input     << GPIO_PIN_CNF_DIR_Pos)   |
             (GPIO_PIN_CNF_INPUT_Connect << GPIO_PIN_CNF_INPUT_Pos) |
-            (GPIO_PIN_CNF_PULL_Pulldown << GPIO_PIN_CNF_PULL_Pos);
+            (GPIO_PIN_CNF_PULL_Pulldown << GPIO_PIN_CNF_PULL_Pos)  |
+            (GPIO_PIN_CNF_SENSE_High    << GPIO_PIN_CNF_SENSE_Pos);   /* keep GPIOTE PORT wake */
         cfg = true;
     }
     return (NRF_P1->IN & (1UL << CU_BUTTON_B_PIN)) != 0;
@@ -590,11 +696,13 @@ uint32_t hal_app_buttons(void)
         CU_BUTTON_A_PORT->PIN_CNF[CU_BUTTON_A_PIN] =
             (GPIO_PIN_CNF_DIR_Input     << GPIO_PIN_CNF_DIR_Pos)   |
             (GPIO_PIN_CNF_INPUT_Connect << GPIO_PIN_CNF_INPUT_Pos) |
-            (GPIO_PIN_CNF_PULL_Pulldown << GPIO_PIN_CNF_PULL_Pos);
+            (GPIO_PIN_CNF_PULL_Pulldown << GPIO_PIN_CNF_PULL_Pos)  |
+            (GPIO_PIN_CNF_SENSE_High    << GPIO_PIN_CNF_SENSE_Pos);
         NRF_P1->PIN_CNF[CU_BUTTON_B_PIN] =
             (GPIO_PIN_CNF_DIR_Input     << GPIO_PIN_CNF_DIR_Pos)   |
             (GPIO_PIN_CNF_INPUT_Connect << GPIO_PIN_CNF_INPUT_Pos) |
-            (GPIO_PIN_CNF_PULL_Pulldown << GPIO_PIN_CNF_PULL_Pos);
+            (GPIO_PIN_CNF_PULL_Pulldown << GPIO_PIN_CNF_PULL_Pos)  |
+            (GPIO_PIN_CNF_SENSE_High    << GPIO_PIN_CNF_SENSE_Pos);
         cfg = true;
     }
     uint32_t m = 0;

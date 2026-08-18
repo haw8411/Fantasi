@@ -72,13 +72,17 @@ void     hal_app_display_acquire(void);
 void     hal_app_display_release(void);
 
 /* Request the currently-running app be killed - used by the `kill` command from a
- * DIFFERENT channel than the one running the app (the launching session sees the
+ * different channel than the one running the app (the launching session sees the
  * request and does the single-owner teardown). Returns false if none running. */
 bool     app_kill_running(void);
 
 /* FreeRTOS task number of the running app, or -1 if none, so `kill <pid>` can
  * verify a pid refers to the app before acting (system tasks aren't killable). */
 int      app_running_pid(void);
+
+/* Cheap check (two loads, no kernel calls, no big stack frames) - the one the
+ * sleep-governance/idle path may use. */
+bool     app_is_running(void);
 
 /* App launch shortcuts (slots 0-7, persisted as scN=<path> in settings.cfg).
  * Used by the Flipper Shortcuts menu, the `shortcut` command, and the screenless

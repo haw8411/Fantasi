@@ -466,7 +466,7 @@ int vfs_rename(const char *src, const char *dst)
     const vfs_mount_t *md = vfs_resolve(dst, &dl);
     if (!ms || !md) return -1;
     if (ms != md) return VFS_ERR_XDEV;            /* different backends - caller copies */
-    if (ms->kind == VFS_BK_RAMFS) return VFS_ERR_XDEV;  /* ramfs has no rename */
+    if (ms->kind == VFS_BK_RAMFS) return ramfs_rename(sl, dl);
     int rc;
     if (ms->kind == VFS_BK_FAT) {
         rc = vfs_fat_rename(ms->fatdrv, sl, dl);

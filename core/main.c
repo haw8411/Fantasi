@@ -1,6 +1,7 @@
 #include "cli.h"
 #include "log.h"
 #include "../hal/hal.h"
+#include "../hal/hal_power.h"
 
 #ifdef FANTASI_ENABLE_BLE_CLI
 #include "ble_serial.h"
@@ -53,8 +54,10 @@ static void pwr_button_task(void *arg)
     uint32_t held_ms = 0;
     bool fired = false;
     for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(PWR_BUTTON_POLL_MS));
         if (hal_shutdown_button_held()) {
+            /* Hold in progress: poll at the historical 50 ms cadence. */
+            vTaskDelay(pdMS_TO_TICKS(PWR_BUTTON_POLL_MS));
+            if (!hal_shutdown_button_held()) continue;   /* released mid-wait */
             held_ms += PWR_BUTTON_POLL_MS;
             /* Fire once per hold. hal_shutdown() doesn't return when it powers
              * off; if it does return (e.g. USB-powered on FZ) the press is a
@@ -66,6 +69,9 @@ static void pwr_button_task(void *arg)
         } else {
             held_ms = 0;
             fired = false;
+            /* Idle: block until a button edge (platforms with a button wake
+             * IRQ) or the poll-fallback delay elapses. */
+            hal_button_wait(UINT32_MAX);
         }
     }
 }
@@ -76,6 +82,7 @@ int main(void)
     hal_init();
     fantasi_log_init();
     fantasi_log(LOG_INFO, "boot");
+    pwr_init();   /* sleep governance: load persisted sleep/off-timeout keys */
 
     fatrd_store_init();   /* create the storage lock before the usb/cli/proto tasks touch LittleFS */
 
@@ -111,6 +118,7 @@ int main(void)
     ble_cli_ctx.transport.read      = ble_serial_read;
     ble_cli_ctx.transport.connected = ble_serial_connected;
     ble_cli_ctx.transport.poll      = ble_serial_poll;
+    ble_cli_ctx.transport.wait      = ble_serial_wait;
     ble_cli_ctx.transport.ctx       = NULL;
     /* Defaults to x4; see WEBUSB_PROTO_STACK above for the shared sizing rationale. */
 #ifndef PROTO_STACK
@@ -134,13 +142,28 @@ int main(void)
  * fantasi_reset(); the weak fallback spins for platforms that don't. */
 __attribute__((weak)) void fantasi_reset(void) { for (;;); }
 
-/* A failed heap allocation is RECOVERABLE and must not brick the device: every
+/* A failed heap allocation is recoverable and must not brick the device: every
  * runtime allocator here checks the result (a ramfs/file upload that outgrows
  * the heap fails the write and reports an error to the host). Resetting here
  * would be worse than the OOM: on STM32WB a warm reset hangs CPU2 and drops USB.
  * Return instead; pvPortMalloc hands the caller NULL to handle. */
-void vApplicationMallocFailedHook(void) { }
+/* OOM breadcrumb. The hook runs inside pvPortMalloc with the scheduler suspended,
+ * so it must not log (fantasi_log takes a mutex) - just record, and let `free`/`ps`
+ * surface it. */
+volatile uint32_t g_oom_count;
+volatile uint32_t g_oom_free_at_fail;
+void vApplicationMallocFailedHook(void)
+{
+    g_oom_count++;
+    g_oom_free_at_fail = (uint32_t)xPortGetFreeHeapSize();
+}
 
-/* A stack overflow, unlike OOM, is unrecoverable memory corruption - reset. */
-void vApplicationStackOverflowHook(TaskHandle_t t, char *n) { (void)t; (void)n; fantasi_reset(); }
+/* A stack overflow, unlike OOM, is unrecoverable memory corruption - reset.
+ * Fingerprint it first so the next boot can log what happened. */
+void vApplicationStackOverflowHook(TaskHandle_t t, char *n)
+{
+    (void)t; (void)n;
+    hal_crash_note(HAL_CRASH_STACK_OVERFLOW);
+    fantasi_reset();
+}
 

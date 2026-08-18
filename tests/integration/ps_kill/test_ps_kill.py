@@ -89,23 +89,24 @@ def main():
               "(switch-mode has one active channel)")
         return 77
 
-    cli(f"upload {elf} {RAMFS_PATH}\nexit\n", cdc)
+    cli(f"rm {RAMFS_PATH}\nexit\n", cdc)
     baseline = read_free(cdc)
     if baseline is None:
         print("FAIL: could not read baseline free")
         return 1
-    print(f"  baseline free (spin resident): {baseline} B")
+    cli(f"upload {elf} {RAMFS_PATH}\nexit\n", cdc)
+    print(f"  baseline free (no transient source): {baseline} B")
 
     # Channel A (CDC serial): launch spin and let it stream.
     print("  [launch spin over CDC, kill from WebUSB]")
     # --serial pins this channel to CDC so it doesn't claim the WebUSB vendor
     # interface (the default transport now) - channel B (webusb_send) needs it.
-    a = subprocess.Popen([CLI_BIN, "--serial", cdc], stdin=subprocess.PIPE,
+    a = subprocess.Popen([CLI_BIN, "--serial", cdc, "-c", f"launch {RAMFS_PATH}"],
+                         stdin=subprocess.DEVNULL,
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                          text=True, bufsize=1)
     ended = True
     try:
-        a.stdin.write(f"launch {RAMFS_PATH}\n"); a.stdin.flush()
         time.sleep(3.0)   # let spin tick over CDC
 
         # Channel B (WebUSB): ps must now show the app task, then kill it.
@@ -121,10 +122,6 @@ def main():
             a.kill(); a.communicate(); return 1
 
         time.sleep(1.0)
-        try:
-            a.stdin.write("exit\n"); a.stdin.flush()
-        except (BrokenPipeError, OSError):
-            pass
         aout, _ = a.communicate(timeout=20)
     except subprocess.TimeoutExpired:
         a.kill(); aout, _ = a.communicate(); ended = False

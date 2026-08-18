@@ -49,7 +49,7 @@ typedef struct {
  * app context suffices and the API callbacks find it here. */
 static app_ctx_t *g_app;
 
-/* Cross-channel kill: the `kill` command (running on a DIFFERENT CLI/proto task
+/* Cross-channel kill: the `kill` command (running on a different CLI/proto task
  * than the one streaming the app) requests termination by setting a flag; the
  * launching session's loop sees it and does the single-owner teardown. Only the
  * app task is killable this way - never a system task. */
@@ -61,10 +61,19 @@ bool app_kill_running(void)
     return true;
 }
 
+/* Cheap "is an app loaded" check for the sleep-governance path. Unlike
+ * app_running_pid() this touches no kernel state and no stack-heavy
+ * TaskStatus_t array, so it is safe from the idle task / tickless hook. */
+bool app_is_running(void)
+{
+    app_ctx_t *a = g_app;
+    return a != NULL && a->task != NULL;
+}
+
 /* PID of the running app as `ps` shows it, or -1 if none. `ps` prints
  * TaskStatus_t.xTaskNumber (creation order), which is a different field from
  * uxTaskGetTaskNumber() - so look the app's handle up in the system state to
- * report the SAME number, letting `kill <pid>` match what the user sees. */
+ * report the same number, letting `kill <pid>` match what the user sees. */
 int app_running_pid(void)
 {
     app_ctx_t *a = g_app;
@@ -324,6 +333,11 @@ int app_run(const char *path)
         launch_busy = false;
         return -1;
     }
+    /* app_load relocated every section into its own RAM; the ELF file is now dead weight
+     * (~30 KB for the RFID driver) that would otherwise stay resident the whole run, competing
+     * with the app's own heap (e.g. the sniff's 64 KB capture ring). Free transient /ramfs sources
+     * - the host re-uploads on the next launch. Persistent apps (/apps, SD) stay put. */
+    if (!strncmp(path, "/ramfs/", 7)) vfs_remove(path);
 
     static app_ctx_t actx;
     memset(&actx, 0, sizeof(actx));
@@ -374,13 +388,12 @@ int app_run(const char *path)
             if (actx.kill_req) { aborted = true; break; }   /* `kill` from another channel */
             vTaskDelay(pdMS_TO_TICKS(1));
         }
-        /* Stop the app cleanly BEFORE deleting it. A self-exited app is already
-         * parked in vTaskSuspend (app_task_entry), which is why that path was
+        /* Stop the app cleanly before deleting it. A self-exited app is already
+         * parked in vTaskSuspend (app_task_entry), which is why that path is
          * safe; a ^C-killed app is still running or blocked (e.g. in a stream
-         * buffer send). vTaskSuspend removes it from the ready/delayed list AND
+         * buffer send). vTaskSuspend removes it from the ready/delayed list and
          * from any event list it's blocked on, so the delete and the stream
-         * buffer / mutex teardown below can't dereference a still-queued task -
-         * that dangling reference was wedging the PM3 on ^C-kill. */
+         * buffer / mutex teardown below can't dereference a still-queued task. */
         vTaskSuspend(actx.task);
         vTaskDelete(actx.task);
         drain_output(&actx);
@@ -474,6 +487,7 @@ int app_launch_async(const char *path, uint32_t session, const app_session_cb_t 
     if (app_load(app_elf_read, (void *)path, (uint32_t)total, &s_async_img) != 0) {
         launch_busy = false; return -3;                                               /* load error */
     }
+    if (!strncmp(path, "/ramfs/", 7)) vfs_remove(path);   /* free transient ELF source (see app_run) */
 
     static app_ctx_t actx;
     memset(&actx, 0, sizeof(actx));

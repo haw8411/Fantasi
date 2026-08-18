@@ -1,7 +1,7 @@
 /* Fantasi / Proxmark5 (AT32F435) - RFID frontend driver.
  *
  * The Proxmark5 keeps an FPGA RF frontend (a GOWIN GW1N-4B on the PM5, replacing
- * the PM3's Spartan-II) that AUTOBOOTS the factory gateware from its own internal
+ * the PM3's Spartan-II) that autoboots the factory gateware from its own internal
  * flash - so, unlike the PM3, we do not load a bitstream: the frontend is already
  * live. This driver talks to that resident gateware exactly the way the PM3 does:
  *
@@ -155,8 +155,15 @@ static void adc_mux(bool hf)                      /* PB5: HIGH = HF (HIPKD), LOW
 #define ANT_MAP_125K 0x87
 
 /* ~100 kHz half-period. The antenna (0x51) and RGB (0x48) controllers are
- * MCU-based and clock-stretch, so keep to spec and honour SCL held low. */
-static inline void i2c_dly(void) { for (volatile int i = 0; i < 1400; i++) __asm volatile("nop"); }
+ * MCU-based and clock-stretch, so scl() honours SCL held low. The half-period
+ * is a variable (pm5_i2c_set_fast) so the idle LED fade can clock much faster;
+ * fast bit-bang stays safe because scl() waits out the clock-stretch. */
+static volatile int s_i2c_dly_n = 1400;
+/* Fast = ~240 kHz, used only for the antenna LED PWM in the idle fade: the
+ * toggle drops ~440 us -> ~130 us so the PWM can dim to near black. Not faster;
+ * at ~1 MHz the controllers miss writes. */
+void pm5_i2c_set_fast(bool fast) { s_i2c_dly_n = fast ? 400 : 1400; }
+static inline void i2c_dly(void) { for (volatile int i = 0; i < s_i2c_dly_n; i++) __asm volatile("nop"); }
 static inline void scl(bool hi)
 {
     fc_set(GPIOC, I2C_SCL_PIN, hi);
@@ -238,8 +245,19 @@ bool pm5_ant_led(bool hf, bool lf)
 static rfid_mode_t s_mode = RFID_OFF;
 static bool s_setup_done;
 
+/* RF-field idle auto-park. A reader mode (HF/LF) drives the antenna carrier, a
+ * big idle heat source. `rfid raw` (and -k) leave it on between frames, so a
+ * forgotten field-on drives the antenna indefinitely. Every field-driving call
+ * stamps s_field_active_ts; hal_rfid_field_tick() (launcher task) parks it
+ * after PM5_FIELD_IDLE_MS idle. Emulation modes drive no carrier, never parked. */
+#define PM5_FIELD_IDLE_MS 5000u
+static volatile TickType_t s_field_active_ts;
+static volatile bool s_field_held;   /* explicit hold (`rfid field on` / raw -k) - never auto-parked */
+static inline void rfid_field_touch(void) { s_field_active_ts = xTaskGetTickCount(); }
+
 /* Defined further below (SSP sample channel); used by hal_rfid_set_mode. */
 static void fpga_24mhz_clk(void);
+static void fpga_24mhz_stop(void);
 static void fpga_ssc_setup(bool wide16);
 static void ssp_clk_start(void);
 
@@ -254,11 +272,19 @@ uint32_t hal_rfid_caps(void) { return RFID_CAP_LF_READ | RFID_CAP_HF_READ | RFID
 
 int hal_rfid_set_mode(rfid_mode_t mode)
 {
+    /* RFID needs full speed for the whole session: FPGA SSP sampling, the
+     * HF/LF timing, spin_ms settles. Hold a 288 MHz boost from OFF->active
+     * until active->OFF (the core otherwise idles at 48 MHz). */
+    bool want_active = (mode != RFID_OFF);
+    bool was_active  = (s_mode != RFID_OFF);
+    if (want_active && !was_active) pm5_clk_boost();
+
     ensure_setup();
     fpga_24mhz_clk();
     switch (mode) {
     case RFID_OFF:
         fpga_conf(FPGA_MAJOR_MODE_OFF);
+        fpga_24mhz_stop();               /* idle: stop clocking the FPGA */
         break;
     case RFID_LF_READER:
         /* Full PM5 LF configuration (field still off until hal_rfid_lf_field). */
@@ -287,15 +313,32 @@ int hal_rfid_set_mode(rfid_mode_t mode)
         ssp_clk_start();                          /* after conf, so FRAME/SCK toggle for the sync */
         break;
     default:
+        if (want_active && !was_active) pm5_clk_unboost();   /* undo boost on reject */
         return RFID_ERR_UNSUPP;
     }
+    if (!want_active && was_active) pm5_clk_unboost();        /* back to idle 48 MHz */
     s_mode = mode;
+    if (mode != RFID_OFF) rfid_field_touch();
+    else                  s_field_held = false;              /* park releases any hold */
     return 0;
+}
+
+/* Park the reader carrier once it has been idle; reader modes only (see above). */
+void hal_rfid_field_tick(void)
+{
+    if (s_field_held) return;                       /* deliberate keep (rfid field on / raw -k) */
+    if (s_mode != RFID_HF_READER && s_mode != RFID_LF_READER) return;
+    if ((uint32_t)(xTaskGetTickCount() - s_field_active_ts) >= pdMS_TO_TICKS(PM5_FIELD_IDLE_MS))
+        hal_rfid_set_mode(RFID_OFF);
 }
 
 void hal_rfid_field(bool on)
 {
     ensure_setup();
+    /* Explicit on = a deliberate hold (`rfid field on` / raw -k), exempt from
+     * the idle auto-park; explicit off releases it. */
+    s_field_held = on;
+    if (on) rfid_field_touch();
     if (s_mode == RFID_LF_READER)
         fpga_conf(on ? (FPGA_MAJOR_MODE_LF_READER | FPGA_LF_ADC_READER_FIELD)
                      : FPGA_MAJOR_MODE_OFF);
@@ -330,6 +373,17 @@ static void fpga_24mhz_clk(void)
              | CRM_CFG_CLKOUT1SEL_PLL | CRM_CFG_CLKOUT1DIV1_3;
     CRM->MISC1 = (CRM->MISC1 & ~CRM_MISC1_CLKOUT1DIV2_MSK) | CRM_MISC1_CLKOUT1DIV2_4;
     s_clk_done = true;
+}
+
+/* Stop the FPGA's 24 MHz clock when RFID is idle: otherwise CLKOUT1 keeps
+ * running after the first op and the FPGA draws power even at MODE_OFF. Park
+ * PA8 as a static-low output (not floating); fpga_24mhz_clk() re-arms the mux. */
+static void fpga_24mhz_stop(void)
+{
+    if (!s_clk_done) return;
+    gpio_set_mode(GPIOA, 8, GPIO_MODE_OUTPUT);
+    GPIOA->CLR = (1u << 8);
+    s_clk_done = false;
 }
 
 /* SPI4 as a TI/"SSP" slave: the FPGA is master and drives FRAME(PB6)+CLK(PB7);
@@ -596,6 +650,7 @@ int hal_rfid_hf_transceive(const uint8_t *tx, int tx_bits, uint32_t flags,
     (void)flags; (void)timeout_us;
     if (s_mode != RFID_HF_READER || !tx || tx_bits <= 0 || !rx || rx_cap <= 0)
         return RFID_ERR_UNSUPP;
+    rfid_field_touch();
     static uint8_t tosend[96];
     int tlen = code_14a_reader(tx, tx_bits, tosend, (int)sizeof tosend);
     if (tlen <= 0) return RFID_ERR_FRAMING;
@@ -610,6 +665,7 @@ int hal_rfid_hf_transceive_par(const uint8_t *tx, int nbytes, const uint8_t *par
     (void)timeout_us;
     if (s_mode != RFID_HF_READER || !tx || nbytes <= 0 || !par || !rx || rx_cap <= 0)
         return RFID_ERR_UNSUPP;
+    rfid_field_touch();
     static uint8_t tosend[96];
     int tlen = code_14a_reader_ex(tx, nbytes * 8, par, tosend, (int)sizeof tosend);
     if (tlen <= 0) return RFID_ERR_FRAMING;
@@ -846,6 +902,7 @@ static void sniff_dma_start(uint8_t *ring, uint16_t n)
 int hal_rfid_hf_sniff_capture(uint8_t *buf, uint32_t cap_bytes, uint32_t quiet_ms, uint32_t max_ms)
 {
     if (s_mode != RFID_HF_READER || !buf) return RFID_ERR_UNSUPP;
+    rfid_field_touch();
     if (cap_bytes < FANTASI_RFID_SNIFF_BUFSZ) return RFID_ERR_UNSUPP;   /* too small to carve safely */
     if (!quiet_ms) quiet_ms = SNIFF_QUIET_MS;
     if (!max_ms)   max_ms   = SNIFF_MAX_MS;
@@ -878,6 +935,7 @@ int hal_rfid_hf_sniff_capture(uint8_t *buf, uint32_t cap_bytes, uint32_t quiet_m
 
     for (;;) {
         TickType_t now = xTaskGetTickCount();
+        s_field_active_ts = now;                  /* keep the field alive across a long sniff */
         if (saw_activity) {
             /* stay in one call for a whole cascade->AUTH->READ burst (gaps < quiet_ms),
              * but always bail out by max_ms so a continuous field can't hang us */
@@ -981,7 +1039,7 @@ int hal_rfid_hf_emu_recv(uint8_t *rx, uint8_t *rx_par, int cap, uint32_t timeout
 
     int n = 0;
 
-    /* PHASE 1 - catch an imminent command IRQs-off (the reader's next command lands
+    /* Phase 1 - catch an imminent command IRQs-off (the reader's next command lands
      * ~1 ms after our reply; a preemption there overruns the 1-byte SPI RX). */
     taskENTER_CRITICAL();
     {
@@ -996,7 +1054,7 @@ int hal_rfid_hf_emu_recv(uint8_t *rx, uint8_t *rx_par, int cap, uint32_t timeout
     }
     taskEXIT_CRITICAL();
 
-    /* PHASE 2 - wait the rest of the timeout preemptibly; decode IRQs-off once a
+    /* Phase 2 - wait the rest of the timeout preemptibly; decode IRQs-off once a
      * command starts. A missed idle poll (REQA/WUPA) is simply retried by the reader. */
     if (!n && s_u.state == U_UNSYNCD) {
         TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms ? timeout_ms : 200);
@@ -1102,6 +1160,7 @@ int hal_rfid_hf_emu_send_stream(uint8_t (*next)(void *ctx), void *ctx, int nsymb
 int hal_rfid_lf_acquire(uint8_t *buf, int max, uint32_t opts)
 {
     if (s_mode != RFID_LF_READER || !buf || max <= 0) return RFID_ERR_UNSUPP;
+    rfid_field_touch();
 
     /* Capture a clean, gap-free block of raw envelope samples via DMA, then demod
      * it. (A static raw buffer keeps this off the caller's small heap/stack.) */
@@ -1187,6 +1246,7 @@ int hal_rfid_lf_modulate(const uint8_t *p, int nbits, uint32_t opts)
 {
     (void)opts;
     if (s_mode != RFID_LF_READER || !p || nbits <= 0) return RFID_ERR_UNSUPP;
+    rfid_field_touch();
     lf_tx_cmd(p, nbits);
     spin_ms(T55_PROGRAM_MS);
     lf_tx_off();
@@ -1201,6 +1261,7 @@ int hal_rfid_lf_modulate(const uint8_t *p, int nbits, uint32_t opts)
 int hal_rfid_lf_transceive(const uint8_t *cmd, int nbits, uint8_t *buf, int cap)
 {
     if (s_mode != RFID_LF_READER || !buf || cap <= 0) return RFID_ERR_UNSUPP;
+    rfid_field_touch();
 
     if (cmd && nbits > 0) lf_tx_cmd(cmd, nbits);         /* send downlink; field left ON */
     else                  lf_tx_on();

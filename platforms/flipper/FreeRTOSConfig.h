@@ -7,7 +7,16 @@
 #define configCPU_CLOCK_HZ              ((unsigned long)32000000)  /* HSE 32 MHz; see platforms/flipper/system.c */
 #define configTICK_RATE_HZ              ((TickType_t)1000)
 #define configMAX_PRIORITIES            5
-#define configMINIMAL_STACK_SIZE        ((unsigned short)128)
+/* 256 words: the idle task runs the kernel tickless path on this stack, and
+ * the backlight task comes within ~48 B of overflow at the 128-word default. */
+#define configMINIMAL_STACK_SIZE        ((unsigned short)256)
+
+/* Tickless idle. The port's weak vPortSuppressTicksAndSleep is overridden in
+ * platforms/flipper/power.c: light path = the kernel's own SysTick algorithm
+ * (plain WFI, CPU2-safe, SysTick keeps counting); deep path = Stop 2 with the
+ * LPTIM1 wake timer and the stock CPU1/CPU2 HSEM protocol, gated to battery
+ * operation only. */
+#define configUSE_TICKLESS_IDLE         1
 /* Elastic app heap. ucHeap (heap_4.c) is aliased onto the linker heap region,
  * and this size is its runtime span - end of .bss to the stack - so the FreeRTOS
  * heap uses all free SRAM1 with nothing stranded. libc malloc (float printf's

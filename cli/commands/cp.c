@@ -73,6 +73,7 @@ static void cmd_cp(const char *args)
     }
     fclose(in);
     fclose(out);
+    fat_sync();
 }
 
 LOCAL_COMMAND_BLE("cp", "copy a file", cmd_cp, proto_cmd_cp);

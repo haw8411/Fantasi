@@ -28,7 +28,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef GUI_TASK_STACK
 #define GUI_TASK_STACK    (configMINIMAL_STACK_SIZE * 8)  /* runs lfs + app_run paths, like cli */
+#endif
 #define GUI_BTN_QUEUE_LEN 8
 #define GUI_DEBOUNCE_MS   30
 

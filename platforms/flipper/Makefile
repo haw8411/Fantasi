@@ -43,7 +43,9 @@ DEFS := -DSTM32WB55xx \
         -DWEBUSB_PROTO_STACK=1024 \
         -DPROTO_STACK=1024 \
         -DUSB_TASK_STACK=2048 \
-        -DCFG_TUD_MSC_EP_BUFSIZE=8192 \
+        -DCLI_TASK_STACK=1024 \
+        -DGUI_TASK_STACK=1024 \
+        -DCFG_TUD_MSC_EP_BUFSIZE=512 \
         $(EXTRA_DEFS)
 # USB_TASK_STACK bumped 1024->2048 words (4KB->8KB): the MSC host-write path (tud_task -> fatrd_write ->
 # build_model's littlefs traversal + write_dir + picolibc vsnprintf) overflows the 4KB "usb" task. Flipper has ample RAM.
@@ -95,9 +97,11 @@ SRCS := \
     $(ROOT)/core/log.c \
     $(ROOT)/core/libc_glue.c \
     $(ROOT)/core/berry_host.c \
+    $(ROOT)/core/power.c \
     $(ROOT)/platforms/flipper/startup.c \
     $(ROOT)/platforms/flipper/system.c \
     $(ROOT)/platforms/flipper/hal.c \
+    $(ROOT)/platforms/flipper/power.c \
     $(ROOT)/platforms/flipper/ble.c \
     $(ROOT)/platforms/flipper/ble_serial.c \
     $(ROOT)/platforms/flipper/display.c \
@@ -120,6 +124,7 @@ SRCS := \
     $(ROOT)/hal/storage/fat_ramdisk.c \
     $(ROOT)/hal/tinyusb/usb_descriptors.c \
     $(ROOT)/hal/tinyusb/hal_serial_tinyusb.c \
+    $(ROOT)/hal/tinyusb/usb_power.c \
     $(ROOT)/third_party/FreeRTOS-Kernel/tasks.c \
     $(ROOT)/third_party/FreeRTOS-Kernel/queue.c \
     $(ROOT)/third_party/FreeRTOS-Kernel/list.c \

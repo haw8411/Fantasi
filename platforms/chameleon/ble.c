@@ -10,6 +10,7 @@
  * so there is no conflict with the SD's SVC range (0x10+). */
 
 #include "ble.h"
+#include "power.h"
 #include "nrf.h"
 #include "../../core/cli.h"
 #include "../../core/log.h"
@@ -31,6 +32,10 @@
 #define SVC_SD_POWER_USBPWRRDY_ENABLE   0x4D
 #define SVC_SD_POWER_USBDETECTED_ENABLE 0x4E
 #define SVC_SD_POWER_USBREMOVED_ENABLE  0x4F
+#define SVC_SD_POWER_DCDC_MODE_SET      0x3F   /* SOC_SVC_BASE_NOT_AVAILABLE(0x2C) + 19 */
+#define SVC_SD_CLOCK_HFCLK_REQUEST      0x42   /* SOC_SVC_BASE_NOT_AVAILABLE + 22 */
+#define SVC_SD_CLOCK_HFCLK_RELEASE      0x43
+#define SVC_SD_CLOCK_HFCLK_IS_RUNNING   0x44
 
 /* ---- BLE constants ---- */
 
@@ -109,6 +114,10 @@ SVCALL(SVC_BLE_GAP_SCAN_STOP,  uint32_t, svc_scan_stop(void))
 SVCALL(SVC_SD_POWER_USBPWRRDY_ENABLE,   uint32_t, svc_power_usbpwrrdy_enable(uint8_t en))
 SVCALL(SVC_SD_POWER_USBDETECTED_ENABLE, uint32_t, svc_power_usbdetected_enable(uint8_t en))
 SVCALL(SVC_SD_POWER_USBREMOVED_ENABLE,  uint32_t, svc_power_usbremoved_enable(uint8_t en))
+SVCALL(SVC_SD_POWER_DCDC_MODE_SET,      uint32_t, svc_power_dcdc_mode_set(uint8_t mode))
+SVCALL(SVC_SD_CLOCK_HFCLK_REQUEST,      uint32_t, svc_clock_hfclk_request(void))
+SVCALL(SVC_SD_CLOCK_HFCLK_RELEASE,      uint32_t, svc_clock_hfclk_release(void))
+SVCALL(SVC_SD_CLOCK_HFCLK_IS_RUNNING,   uint32_t, svc_clock_hfclk_is_running(uint32_t *running))
 SVCALL(0x74,                   uint32_t, svc_gap_adv_stop(uint8_t adv_handle))
 SVCALL(0x73,                   uint32_t, svc_gap_adv_start_scan(uint8_t adv_handle, uint8_t tag))
 
@@ -126,6 +135,9 @@ static volatile bool sd_active;
 static void sd_fault(uint32_t id, uint32_t pc, uint32_t info)
 {
     (void)id; (void)pc; (void)info;
+    /* Fingerprint the fault (retained register; the SD is broken anyway, so
+     * the direct write is fine) - the next boot logs it. */
+    NRF_POWER->GPREGRET2 = 0xA2;   /* HAL_CRASH_RADIO_FAULT */
     NVIC_SystemReset();
 }
 
@@ -138,20 +150,33 @@ bool cu_ble_sd_init(void)
     NVIC_DisableIRQ(POWER_CLOCK_IRQn);
     NVIC_ClearPendingIRQ(POWER_CLOCK_IRQn);
 
+    /* If the app started the LFXO by hand (ble=0 boot, `ble on` later), hand
+     * the clock back before sd_enable - the SD insists on owning LFCLK and
+     * enabling it over an app-started clock can stall inside the SVC. */
+    cu_power_release_lfclk_for_sd();
+
     /* While VTOR points at the MBR below (until the SD learns our app vector
      * base), an app peripheral IRQ would vector through the MBR with no
-     * forwarding target and fault. POWER_CLOCK is masked above; USBD is the
-     * only other app IRQ live at boot, and it is busy during enumeration -
-     * mask it across the window too. Pending is NOT cleared, so a USB event
-     * latched here still fires (correctly vectored) once re-enabled. This
-     * makes bring-up deterministic instead of relying on a settle delay. */
+     * forwarding target and fault. POWER_CLOCK is masked above; the other app
+     * IRQs live at this point - USBD (busy during enumeration), GPIOTE
+     * (button wake), RTC1 (tickless wake timer) - are masked across the
+     * window too. Pending is not cleared, so an event latched here still
+     * fires (correctly vectored) once re-enabled. This makes bring-up
+     * deterministic instead of relying on a settle delay. */
     NVIC_DisableIRQ(USBD_IRQn);
+    NVIC_DisableIRQ(GPIOTE_IRQn);
+    NVIC_DisableIRQ(RTC1_IRQn);
 
     saved_vtor = SCB->VTOR;
     SCB->VTOR = 0;
     __DSB();
     __ISB();
 
+    /* LFCLK source: SD default (NULL = LFRC + SD-managed calibration), the
+     * known-good bring-up config. RTC1 tickless runs fine off the LFRC
+     * (+-250 ppm). Moving to the LFXO (stock uses XTAL, 20 ppm) makes
+     * sd_softdevice_enable block ~0.3 s for crystal startup inside the
+     * masked-USBD window below - retry that only with USB-safe sequencing. */
     uint32_t rc = svc_sd_enable(NULL, sd_fault);
     if (rc != NRF_SUCCESS) {
         cli_printf("ble: sd_enable 0x%04lx\r\n", (unsigned long)rc);
@@ -159,6 +184,8 @@ bool cu_ble_sd_init(void)
         __DSB();
         NVIC_EnableIRQ(POWER_CLOCK_IRQn);
         NVIC_EnableIRQ(USBD_IRQn);
+        NVIC_EnableIRQ(GPIOTE_IRQn);
+        NVIC_EnableIRQ(RTC1_IRQn);
         return false;
     }
 
@@ -169,6 +196,8 @@ bool cu_ble_sd_init(void)
     /* App vectors are registered - the window is closed, so USB can resume.
      * (POWER_CLOCK stays masked: the SoftDevice owns it from here.) */
     NVIC_EnableIRQ(USBD_IRQn);
+    NVIC_EnableIRQ(GPIOTE_IRQn);
+    NVIC_EnableIRQ(RTC1_IRQn);
 
     __attribute__((aligned(4))) uint8_t cfg[16];
 
@@ -203,7 +232,7 @@ bool cu_ble_sd_init(void)
      * SoftDevice pack many notifications per connection event (download hit
      * ~215 kbps vs ~39 kbps at 5ms) while still leaving ~5ms of radio-idle
      * per interval for the flash scheduler - sd_flash_write only runs when
-     * the radio is idle, and too-long events starved it so uploads hung. */
+     * the radio is idle, and over-long events starve it. */
     *(uint16_t *)&cfg[4] = 8;
     svc_ble_cfg_set(BLE_CONN_CFG_GAP, cfg, APP_RAM_BASE);
 
@@ -234,8 +263,7 @@ bool cu_ble_sd_init(void)
     /* The SoftDevice now owns POWER_CLOCK, so the app's POWER ISR no longer sees
      * VBUS attach/detach. Enable the USB power events as SoC events instead;
      * cu_soc_drain (in ble_serial_poll) forwards them to TinyUSB. Without this,
-     * plugging the cable in AFTER the SoftDevice came up never enumerates USB -
-     * only a boot-while-connected device worked. */
+     * plugging the cable in after the SoftDevice came up never enumerates USB. */
     svc_power_usbdetected_enable(1);
     svc_power_usbpwrrdy_enable(1);
     svc_power_usbremoved_enable(1);
@@ -244,6 +272,42 @@ bool cu_ble_sd_init(void)
 }
 
 bool cu_ble_sd_is_active(void)
+{
+    return sd_active;
+}
+
+bool cu_hfclk_request(void)
+{
+    if (!sd_active) {
+        NRF_CLOCK->EVENTS_HFCLKSTARTED = 0;
+        NRF_CLOCK->TASKS_HFCLKSTART = 1;
+        for (uint32_t i = 0; i < 200000; i++)
+            if (NRF_CLOCK->EVENTS_HFCLKSTARTED) return true;
+        return false;
+    }
+
+    if (svc_clock_hfclk_request() != NRF_SUCCESS) return false;
+    for (uint32_t i = 0; i < 200; i++) {
+        uint32_t running = 0;
+        if (svc_clock_hfclk_is_running(&running) != NRF_SUCCESS) break;
+        if (running) return true;
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    svc_clock_hfclk_release();
+    return false;
+}
+
+void cu_hfclk_release(void)
+{
+    if (sd_active) svc_clock_hfclk_release();
+}
+
+/* Strong override of the tinyusb nRF driver's weak hook. While the SoftDevice is
+ * active it owns the HFCLK, so the USB driver must not write NRF_CLOCK directly
+ * (the SD traps it as APP_MEMACC and resets - the 0xA2 crash on USB disconnect,
+ * where the driver's hfclk_disable() would otherwise stop the HFXO). The HFXO
+ * runs regardless: started at boot for USB and kept up by the SD. */
+bool tud_nrf_hfclk_external(void)
 {
     return sd_active;
 }

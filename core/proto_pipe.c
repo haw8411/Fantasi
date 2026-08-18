@@ -23,9 +23,12 @@ void proto_pipe_set_mtu(proto_pipe_t *p, uint16_t att_mtu)
 
 static void drain_one(proto_pipe_t *p, const uint8_t *data, uint16_t len)
 {
-    for (int retries = 0; retries < 200; retries++) {
+    /* ~200 ms tick-deadline. */
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(200);
+    for (;;) {
         size_t w = p->write_fn(data, len, p->write_ctx);
         if (w > 0) return;
+        if ((int32_t)(xTaskGetTickCount() - deadline) >= 0) return;
         if (p->poll_fn) p->poll_fn();
         vTaskDelay(pdMS_TO_TICKS(1));
     }

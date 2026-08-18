@@ -12,10 +12,19 @@ size_t ble_serial_read(uint8_t *buf, size_t len, void *ctx);
 bool   ble_serial_connected(void *ctx);
 void   ble_serial_poll(void);
 
+/* Block until the SoftDevice signals an event (SWI2) or timeout_ms elapsed.
+ * cli_transport_t.wait for the BLE proto task - may return early. */
+void   ble_serial_wait(uint32_t timeout_ms);
+
 /* Serial service (advertising) on/off - backs `ble on` / `ble off`. */
 int    ble_serial_resume(void);
 void   ble_serial_stop(void);
 bool   ble_serial_is_active(void);
+
+/* Idle power policy: slow (1 s) vs fast (100 ms) advertising interval.
+ * Applies immediately when advertising and unconnected; otherwise on the
+ * next advertising (re)start. */
+void   ble_serial_set_adv_slow(bool slow);
 
 /* Central-mode pairing */
 int  ble_pair_setup_security(uint8_t io_cap);

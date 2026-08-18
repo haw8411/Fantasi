@@ -1,6 +1,6 @@
 /* `rfid` - host side of the on-demand RFID app.
  *
- * Streams the driver into /ramfs, launches it as an ASYNC app session, then
+ * Streams the driver into /ramfs, launches it as an async app session, then
  * services it live over the protobuf channel: prints the app's output, forwards
  * the terminal's keystrokes (and ^C) to it, and answers each `module_request` by
  * streaming that feature module into /ramfs just in time. On exit it deletes the
@@ -33,6 +33,7 @@ static void cmd_rfid(const char *arg)
 #include <stdlib.h>
 #include <unistd.h>
 #include <termios.h>
+#include <time.h>
 #include <poll.h>
 #include <signal.h>
 #include <readline/readline.h>
@@ -102,6 +103,9 @@ static ssize_t tp_read(void *b, size_t n)
 #ifdef HAS_USB_VENDOR
     if (use_usb) return usb_transport_read(b, n);
 #endif
+    /* Poll before pumping D-Bus; mirrors main.c's proto_recv. */
+    int bfd = ble_transport_fd();
+    if (bfd >= 0) { struct pollfd p = { .fd = bfd, .events = POLLIN }; poll(&p, 1, 20); }
     ble_transport_process();
     return ble_transport_read(b, n);
 }
@@ -128,6 +132,13 @@ static int recv_resp(CliResponse *resp)
         if (n < 0) return -1;
         if (n > 0 && rx_len + (size_t)n <= sizeof rx_acc) { memcpy(rx_acc + rx_len, chunk, n); rx_len += n; }
     }
+    /* Skip BLE inter-frame zero padding; valid frame lengths are nonzero. */
+    if (rx_len > 0 && rx_acc[0] == 0) {
+        size_t skip = 0;
+        while (skip < rx_len && rx_acc[skip] == 0) skip++;
+        rx_len -= skip;
+        if (rx_len > 0) memmove(rx_acc, rx_acc + skip, rx_len);
+    }
     if (rx_len >= 2) {
         uint16_t ml = rx_acc[0] | (rx_acc[1] << 8);
         if (rx_len >= 2u + ml) {
@@ -142,11 +153,35 @@ static int recv_resp(CliResponse *resp)
     return 0;
 }
 
+static int publish_file(const char *staged, const char *final)
+{
+    CliRequest req = CliRequest_init_zero;
+    if (strlen(staged) >= sizeof req.payload.file_rename.src ||
+        strlen(final) >= sizeof req.payload.file_rename.dst) return -1;
+    req.id = ++rq_id;
+    req.which_payload = CliRequest_file_rename_tag;
+    memcpy(req.payload.file_rename.src, staged, strlen(staged) + 1);
+    memcpy(req.payload.file_rename.dst, final, strlen(final) + 1);
+    if (send_req(&req) < 0) return -1;
+    for (int spin = 0; spin < 3000; spin++) {
+        CliResponse r;
+        int rc = recv_resp(&r);
+        if (rc < 0) return -1;
+        if (rc == 1 && r.id == req.id)
+            return r.which_payload == CliResponse_error_tag ? -1 : 0;
+        if (rc == 0) usleep(1000);
+    }
+    return -1;
+}
+
 /* Stream local -> /ramfs path. Fires FileWriteChunks; when drain_acks, waits for
  * their acks here (used before the session loop is running to absorb them). */
 static int upload_ram(const char *ram, const char *local, int drain_acks)
 {
     (void)drain_acks;   /* window-of-1 acks every chunk inline now */
+    char staged[64];
+    int sl = snprintf(staged, sizeof staged, "%s.part", ram);
+    if (sl < 0 || (size_t)sl >= sizeof staged) return -1;
     FILE *f = fopen(local, "rb");
     if (!f) { fprintf(stderr, "\nrfid: cannot open %s\n", local); return -1; }
     fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
@@ -157,57 +192,27 @@ static int upload_ram(const char *ram, const char *local, int drain_acks)
         CliRequest req = CliRequest_init_zero;
         req.id = ++rq_id; req.which_payload = CliRequest_file_write_tag;
         FileWriteChunk *fw = &req.payload.file_write;
-        strncpy(fw->path, ram, sizeof fw->path - 1);
+        memcpy(fw->path, staged, strlen(staged) + 1);
         fw->offset = off; memcpy(fw->data.bytes, data, n); fw->data.size = (pb_size_t)n;
         fw->last = (off + n >= (uint32_t)sz); fw->has_total = true; fw->total = (uint32_t)sz;
-        if (send_req(&req) < 0) { fclose(f); return -1; }
-
-        /* Window of 1: wait for this chunk's ack before sending the next. The
-         * Proxmark3's AT91SAM7 USB has only two 64-byte ping-pong OUT banks and a
-         * slow ARM7 draining them; back-to-back chunks flood and stall the endpoint
-         * (same reason cli/commands/upload.c paces its window). Callers hand us a
-         * drained channel, so the matching-id ack is the only frame we expect. */
+        /* Window of 1; retrying an absolute-offset write is idempotent. */
         int got = 0;
-        for (int spin = 0; spin < 3000 && !got; spin++) {
-            CliResponse r;
-            int rc = recv_resp(&r);
-            if (rc < 0) { fclose(f); return -1; }
-            if (rc == 1) { if (r.id == req.id) got = 1; }   /* skip any stale frame */
-            else usleep(1000);
+        for (int attempt = 0; attempt < 30 && !got; attempt++) {
+            if (send_req(&req) < 0) { fclose(f); return -1; }
+            for (int spin = 0; spin < 100 && !got; spin++) {
+                CliResponse r;
+                int rc = recv_resp(&r);
+                if (rc < 0) { fclose(f); return -1; }
+                if (rc == 1) { if (r.id == req.id) got = 1; } /* skip stale/session frames */
+                else usleep(1000);
+            }
         }
         if (!got) { fclose(f); return -1; }
         off += n;
         if (fw->last) break;
     }
     fclose(f);
-    return 0;
-}
-
-/* Write a one-chunk marker file to the device (window-of-1, like upload_ram). The
- * bitstream provisioner writes /ramfs/fpga.rdy after the .z has committed to lfs;
- * the driver polls that ramfs marker instead of the lfs file, so it never opens
- * the bitstream mid-write (the app and file-write tasks share one unlocked lfs_t).
- * Content is informational - existence is the signal. Returns 0 or -1. */
-static int write_marker(const char *dev_path, const char *content)
-{
-    CliRequest req = CliRequest_init_zero;
-    req.id = ++rq_id; req.which_payload = CliRequest_file_write_tag;
-    FileWriteChunk *fw = &req.payload.file_write;
-    strncpy(fw->path, dev_path, sizeof fw->path - 1);
-    size_t n = strlen(content);
-    if (n > sizeof fw->data.bytes) n = sizeof fw->data.bytes;
-    memcpy(fw->data.bytes, content, n);
-    fw->data.size = (pb_size_t)n;
-    fw->offset = 0; fw->last = true; fw->has_total = true; fw->total = (uint32_t)n;
-    if (send_req(&req) < 0) return -1;
-    for (int spin = 0; spin < 3000; spin++) {
-        CliResponse r;
-        int rc = recv_resp(&r);
-        if (rc < 0) return -1;
-        if (rc == 1 && r.id == req.id) return 0;   /* our ack */
-        if (rc == 0) usleep(1000);
-    }
-    return -1;
+    return publish_file(staged, ram);
 }
 
 static void serve_module(const char *name)
@@ -224,12 +229,13 @@ static void serve_module(const char *name)
         snprintf(dev, sizeof dev, "/fpga/%s.bit.z", res);
         if (upload_ram(dev, local, 0) < 0)
             fprintf(stderr, "\nrfid: host has no bitstream '%s'\n", res);
-        else
-            write_marker("/ramfs/fpga.rdy", res);   /* must match RFID_FPGA_RDY in apps/rfid/rfid.c */
         return;
     }
     for (int i = 0; i < NMODS; i++)
-        if (strcmp(RFID_MODS[i].name, name) == 0) { upload_ram(RFID_MODS[i].ram, elf_path(name), 0); return; }
+        if (strcmp(RFID_MODS[i].name, name) == 0) {
+            upload_ram(RFID_MODS[i].ram, elf_path(name), 0);
+            return;
+        }
     fprintf(stderr, "\nrfid: host has no module '%s'\n", name);
 }
 
@@ -722,54 +728,170 @@ static const struct {
     int sub; uint32_t ops, cap;
     const annotator_t *ann;
 } RFID_REG[] = {
-    { "nfca",  "generic",             SC_NFCA,  OP_SNIFF | OP_RAW | OP_READ, CAP_HF_READ, &ann_nfca  },
+    { "nfca",  "generic",             SC_NFCA,  OP_SNIFF | OP_RAW,           CAP_HF_READ, &ann_nfca  },
     { "mfc",   "MIFARE Classic",      SC_NFCA,  OP_SNIFF | OP_RAW | OP_READ, CAP_HF_READ, &ann_mfc   },
     { "mfp",   "MIFARE Plus",         SC_NFCA,  OP_SNIFF | OP_RAW,           CAP_HF_READ, &ann_mfp   },
     { "ul",    "Ultralight",          SC_NFCA,  OP_SNIFF | OP_RAW | OP_READ, CAP_HF_READ, &ann_ul    },
     { "ulc",   "Ultralight C",        SC_NFCA,  OP_SNIFF | OP_RAW | OP_READ, CAP_HF_READ, &ann_ulc   },
     { "ulaes", "Ultralight AES",      SC_NFCA,  OP_SNIFF | OP_RAW,           CAP_HF_READ, &ann_ulaes },
     { "mfdes", "DESFire",             SC_NFCA,  OP_SNIFF | OP_RAW,           CAP_HF_READ, &ann_mfdes },
-    { "lf",    "generic",             SC_LF,    OP_READ,                     CAP_LF_READ, &ann_nfca  },
     { "t5577", "T5577",               SC_LF,    OP_READ | OP_RAW | OP_WRITE, CAP_LF_READ, &ann_nfca  },
 };
 #define NREG ((int)(sizeof RFID_REG / sizeof RFID_REG[0]))
 
-/* The verb vocabulary - drives help + top-level completion. `local` verbs (help, list, write) are
- * HOST-side and coloured yellow: help/list are host-rendered, and write doesn't exist on the device
- * either - it's a host abstraction that emits a device `raw` command. The rest dispatch straight to
- * the device app. */
-static const struct { const char *name, *args, *help; bool local; } RFID_VERBS[] = {
-    { "search", "[protocol]",                 "scan for tags (bare = every band)",      false },
-    { "sniff",  "<protocol>",                 "passively watch a reader<->card exchange", false },
-    { "raw",    "<protocol> [-c][-k][-s] <hex>", "send a raw frame to a protocol",        false },
-    { "write",  "<protocol> -b <block> -d <hex>", "write a block to a tag",             true  },
-    { "read",   "<protocol> [-b <block>]",        "read a block, or all blocks, from a tag", true  },
-    { "collect", "<protocol> <card|reader|sniff> [-u UID][-k key]", "gather key material (nonces, sniffed keys)", true },
-    { "emulate", "<dump.json>",              "emulate a card from a saved dump (MIFARE Classic)", true },
-    { "list",   "[band|sub]",               "list supported protocols (band > sub-cat > protocol)", true  },
-    { "trace",  "[clear]",            "show (or clear) the accumulated raw trace",    false },
-    { "field",  "on|off|status",      "turn the reader carrier on/off, or report it", false },
-    { "help",   "",                   "show this help",                               true  },
-    { "exit",   "",                   "leave the rfid app",                           false },
+/* Per-command option legends + examples, surfaced by `help <command>`. Kept beside the verb table so the
+ * two stay in sync. A NULL-terminated list means "none". Order-free flags mirror the parse_rw/raw/collect
+ * handlers above - keep them accurate. */
+typedef struct { const char *flag, *desc; } rfid_hopt;
+
+static const rfid_hopt HO_search[]  = { { "[band]", "scan just one band (hf or lf); omit to scan every band" }, { NULL, NULL } };
+static const char *const EX_search[] = { "search", "search hf", "search lf", NULL };
+
+static const rfid_hopt HO_read[] = {
+    { "<protocol>", "tag type to read (see `list`)" },
+    { "-b <block>", "read just this block; omit to dump every block" },
+    { "-k <key>",   "key / password (e.g. a T5577 password)" },
+    { "-s [file]",  "save the dump as JSON (auto-named if no file given)" },
+    { NULL, NULL } };
+static const char *const EX_read[] = {
+    "read mfc                 dump a MIFARE Classic",
+    "read t5577 -b 4          read block 4 of an LF T5577",
+    "read mfc -s dump.json    dump and save as JSON",
+    NULL };
+
+static const rfid_hopt HO_write[] = {
+    { "<protocol>", "tag type to write (see `list`)" },
+    { "-b <block>", "block number to write" },
+    { "-d <hex>",   "data to write" },
+    { "-k <key>",   "key / password" },
+    { NULL, NULL } };
+static const char *const EX_write[] = { "write t5577 -b 4 -d 1A2B3C4D", NULL };
+
+static const rfid_hopt HO_emulate[] = {
+    { "<dump.json>", "a dump saved by `read -s`" }, { NULL, NULL } };
+static const char *const EX_emulate[] = { "emulate mycard.json", NULL };
+
+static const rfid_hopt HO_sniff[] = {
+    { "<protocol>", "tag type to decode the capture as (see `list`)" }, { NULL, NULL } };
+static const char *const EX_sniff[] = { "sniff mfc     watch a reader<->card auth (any key stops)", NULL };
+
+static const rfid_hopt HO_trace[] = { { "clear", "clear the trace instead of showing it" }, { NULL, NULL } };
+static const char *const EX_trace[] = { "trace", "trace clear", NULL };
+
+static const rfid_hopt HO_collect[] = {
+    { "<protocol>", "only `mfc` today" },
+    { "card",       "collect nonces from a presented card (Hardnested)" },
+    { "sniff",      "recover keys from a live auth (mfkey64)" },
+    { "reader",     "impersonate a card to a reader (not implemented yet)" },
+    { "-u <UID>",   "target UID (4- or 7-byte hex)" },
+    { "-k <key>",   "seed a known key (6 hex bytes)" },
+    { NULL, NULL } };
+static const char *const EX_collect[] = { "collect mfc card", "collect mfc sniff", NULL };
+
+static const rfid_hopt HO_raw[] = {
+    { "<protocol>", "tag type (see `list`)" },
+    { "-c",         "append a CRC to the frame" },
+    { "-k",         "keep the field on afterwards (for follow-ups)" },
+    { "-s",         "select the tag first (anticollision)" },
+    { "<hex>",      "frame bytes to send" },
+    { NULL, NULL } };
+static const char *const EX_raw[] = { "raw mfc -s -c 3000    select a card, then read block 0 with CRC", NULL };
+
+static const rfid_hopt HO_field[] = {
+    { "on",     "turn the reader carrier on and leave it on" },
+    { "off",    "turn the carrier off" },
+    { "status", "report whether the carrier is on" },
+    { NULL, NULL } };
+static const char *const EX_field[] = { "field on", "field status", NULL };
+
+static const rfid_hopt HO_list[] = {
+    { "[band|sub]", "restrict to a band (hf/lf) or sub-category" }, { NULL, NULL } };
+static const char *const EX_list[] = { "list", "list hf", NULL };
+
+static const rfid_hopt HO_help[] = {
+    { "[command]", "detailed help for one command; omit for this list" }, { NULL, NULL } };
+static const char *const EX_help[] = { "help", "help read", NULL };
+
+/* The verb vocabulary - drives help + top-level completion. `local` verbs are host-side and coloured
+ * yellow: help/list are host-rendered, read/write/collect/emulate are host abstractions over device
+ * primitives. The rest dispatch straight to the device app. `section` groups them in `help`. */
+enum { SEC_OPS, SEC_ANALYZE, SEC_GENERAL };
+static const char *const RFID_SECTIONS[] = { "operations", "sniff & analyze", "general" };
+#define NSECT ((int)(sizeof RFID_SECTIONS / sizeof RFID_SECTIONS[0]))
+
+typedef struct {
+    const char *name, *args, *help;
+    bool local;
+    int  section;
+    const rfid_hopt *opts;
+    const char *const *examples;
+} rfid_verb_t;
+
+static const rfid_verb_t RFID_VERBS[] = {
+    { "search",  "[band]",                                         "scan for nearby tags (bare = every band)",     false, SEC_OPS,     HO_search,  EX_search  },
+    { "read",    "<protocol> [-b <block>] [-k <key>] [-s [file]]", "read one block, or dump a whole tag",          true,  SEC_OPS,     HO_read,    EX_read    },
+    { "write",   "<protocol> -b <block> -d <hex> [-k <key>]",      "write a block to a tag",                       true,  SEC_OPS,     HO_write,   EX_write   },
+    { "emulate", "<dump.json>",                                    "emulate a card from a saved dump",             true,  SEC_OPS,     HO_emulate, EX_emulate },
+    { "sniff",   "<protocol>",                                     "passively watch a reader<->card exchange",     false, SEC_ANALYZE, HO_sniff,   EX_sniff   },
+    { "trace",   "[clear]",                                        "show or clear the captured frame trace",       false, SEC_ANALYZE, HO_trace,   EX_trace   },
+    { "collect", "<protocol> <card|reader|sniff> [-u <UID>] [-k <key>]", "capture key material (nonces, sniffed keys)", true, SEC_ANALYZE, HO_collect, EX_collect },
+    { "raw",     "<protocol> [-c] [-k] [-s] <hex>",                "send a raw frame to a protocol",               false, SEC_ANALYZE, HO_raw,     EX_raw     },
+    { "field",   "on|off|status",                                  "turn the reader carrier on/off, or report it", false, SEC_GENERAL, HO_field,   EX_field   },
+    { "list",    "[band|sub]",                                     "list supported protocols",                     true,  SEC_GENERAL, HO_list,    EX_list    },
+    { "help",    "[command]",                                      "show this list, or details for one command",   true,  SEC_GENERAL, HO_help,    EX_help    },
+    { "exit",    "",                                               "leave the rfid app",                           false, SEC_GENERAL, NULL,       NULL       },
 };
 #define NVERBS ((int)(sizeof RFID_VERBS / sizeof RFID_VERBS[0]))
 
+/* A cyan "--------  ----- title -----" rule, matching `list`'s sub-category headers. */
+static void rfid_section_hdr(const char *title)
+{
+    int width = 44, tl = (int)strlen(title), dashes = width - tl - 2;
+    if (dashes < 2) dashes = 2;
+    int l = dashes / 2, r = dashes - l;
+    printf("  \033[36m--------  ");
+    for (int i = 0; i < l; i++) putchar('-');
+    printf(" %s ", title);
+    for (int i = 0; i < r; i++) putchar('-');
+    printf("\033[0m\n");
+}
+
 static void rfid_help(void)
 {
-    /* Build each "verb args" cell first, then align every description to the widest cell (+2), so a long
-     * signature like `write <protocol> -b <block> -d <hex>` doesn't shove its description out of column. */
-    char nm[NVERBS][64];
-    int maxw = 0;
-    for (int i = 0; i < NVERBS; i++) {
-        if (RFID_VERBS[i].args[0]) snprintf(nm[i], sizeof nm[i], "%s %s", RFID_VERBS[i].name, RFID_VERBS[i].args);
-        else                       snprintf(nm[i], sizeof nm[i], "%s", RFID_VERBS[i].name);
-        int w = (int)strlen(nm[i]); if (w > maxw) maxw = w;
+    int maxw = 0;                                          /* widest verb name -> summaries line up */
+    for (int i = 0; i < NVERBS; i++) { int w = (int)strlen(RFID_VERBS[i].name); if (w > maxw) maxw = w; }
+    printf("commands:  (`help <command>` for options + examples)\n");
+    for (int sec = 0; sec < NSECT; sec++) {
+        rfid_section_hdr(RFID_SECTIONS[sec]);
+        for (int i = 0; i < NVERBS; i++) {
+            if (RFID_VERBS[i].section != sec) continue;
+            int pad = maxw + 2 - (int)strlen(RFID_VERBS[i].name);
+            if (RFID_VERBS[i].local) printf("  " C_YELLOW "%s" C_RESET "%*s%s\n", RFID_VERBS[i].name, pad, "", RFID_VERBS[i].help);
+            else                     printf("  %s%*s%s\n", RFID_VERBS[i].name, pad, "", RFID_VERBS[i].help);
+        }
     }
-    printf("commands:\n");
-    for (int i = 0; i < NVERBS; i++) {
-        int pad = maxw + 2 - (int)strlen(nm[i]);
-        if (RFID_VERBS[i].local) printf("  " C_YELLOW "%s" C_RESET "%*s%s\n", nm[i], pad, "", RFID_VERBS[i].help);
-        else                     printf("  %s%*s%s\n", nm[i], pad, "", RFID_VERBS[i].help);
+    printf("\n  \033[90ma <protocol> is a tag type (mfc, ul, t5577, ...); `list` shows all\033[0m\n");
+}
+
+/* `help <command>`: description, usage, an option legend, and examples (pm3-style). */
+static void rfid_help_cmd(const char *verb)
+{
+    char v[32]; snprintf(v, sizeof v, "%s", verb ? verb : "");
+    char *p = v; while (*p == ' ') p++;
+    size_t l = strlen(p); while (l && p[l-1] == ' ') p[--l] = 0;
+    if (!strcmp(p, "?")) p = "help";
+    int idx = -1;
+    for (int i = 0; i < NVERBS; i++) if (!strcmp(RFID_VERBS[i].name, p)) { idx = i; break; }
+    if (idx < 0) { printf("rfid: no such command '%s' (try `help`)\n", p); return; }
+    const rfid_verb_t *c = &RFID_VERBS[idx];
+    printf("%s\n\nusage:\n    %s%s%s\n", c->help, c->name, c->args[0] ? " " : "", c->args);
+    if (c->opts) {
+        printf("\noptions:\n");
+        for (const rfid_hopt *o = c->opts; o->flag; o++) printf("    %-16s %s\n", o->flag, o->desc);
+    }
+    if (c->examples) {
+        printf("\nexamples:\n");
+        for (const char *const *e = c->examples; *e; e++) printf("    %s\n", *e);
     }
 }
 
@@ -861,21 +983,17 @@ static char **rfid_completion(const char *text, int start, int end)
     /* Completion candidates derived from the registry: verbs, list scopes (band+sub-cat), and
      * protocols filtered by which op each supports - so `raw <TAB>` offers only raw-capable protocols. */
     static const char *verbs[NVERBS], *scopes[NBAND + NSUB];
-    static const char *tsniff[NREG], *traw[NREG], *tread[NREG], *twrite[NREG], *tblk[NREG];
-    static int nsniff = 0, nraw = 0, nread = 0, nwrite = 0, nblk = 0, init = 0;
+    static const char *tsniff[NREG], *traw[NREG], *tread[NREG], *twrite[NREG];
+    static int nsniff = 0, nraw = 0, nread = 0, nwrite = 0, init = 0;
     if (!init) {
         for (int i = 0; i < NVERBS; i++) verbs[i]  = RFID_VERBS[i].name;
-        for (int i = 0; i < NBAND;  i++) scopes[i] = BAND[i].tok;            /* list scope = band ... */
-        for (int i = 0; i < NSUB;   i++) scopes[NBAND + i] = SUB[i].tok;     /* ... or sub-category */
+        for (int i = 0; i < NBAND;  i++) scopes[i] = BAND[i].tok;            /* list/search scope = band ... */
+        for (int i = 0; i < NSUB;   i++) scopes[NBAND + i] = SUB[i].tok;     /* ... or (list) sub-category */
         for (int i = 0; i < NREG;   i++) {
             if (RFID_REG[i].ops & OP_SNIFF) tsniff[nsniff++] = RFID_REG[i].token;
             if (RFID_REG[i].ops & OP_RAW)   traw[nraw++]     = RFID_REG[i].token;
-            if (RFID_REG[i].ops & OP_READ)  tread[nread++]   = RFID_REG[i].token;   /* search scope */
+            if (RFID_REG[i].ops & OP_READ)  tread[nread++]   = RFID_REG[i].token;   /* read scope */
             if (RFID_REG[i].ops & OP_WRITE) twrite[nwrite++] = RFID_REG[i].token;
-            /* block-read verb scope: LF memory protocols with a raw block primitive (t5577) */
-            if ((RFID_REG[i].ops & OP_READ) && (RFID_REG[i].ops & OP_RAW) &&
-                SUB[RFID_REG[i].sub].band == BAND_LF)
-                tblk[nblk++] = RFID_REG[i].token;
         }
         init = 1;
     }
@@ -886,16 +1004,17 @@ static char **rfid_completion(const char *text, int start, int end)
     else if (!strncmp(rl_line_buffer, "sniff ",  6)) { g_cand = tsniff;     g_nc = nsniff; }
     else if (!strncmp(rl_line_buffer, "raw ",    4)) { g_cand = traw;       g_nc = nraw; }
     else if (!strncmp(rl_line_buffer, "write ",  6)) { g_cand = twrite;     g_nc = nwrite; }
-    else if (!strncmp(rl_line_buffer, "read ",   5)) { g_cand = tblk;       g_nc = nblk; }
-    else if (!strncmp(rl_line_buffer, "search ", 7)) { g_cand = tread;      g_nc = nread; }
+    else if (!strncmp(rl_line_buffer, "read ",   5)) { g_cand = tread;      g_nc = nread; }
+    else if (!strncmp(rl_line_buffer, "search ", 7)) { g_cand = scopes;     g_nc = NBAND; }   /* bands only */
     else if (!strncmp(rl_line_buffer, "list ",   5)) { g_cand = scopes;     g_nc = NBAND + NSUB; }
     else return NULL;
     return rl_completion_matches(text, rfid_gen);
 }
 
-/* Resolve a sniff/raw/search <protocol>: set the active annotator for the trace that follows,
- * and rewrite a protocol token (mfc, ulc, ...) to the RF-category token the device parses -
- * the device only ever sees categories; the host owns the protocol layer. Writes to `out` and
+/* Resolve a sniff/raw <protocol>: set the active annotator for the trace that follows, and rewrite a
+ * protocol token (mfc, ulc, ...) to the RF-category token the device parses - the device only ever sees
+ * categories; the host owns the protocol layer. `search` is not here: it scans by band (hf/lf), so its
+ * argument passes to the device verbatim rather than being mapped from a protocol. Writes to `out` and
  * Returns: 0 forward `line` unchanged, 1 forward `out` (rewritten), 2 handled here (an error was
  * printed - do not forward). Interactive path only. */
 static int rfid_resolve(const char *line, char *out, size_t outsz)
@@ -903,7 +1022,6 @@ static int rfid_resolve(const char *line, char *out, size_t outsz)
     const char *verb; uint32_t need; int set_ann;
     if      (!strncmp(line, "sniff ",  6)) { verb = "sniff";  need = OP_SNIFF; set_ann = 1; }
     else if (!strncmp(line, "raw ",    4)) { verb = "raw";    need = OP_RAW;   set_ann = 1; }
-    else if (!strncmp(line, "search ", 7)) { verb = "search"; need = OP_READ;  set_ann = 0; }
     else return 0;
 
     const char *rest = line + strlen(verb);
@@ -1587,8 +1705,24 @@ static void rfid_dispatch_line(uint32_t sid, char *line)
 {
     char *t = line; while (*t == ' ') t++;                 /* trim for exact match */
     size_t tl = strlen(t); while (tl && t[tl-1] == ' ') t[--tl] = '\0';
+    /* `<verb> -h` / `<verb> --help` -> per-command help (pm3 muscle memory). Only when the flag is the
+     * sole argument right after the verb; anything more is a real command and falls through. */
+    char *sp = strchr(t, ' ');
+    if (sp) {
+        char *a = sp; while (*a == ' ') a++;
+        if (!strcmp(a, "-h") || !strcmp(a, "--help")) {
+            char vb[32]; size_t vn = (size_t)(sp - t); if (vn >= sizeof vb) vn = sizeof vb - 1;
+            memcpy(vb, t, vn); vb[vn] = 0;
+            rfid_help_cmd(vb);
+            g_rfid_ready = 1;
+            return;
+        }
+    }
     if (!strcmp(t, "help") || !strcmp(t, "?")) {
         rfid_help();                                       /* host-rendered; not sent to the device */
+        g_rfid_ready = 1;
+    } else if (!strncmp(t, "help ", 5)) {
+        rfid_help_cmd(t + 5);                              /* `help <command>` - per-command detail */
         g_rfid_ready = 1;
     } else if (!strcmp(t, "list") || !strncmp(t, "list ", 5)) {
         rfid_list(t[4] ? t + 5 : NULL);
@@ -1678,6 +1812,8 @@ void proto_cmd_rfid(const char *arg)
 
     g_rfid_ready = 0;
     int done = 0, stdin_done = 0, stop_sent = 0;
+    int cmd_running = 0;                                /* a readline-dispatched command is streaming */
+    time_t stop_at = 0;                                 /* when app_stop was sent (bounded-drain deadline) */
     while (!done) {
         for (;;) {                                     /* drain everything the app emitted (frames, results, prompt) */
             CliResponse resp;
@@ -1694,15 +1830,30 @@ void proto_cmd_rfid(const char *arg)
         }
         if (done) break;
 
+        // Bounded command timeout
+        if (stop_sent) {
+            if (!stop_at) stop_at = time(NULL);
+            else if (time(NULL) - stop_at >= 3) break;
+        }
+
         if (oneshot && !oneshot_sent && g_rfid_ready) {   /* -c one-shot: run the command once the app is ready */
             g_rfid_ready = 0;
             rfid_dispatch_line(sid, oneshot);
             oneshot_sent = 1;
-            if (g_rfid_ready) {                            /* host-answered (app idle now) -> exit cleanly */
+            if (g_rfid_ready) {                            /* host-answered (read/list/help): app idle now -> exit */
                 send_input((const uint8_t *)"exit\r", 5);
-                stdin_done = 1;
+                stop_sent = 1; stdin_done = 1;             /* don't let the check below app_stop it again */
             }
             continue;                                      /* streaming cmd (emulate/sniff): drain until it ends */
+        }
+        // The app's next prompt, not output silence, completes a forwarded one-shot.
+        if (oneshot && oneshot_sent && !stop_sent && g_rfid_ready) {
+            g_rfid_ready = 0;
+            CliRequest s = CliRequest_init_zero;
+            s.id = ++rq_id; s.which_payload = CliRequest_app_stop_tag; s.payload.app_stop = true;
+            send_req(&s);
+            stop_sent = 1; stdin_done = 1;
+            continue;
         }
         if (g_rfid_sigstop && !stop_sent) {               /* SIGINT/SIGTERM: stop the running app cleanly. Gate on
                                                            * stop_sent, NOT stdin_done: a `-c` one-shot has stdin at
@@ -1716,6 +1867,7 @@ void proto_cmd_rfid(const char *arg)
 
         if (g_rfid_ready && interactive && !stdin_done) {
             g_rfid_ready = 0;
+            cmd_running = 0;                                   /* back at the prompt: no command is streaming */
             if (have_tio) tcsetattr(0, TCSANOW, &cook_tio);   /* readline needs a cooked base (OPOST on) */
             char *line = readline("rfid> ");
             if (!line) {                                       /* ^D / EOF -> exit the app cleanly */
@@ -1724,11 +1876,15 @@ void proto_cmd_rfid(const char *arg)
             } else {
                 if (*line) { add_history(line); if (rfid_hist[0]) write_history(rfid_hist); }
                 rfid_dispatch_line(sid, line);
+                cmd_running = !g_rfid_ready;               /* host-answered -> ready, loop to readline; else streaming */
                 free(line);
             }
             if (have_tio) tcsetattr(0, TCSANOW, &raw_tio);     /* raw while the command runs (forward keys) */
         } else if (stdin_done) {
             usleep(10000);                                      /* input at EOF: just wait for the app to finish */
+        } else if (interactive && !cmd_running) {
+            usleep(10000);                                      /* awaiting a prompt (not running): don't read stdin,
+                                                                 * let the typed line reach readline */
         } else {
             /* a command is running (interactive) or we're piped: forward stdin so a key stops sniff, ^C aborts.
              * poll blocks up to 10 ms, so it also paces the drain loop without spinning. */

@@ -46,6 +46,11 @@ int  hal_rfid_set_mode(rfid_mode_t mode);
 /* Energise / de-energise the carrier for the current reader mode. */
 void hal_rfid_field(bool on);
 
+/* Periodic hook (call from a task loop): auto-parks the reader carrier once it
+ * has been left on and idle, so no op or host command can leave the field
+ * driving the antenna. No-op on platforms that don't define it. */
+void hal_rfid_field_tick(void);
+
 /* ---- Loadable gateware (FPGA-backed platforms; weak-default NULL/unsupported) ----
  * The Proxmark3's Spartan-II holds exactly one bitstream at a time and there is
  * not enough app-region flash to embed every protocol's, so bitstreams live

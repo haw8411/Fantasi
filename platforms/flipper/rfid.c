@@ -253,10 +253,7 @@ static uint32_t get_irq(void)
 /* Bring the ST25R3916 up as an ISO14443-A poller. Returns 0, or -1 if no chip. */
 static int st25_init(void)
 {
-    direct_cmd(CMD_STOP);                         /* exit any lingering transparent mode first: a sniff
-                                                   * aborted by ^C never runs its cleanup, and CMD_SET_DEFAULT
-                                                   * alone does not drop the chip out of transparent mode, so
-                                                   * the reader init would otherwise come up deaf (no card) */
+    direct_cmd(CMD_STOP);                         /* exit any lingering transparent mode first */
     direct_cmd(CMD_SET_DEFAULT);
     vTaskDelay(pdMS_TO_TICKS(1));
     reg_set(REG_IO_CONF2, IO_CONF2_drv_lvl);      /* boost driver strength */
@@ -428,7 +425,10 @@ static void lf_stop(void)
                                  * up in the quiet after, so the ring must hold a whole transaction's
                                  * backlog. Sized just under the DMA's 16-bit CNDTR ceiling (65535): a full
                                  * mfu dump (11 back-to-back reads) plus repeated failed-auth anticollision
-                                 * peaks ~59000 samples, kept under the 90% overrun line (~58950). */
+                                 * peaks ~59000 samples, kept under the 90% overrun line (~58950). The 80 KB
+                                 * this + decode scratch needs only fits once the app loader frees the driver's
+                                 * /ramfs ELF post-load (core/app_run.c) - without that it OOMs on this heap. */
+#define RING_SAMPLES_MIN 32768u  /* low-memory fallback ring; if even this won't fit we report OOM */
 #define RING_MARGIN   1500u     /* keep the read ptr this far behind the DMA write ptr */
 #define PROCESS_MIN   4000u     /* don't process until this many samples are queued - keeps rounds large
                                  * (low per-round overhead) instead of spinning ~100-sample rounds */
@@ -1016,6 +1016,7 @@ static int find_cut(int start, int *cp, int *mgv, int *mgn, int *mgp)
  * a detected field means field-off noise is never captured or decoded. Runs until the field has been
  * quiet a while or timeout. [INSTRUMENTED for bring-up: L-header carries rounds/overruns/... after the
  * coupling level; the app colours the frames by that level.] */
+static int s_ring_low_warned;   /* latched on ring fallback, cleared when the full ring fits - warn once per episode */
 int hal_rfid_hf_sniff(const char *dump_path, uint32_t timeout_ms)
 {
     if (!s_spi_up || s_mode != RFID_HF_READER || !dump_path) return RFID_ERR_UNSUPP;
@@ -1033,16 +1034,49 @@ int hal_rfid_hf_sniff(const char *dump_path, uint32_t timeout_ms)
     /* The capture ring AND all decode scratch (s_tr/s_fr/s_txt, ~17 KB) live on the heap only for the
      * duration of a sniff. As static BSS they'd pin that memory below the app heap forever for a feature
      * that is rarely the one running - free it back when idle. */
-    uint8_t *ring = pvPortMalloc(RING_SAMPLES);
+    /* Reserve the small fixed scratch (~18 KB) first, then the ring last so the ring flexes to the
+     * largest block that remains. Allocating the big ring first would grab the one large free block and
+     * starve the scratch - OOM despite plenty of total free heap (just fragmented), and the ring's own
+     * fallback never triggers because the ring itself "fit". */
     s_tr   = pvPortMalloc(6000 * sizeof *s_tr);
     s_fr   = pvPortMalloc(48   * sizeof *s_fr);
     s_txt  = pvPortMalloc(S_TXT_CAP);
     s_paus = pvPortMalloc(600  * sizeof *s_paus);
     s_seq  = pvPortMalloc(160);
+    uint32_t ring_samples = RING_SAMPLES;
+    uint8_t *ring = pvPortMalloc(RING_SAMPLES);
+    if (!ring) {                                  /* full ring won't fit - fall back to a smaller one */
+        ring_samples = RING_SAMPLES_MIN;
+        ring = pvPortMalloc(RING_SAMPLES_MIN);
+    }
     if (!ring || !s_tr || !s_fr || !s_txt || !s_paus || !s_seq) {
         vPortFree(ring); vPortFree(s_tr); vPortFree(s_fr); vPortFree(s_txt); vPortFree(s_paus); vPortFree(s_seq);
         s_tr = 0; s_fr = 0; s_txt = 0; s_paus = 0; s_seq = 0;
-        return RFID_ERR_UNSUPP;
+        /* Not even the reduced ring fit: report OOM (need = the minimum, the bar we failed). */
+        unsigned freeb = (unsigned)xPortGetFreeHeapSize();
+        static TickType_t last_oom;
+        TickType_t now = xTaskGetTickCount();
+        if (now - last_oom > pdMS_TO_TICKS(2000)) {
+            last_oom = now;
+            fantasi_log(LOG_WARN, "sniff: out of memory (need %u B ring, %u B free)", (unsigned)RING_SAMPLES_MIN, freeb);
+        }
+        char msg[80];
+        int n = snprintf(msg, sizeof msg, "sniff: out of memory - need %u B, %u B free (see `free`)\r\n",
+                         (unsigned)RING_SAMPLES_MIN, freeb);
+        vfs_write_file(dump_path, msg, (uint32_t)n);
+        return n;   /* >0 so the module surfaces the reason to the user */
+    }
+
+    /* Reduced ring: warn once per episode (log breadcrumb + inline trace notice, prepended below). */
+    int reduced = (ring_samples != RING_SAMPLES), warn_now = 0;
+    if (reduced) {
+        if (!s_ring_low_warned) {
+            s_ring_low_warned = 1; warn_now = 1;
+            fantasi_log(LOG_WARN, "sniff: low memory - ring reduced to %u B (full %u B)",
+                        (unsigned)RING_SAMPLES_MIN, (unsigned)RING_SAMPLES);
+        }
+    } else {
+        s_ring_low_warned = 0;
     }
 
     s_cap_idr = &GPIOB->IDR; s_cap_shift = MISO_PIN;   /* sniff reads the demod on PB4/MISO (reader mode) */
@@ -1050,7 +1084,7 @@ int hal_rfid_hf_sniff(const char *dump_path, uint32_t timeout_ms)
     direct_cmd(CMD_TRANSPARENT_MODE);
     miso_as_input();
     vTaskDelay(pdMS_TO_TICKS(1));
-    dma_circ_arm(ring, RING_SAMPLES);
+    dma_circ_arm(ring, ring_samples);
     dma_cap_go();
 
     /* Reset the incremental extractor. s_lvl seeds from the first ring sample; the first real edge
@@ -1061,6 +1095,9 @@ int hal_rfid_hf_sniff(const char *dump_path, uint32_t timeout_ms)
 
     const int FSTART = 40;                        /* room for the leading L-header line */
     int plen = FSTART, saw_activity = 0, rounds = 0, overrun = 0, valid = 0;
+    if (warn_now)                                 /* inline notice; host beautifier passes non-frame lines through */
+        plen += snprintf(s_txt + plen, (size_t)(S_TXT_CAP - plen),
+                         "sniff: reduced ring to %u B - low memory (see `free`)\n", (unsigned)RING_SAMPLES_MIN);
     uint32_t read_abs = 0, wr_hi = 0, last_wpos = 0, max_bl = 0;   /* max_bl: peak backlog, health metric */
     uint32_t abs_base = 0;                        /* absolute sample offset of the current edge-list origin,
                                                    * so frame timestamps become absolute-in-capture (for us) */
@@ -1075,8 +1112,8 @@ int hal_rfid_hf_sniff(const char *dump_path, uint32_t timeout_ms)
          * data we're about to read (corrupting frames mid-transaction). Track write position across ring
          * wraps and measure the true, unwrapped backlog. Rounds/waits are << the ~16 ms ring period, so
          * no wrap is missed. */
-        uint32_t write_pos = RING_SAMPLES - DMA1_Channel1->CNDTR;
-        if (write_pos < last_wpos) wr_hi += RING_SAMPLES;   /* DMA wrapped the ring */
+        uint32_t write_pos = ring_samples - DMA1_Channel1->CNDTR;
+        if (write_pos < last_wpos) wr_hi += ring_samples;   /* DMA wrapped the ring */
         last_wpos = write_pos;
         uint32_t backlog = (wr_hi + write_pos) - read_abs;
         if (backlog > max_bl) max_bl = backlog;
@@ -1090,10 +1127,10 @@ int hal_rfid_hf_sniff(const char *dump_path, uint32_t timeout_ms)
         if (active && !boosted)      { vTaskPrioritySet(NULL, configMAX_PRIORITIES - 1); boosted = 1; }
         else if (!active && boosted) { vTaskPrioritySet(NULL, base_prio); boosted = 0; }
 
-        if (backlog > 9 * RING_SAMPLES / 10) {        /* fell behind (or lapped) -> catch up to the head */
+        if (backlog > 9 * ring_samples / 10) {        /* fell behind (or lapped) -> catch up to the head */
             read_abs = wr_hi + write_pos; overrun++;
             s_ntr = 0; pos = 0;
-            s_lvl = (ring[read_abs % RING_SAMPLES] >> MISO_PIN) & 1; s_tr_init = s_lvl;
+            s_lvl = (ring[read_abs % ring_samples] >> MISO_PIN) & 1; s_tr_init = s_lvl;
             continue;
         }
         if (backlog < PROCESS_MIN) {                  /* caught up / data still trickling in: wait for a
@@ -1117,8 +1154,8 @@ int hal_rfid_hf_sniff(const char *dump_path, uint32_t timeout_ms)
         int ntr0 = s_ntr;                             /* edges already held (the carried in-flight frame) */
         if (ntr0 == 0) abs_base = read_abs;           /* scan_span drops dead air (pos=0) with no carried
                                                        * edges, so the origin re-bases to this segment start */
-        uint32_t read_pos = read_abs % RING_SAMPLES;
-        uint32_t first = RING_SAMPLES - read_pos;
+        uint32_t read_pos = read_abs % ring_samples;
+        uint32_t first = ring_samples - read_pos;
         if (first > take) first = take;
         scan_span(ring + read_pos, (int)first, &pos);
         if (take > first) scan_span(ring, (int)(take - first), &pos);
@@ -1345,6 +1382,11 @@ static int reader_xcv(const uint8_t *tx, int tx_bits, const uint8_t *par, uint8_
     if (nsec < 0) return RFID_ERR_FRAMING;
 
     s_ntr = 0;
+    /* Shield the whole exchange from preemption. reader_tx already masks IRQs for
+     * the TX bit-bang; extend that over the FDT capture-wait too. Bounded by a
+     * DWT deadline so a dead DMA can't mask for long; the DMA captures in HW. */
+    uint32_t pm = __get_PRIMASK();
+    __disable_irq();
     dma_circ_arm(s_rdr_ring, RDR_RING);
     dma_cap_go();
     reader_tx(sec, nsec);                            /* DMA (TIM2, HW) keeps capturing through the bit-bang */
@@ -1354,9 +1396,11 @@ static int reader_xcv(const uint8_t *tx, int tx_bits, const uint8_t *par, uint8_
      * 18-byte encrypted READ reply (16 data + 2 CRC = ~1.5 ms at 106 kbit/s). */
     uint32_t need = (RDR_RING - DMA1_Channel1->CNDTR) + 4200;
     if (need > RDR_RING) need = RDR_RING;
-    for (uint32_t g = 0; g < 8000000u && (RDR_RING - DMA1_Channel1->CNDTR) < need; g++) { }  /* counter cap, DWT-independent */
+    uint32_t deadline = DWT->CYCCNT + 32000u * 3;    /* 3 ms hard cap @32 MHz (wait is normally <=1.7 ms) */
+    while ((RDR_RING - DMA1_Channel1->CNDTR) < need && (int32_t)(DWT->CYCCNT - deadline) < 0) { }
     dma_cap_stop();
     uint32_t got = RDR_RING - DMA1_Channel1->CNDTR;
+    if (!pm) __enable_irq();
     if (got < 8) return RFID_ERR_TIMEOUT;
 
     s_ntr = 0; int pos = 0;

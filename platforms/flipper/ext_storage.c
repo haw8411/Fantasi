@@ -13,8 +13,6 @@
 #include "FreeRTOS.h"
 #include "task.h"
 
-#include <stdio.h>
-#include <stdarg.h>
 #include <string.h>
 
 static FATFS s_fatfs;
@@ -53,20 +51,6 @@ int fatrd_ext_write(uint32_t lba, const uint8_t *buf)
     return sd_spi_write(lba, buf, 1) == 0 ? 0 : -1;
 }
 
-/* Boot diagnostics: the streaming `log` command can't be read over a one-shot
- * connection, so also drop a status line into /ramfs that `cat /ramfs/ext0.status`
- * can read back. Temporary bring-up aid. */
-static void ext_status(const char *fmt, ...)
-{
-    char buf[96];
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(buf, sizeof buf, fmt, ap);
-    va_end(ap);
-    fantasi_log(LOG_INFO, "%s", buf);
-    vfs_write_file("/ramfs/ext0.status", buf, (uint32_t)strlen(buf));
-}
-
 /* Bring up the card + FAT on its own task: a slow card init must never delay the
  * CLI coming up. Unlike the Proxmark5 QSPI (a blank chip we format), the SD card
  * is the user's own media - we never format it on mount failure; we just leave
@@ -77,8 +61,8 @@ static void ext_storage_task(void *arg)
     TickType_t t0 = xTaskGetTickCount();
 
     if (!sd_spi_init()) {
-        ext_status("sd: init fail stage=%d r1=0x%02X ctype=%d",
-                   sd_spi_diag_stage(), sd_spi_diag_r1(), sd_spi_diag_card_type());
+        fantasi_log(LOG_WARN, "sd: init fail stage=%d r1=0x%02X ctype=%d",
+                    sd_spi_diag_stage(), sd_spi_diag_r1(), sd_spi_diag_card_type());
         vTaskDelete(NULL);
         return;
     }
@@ -87,14 +71,13 @@ static void ext_storage_task(void *arg)
     /* Mount immediately (opt=1) so a bad/foreign filesystem is detected here. */
     FRESULT r = f_mount(&s_fatfs, "0:", 1);
     if (r != FR_OK) {
-        ext_status("sd: card ok (%lu MB) but f_mount=%d (not FAT?)",
-                   (unsigned long)((uint64_t)sectors * 512u / (1024u * 1024u)), (int)r);
+        fantasi_log(LOG_WARN, "sd: card ok (%lu MB) but f_mount=%d (not FAT?)",
+                    (unsigned long)((uint64_t)sectors * 512u / (1024u * 1024u)), (int)r);
         vTaskDelete(NULL);
         return;
     }
 
-    /* Self-test the FatFs path (root listing + free space) and report it, so the
-     * raw SD driver can be verified over `cat /ramfs/ext0.status` on its own. */
+    /* Self-test the FatFs path (root listing + free space) and log it. */
     int entries = 0;
     DIR dir;
     FILINFO fno;
@@ -109,9 +92,9 @@ static void ext_storage_task(void *arg)
     if (f_getfree("0:", &nfree, &fs) == FR_OK)
         free_mb = (unsigned long)((uint64_t)nfree * fs->csize * 512u / (1024u * 1024u));
     uint32_t ms = (uint32_t)((xTaskGetTickCount() - t0) * portTICK_PERIOD_MS);
-    ext_status("sd: OK %lu MB, %d root entries, %lu MB free, %lu ms",
-               (unsigned long)((uint64_t)sectors * 512u / (1024u * 1024u)),
-               entries, free_mb, (unsigned long)ms);
+    fantasi_log(LOG_INFO, "sd: OK %lu MB, %d root entries, %lu MB free, %lu ms",
+                (unsigned long)((uint64_t)sectors * 512u / (1024u * 1024u)),
+                entries, free_mb, (unsigned long)ms);
 
     /* The card is FAT32 and mounted: expose it to the passthrough hooks (for the
      * MSC overlay) and register it as /mnt/ext0 for the CLI/proto file API. The MSC

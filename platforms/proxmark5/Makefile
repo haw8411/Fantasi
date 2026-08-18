@@ -79,6 +79,7 @@ SRCS := \
     $(ROOT)/core/libc_glue.c \
     $(ROOT)/core/lzss.c \
     $(ROOT)/core/berry_host.c \
+    $(ROOT)/core/power.c \
     $(ROOT)/platforms/proxmark5/startup.c \
     $(ROOT)/platforms/proxmark5/system.c \
     $(ROOT)/platforms/proxmark5/hal.c \
@@ -95,6 +96,7 @@ SRCS := \
     $(ROOT)/hal/storage/fat_ramdisk.c \
     $(ROOT)/hal/tinyusb/usb_descriptors.c \
     $(ROOT)/hal/tinyusb/hal_serial_tinyusb.c \
+    $(ROOT)/hal/tinyusb/usb_power.c \
     $(ROOT)/third_party/FreeRTOS-Kernel/tasks.c \
     $(ROOT)/third_party/FreeRTOS-Kernel/queue.c \
     $(ROOT)/third_party/FreeRTOS-Kernel/list.c \

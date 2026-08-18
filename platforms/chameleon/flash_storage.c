@@ -1,6 +1,6 @@
 /* nRF52840 internal flash driver for the LittleFS storage region.
  *
- * The 256 KB storage region is placed at the TOP of available app
+ * The 256 KB storage region is placed at the top of available app
  * flash, just below the DFU bootloader. The bootloader address is
  * read from UICR.NRFFW[0] at runtime.
  *
@@ -15,7 +15,9 @@
 #include "flash_storage.h"
 #include "hal_storage.h"
 #include "ble.h"
+#include "power.h"
 #include "nrf.h"
+#include "../../hal/hal_power.h"
 #include "FreeRTOS.h"
 #include "task.h"
 #include <string.h>
@@ -52,7 +54,7 @@ extern void tusb_hal_nrf_power_event(uint32_t event);
  * connection processing stalls and the radio never yields idle time for the
  * flash operation - a deadlock where the completion event never arrives.
  *
- * BUT this re-pump is only safe when we are ALREADY on the BLE proto task (a
+ * But this re-pump is only safe when we are already on the BLE proto task (a
  * flash op it started, e.g. a bond save - it re-enters its own poll). When a
  * flash op is started from another task - an MSC/settings write on the USB task
  * - pumping ble_serial_poll() here would run it concurrently with the
@@ -69,8 +71,10 @@ extern bool ble_serial_on_poll_task(void);
 static void soc_dispatch_usb(uint32_t evt_id)
 {
     switch (evt_id) {
-    case NRF_EVT_POWER_USB_DETECTED:    tusb_hal_nrf_power_event(0); break;
-    case NRF_EVT_POWER_USB_REMOVED:     tusb_hal_nrf_power_event(1); break;
+    case NRF_EVT_POWER_USB_DETECTED:    cu_power_vbus(true);
+                                        tusb_hal_nrf_power_event(0); break;
+    case NRF_EVT_POWER_USB_REMOVED:     cu_power_vbus(false);
+                                        tusb_hal_nrf_power_event(1); break;
     case NRF_EVT_POWER_USB_POWER_READY: tusb_hal_nrf_power_event(2); break;
     default: break;
     }
@@ -188,8 +192,14 @@ int storage_flash_erase(uint32_t page_index)
 
     uint32_t page_addr = s_base + page_index * STORAGE_PAGE_SIZE;
 
-    if (cu_ble_sd_is_active())
-        return flash_sd_erase(page_addr / STORAGE_PAGE_SIZE);
+    if (cu_ble_sd_is_active()) {
+        /* Vote out of deep sleep for the whole async op (request + completion
+         * event wait) so tickless can't lengthen the completion latency. */
+        pwr_inhibit_enter(PWR_CLIENT_FLASH);
+        int rc = flash_sd_erase(page_addr / STORAGE_PAGE_SIZE);
+        pwr_inhibit_exit(PWR_CLIENT_FLASH);
+        return rc;
+    }
 
     __disable_irq();
     nvmc_wait();
@@ -216,6 +226,8 @@ int storage_flash_program(uint32_t offset, const void *buf, size_t len)
     size_t words = len / 4;
 
     if (cu_ble_sd_is_active()) {
+        pwr_inhibit_enter(PWR_CLIENT_FLASH);
+        int rc = 0;
         /* sd_flash_write requires a word-aligned source. Callers (lfs) align the
          * destination offset/length but not always the source pointer, so bounce
          * an unaligned source through an aligned buffer. (The direct NVMC path
@@ -227,13 +239,17 @@ int storage_flash_program(uint32_t offset, const void *buf, size_t len)
             while (rem) {
                 uint32_t chunk = rem > sizeof(bounce) ? sizeof(bounce) : rem;
                 memcpy(bounce, s, chunk);
-                if (flash_sd_write((uint32_t *)(s_base + off), bounce, chunk / 4) != 0)
-                    return -1;
+                if (flash_sd_write((uint32_t *)(s_base + off), bounce, chunk / 4) != 0) {
+                    rc = -1;
+                    break;
+                }
                 s += chunk; off += chunk; rem -= chunk;
             }
-            return 0;
+        } else {
+            rc = flash_sd_write(dst, src, words);
         }
-        return flash_sd_write(dst, src, words);
+        pwr_inhibit_exit(PWR_CLIENT_FLASH);
+        return rc;
     }
 
     volatile uint32_t *vdst = (volatile uint32_t *)dst;

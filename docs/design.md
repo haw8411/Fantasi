@@ -56,6 +56,7 @@ platforms/      One directory per target
 third_party/    Auto-cloned dependencies (gitignored)
   tinyusb/        USB device stack (pinned tag)
   littlefs/       On-flash filesystem (pinned tag)
+  fatfs/          FatFs, backing external FAT volumes (Flipper SD card)
   nanopb/         Protobuf codec for the BLE CLI transport
   FreeRTOS-Kernel/
   cmsis_core/
@@ -91,6 +92,9 @@ Each device reserves 256 KB of internal flash for a LittleFS filesystem, placed 
 | Kiisu | Just below BLE secure flash (SFSA) | Runtime-detected from `FLASH->SFR` (same as Flipper) |
 | Chameleon Ultra | Just below DFU bootloader | Runtime-detected from `UICR.NRFFW[0]` |
 | Proxmark3 | Flash plane 1 (`0x140000`) | Fixed; S512 only |
+| Proxmark5 | Flash bank 2 (`0x08080000+`) | Fixed |
+
+The VFS (`core/vfs.c`) is a multi-mount path router. Internal flash is LittleFS (mounted at `/`); app-capable targets add a RAM disk (`ramfs`) at `/ramfs`; and external storage devices mount at `/mnt/extN` in registration order. External volumes come in two backends: a **LittleFS** instance on the second flash chip (the Proxmark3's onboard SPI NOR and the Proxmark5's QSPI NOR), or a **FatFs** volume (the Flipper's microSD card, via `platforms/flipper/vfs_fat.c` over the vendored `third_party/fatfs`). The `df` command reports each mount's total/used/free (RAM disks show `RAM`) plus a trailing `program flash free:` line for the firmware region.
 
 The on-device firmware mounts LittleFS at boot and reads/writes files via the `lfs_*` API. To the host it does *not* expose the raw LittleFS blocks; instead the MSC LUN presents a **synthetic FAT volume** (labelled `Fantasi`, 512-byte sectors) that is generated on the fly from the underlying filesystem(s). Reads synthesize the boot sector, FAT tables, and directory/data sectors from the live tree (LittleFS at `/`, plus the RAM-backed `/ramfs` on app-capable targets); writes are parsed back out of the FAT structures and committed to the real filesystem. This means any host OS can mount the volume like a normal USB stick - no LittleFS knowledge on the host side - and there is no second copy of the data in RAM. See [cli.md](cli.md) for how the host CLI drives this. The synthetic FAT is implemented in `hal/storage/fat_ramdisk.c` over the `core/vfs.c` path router.
 

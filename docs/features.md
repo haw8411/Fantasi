@@ -14,3 +14,4 @@
 | LittleFS storage (256 KB) | Yes (internal flash) | Yes (internal flash) | Yes (internal flash) | Yes (flash plane 1, S512 only) | Yes (flash bank 2) |
 | USB MSC (mass storage) | Concurrent with CDC | Concurrent with CDC | Concurrent with CDC | Mode-switched (`msc` command) | Concurrent with CDC |
 | MSC return to CDC | N/A (always concurrent) | N/A (always concurrent) | N/A (always concurrent) | `eject /dev/sdX` from host | N/A (always concurrent) |
+| Idle sleep (`power`) | Yes (light + deep) | Yes (light + deep) | Yes (light) | Yes (light) | Yes (light) |

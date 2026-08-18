@@ -42,10 +42,13 @@ Local commands:
 |---|---|
 | `cat <file>` | Print file contents |
 | `cd <path>` | Change directory |
+| `clear` | Clear the terminal screen |
+| `cp <src> <dst>` | Copy a file |
 | `crc32 <file>` | Print the CRC32 (and size) of a device file |
 | `exit` / `quit` | Exit the CLI |
 | `ls [path]` | List files |
 | `mkdir <dir>` | Create a directory |
+| `mv <src> <dst>` | Move/rename a file |
 | `pwd` | Print working directory |
 | `rm <file>` | Delete a file |
 | `rmdir <dir>` | Remove an empty directory |

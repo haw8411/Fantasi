@@ -88,7 +88,7 @@ build/cli/fantasi --ble-addr=F1:50:0F:05:34:62   # connect to a specific address
 ```
 
 Inside the shell: `ls`, `cd`, `pwd`, `cat`, `upload <local> [remote]`, `mkdir`,
-`rm`, `rmdir`, `help`, `exit`. Over BLE it pairs on demand - enter the passkey
+`rm`, `rmdir`, `cp`, `mv`, `clear`, `help`, `exit`. Over BLE it pairs on demand - enter the passkey
 shown in the device's USB log. See [docs/bluetooth.md](docs/bluetooth.md) for
 pairing details and [docs/cli.md](docs/cli.md) for the full command reference.
 
@@ -126,14 +126,15 @@ fantasi> help
   connect     connect to a BLE peer
   crc32       CRC32 of a device file
   device      print device identifier
-  df          show free flash bytes
+  df          show filesystem usage per mount
   dfu         reboot into bootloader/DFU
   disconnect  disconnect BLE peer(s)
   echo        print arguments back
   exit        exit the CLI
+  format      erase internal storage (format internal)
   free        report heap and SRAM free bytes
   help        list commands
-  kill        stop the running app: kill [pid]
+  kill        stop a pid or the running app
   launch      load and run an app (/ramfs or /apps path)
   log         stream or write log messages
   ls          list files
@@ -141,6 +142,7 @@ fantasi> help
   mkdir       create a directory
   msc         enter USB mass storage mode
   pair        pair with a BLE device
+  power       sleep status/control (power sleep on|off)
   ps          list tasks (state, priority, free stack) + heap summary
   pwd         print working directory
   quit        exit the CLI
@@ -150,6 +152,7 @@ fantasi> help
   rmdir       remove empty directory
   scan        scan for BLE devices
   settings    manage saved settings
+  shortcut    list/set/run app shortcuts (slots 0-7)
   shutdown    power the device off
   unpair      remove BLE bond(s)
   upload      copy host file to device

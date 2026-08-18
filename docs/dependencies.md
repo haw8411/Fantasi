@@ -26,6 +26,7 @@ in-tree.
 |---|---|---|---|
 | TinyUSB | **0.17.0** (`TUSB_TAG`) | `git clone` on demand (`check-tinyusb`) | all targets (USB stack). `check-tinyusb` also applies the Fantasi patches under `third_party/tinyusb_patches/` (SAM7S DCD for Proxmark3; the AT32 DWC2 port for Proxmark5). |
 | LittleFS | **v2.11.3** (`LFS_TAG`) | `git clone` on demand (`check-littlefs`) | all targets (internal flash FS) |
+| FatFs | vendored | in `third_party/` | external FAT volumes (Flipper SD card) |
 | FreeRTOS-Kernel | vendored | in `third_party/` | all targets |
 | nanopb (runtime) | vendored | in `third_party/` | protobuf encode/decode on device |
 | CMSIS core | vendored | in `third_party/` | Cortex-M targets (incl. Proxmark5 `core_cm4.h`) |

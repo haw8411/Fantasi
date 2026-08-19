@@ -115,6 +115,9 @@ extern bool     g_switch_mode;               /* device is switch-mode (PM3): its
 #ifdef HAS_PROTO
 extern uint32_t proto_req_id;                  /* monotonic protobuf request id */
 extern size_t   proto_rx_len;                  /* protobuf RX accumulator length */
+/* No complete response arrived before the receive deadline. Unlike -1, this
+ * does not mean that the transport disconnected or the frame was invalid. */
+#define PROTO_RECV_TIMEOUT (-2)
 int   proto_send(CliRequest *req);       /* drain stale rx, then send */
 int   proto_write_req(CliRequest *req);        /* send without draining (pipelined) */
 int   proto_recv(CliResponse *resp);

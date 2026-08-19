@@ -545,7 +545,10 @@ static bool find_fantasi_device(char *ser_path, size_t ser_len,
 
 static bool wait_for_fantasi_block(char *out, size_t len, int timeout_s)
 {
-    for (int i = 0; i < timeout_s * 4; i++) {
+    /* timeout_s == 0: a single scan with no waiting (a pure presence probe). */
+    int iterations = timeout_s * 4;
+    if (iterations < 1) iterations = 1;
+    for (int i = 0; i < iterations; i++) {
         glob_t g;
         if (glob("/sys/bus/usb/devices/[0-9]*", 0, NULL, &g) != 0) {
             usleep(250000);
@@ -583,7 +586,7 @@ static bool wait_for_fantasi_block(char *out, size_t len, int timeout_s)
             }
         }
         globfree(&g);
-        usleep(250000);
+        if (i + 1 < iterations) usleep(250000);
     }
     return false;
 }
@@ -1031,7 +1034,7 @@ static int usb_recv_proto(CliResponse *resp)
             }
         }
     }
-    return -1;
+    return PROTO_RECV_TIMEOUT;
 }
 #endif /* HAS_USB_VENDOR */
 
@@ -1123,7 +1126,7 @@ int proto_recv(CliResponse *resp)
             }
         }
     }
-    return -1;
+    return PROTO_RECV_TIMEOUT;
 }
 
 void proto_send_cmd(const char *cmd)
@@ -1147,11 +1150,17 @@ static void proto_read_response(bool forward_stdin)
 
     CliResponse resp;
     bool got_data = false;
+    bool has_more = false;
 
     for (;;) {
         if (proto_stream_interrupted) break;
 
-        if (proto_recv(&resp) < 0) break;
+        int rc = proto_recv(&resp);
+        /* Once has_next establishes a stream, inactivity is not completion.
+         * Keep waiting until the device ends it, the link fails, or the user
+         * interrupts it. Ordinary requests still retain the receive deadline. */
+        if (rc == PROTO_RECV_TIMEOUT && has_more) continue;
+        if (rc < 0) break;
         got_data = true;
         if (resp.which_payload == CliResponse_output_tag && resp.payload.output[0]) {
             if (g_cap) cap_puts(resp.payload.output);
@@ -1164,7 +1173,8 @@ static void proto_read_response(bool forward_stdin)
         else if (resp.which_payload == CliResponse_error_tag)
             fprintf(stderr, "error: %s\n", resp.payload.error.message);
         fflush(stdout);
-        if (!resp.has_next) goto done;
+        has_more = resp.has_next;
+        if (!has_more) goto done;
 
         /* Only a launch treats stdin as app I/O: a piped/non-tty ^C arrives as a
          * literal 0x03 byte (an interactive tty delivers SIGINT, handled above),
@@ -1298,7 +1308,8 @@ bool try_webusb_upgrade(bool required)
  * The first word completes against the command set: the host-local commands (the local_cmd registry)
  * PLUS the device's own commands (ps, log, version, ...), fetched once by querying its `help` and
  * cached - completing only local names would wrongly turn `p` into `pwd` when the device also has `ps`.
- * Arguments aren't completed except for `upload`, whose argument is a HOST file (readline's default). */
+ * Arguments of the file commands complete against the device filesystem (see devfile_generator);
+ * `upload`'s first argument is a host file (readline's default). */
 static char g_dev_cmd[64][24];
 static int  g_dev_ncmd = -1;   /* -1 = not yet fetched */
 
@@ -1353,16 +1364,173 @@ static char *cmd_generator(const char *text, int state)
     return NULL;
 }
 
+/* ---- Device filename completion ----
+ * Path arguments complete against the device filesystem, listed the same way the
+ * file commands read it: a dir_list protobuf request over WebUSB/BLE, or readdir
+ * on the OS-mounted FAT over serial. On plain serial with no block device exposed
+ * (a switch-mode PM3 still in CDC mode) completion stays silent - switching the
+ * device into MSC mode on a TAB press would be far too disruptive. */
+static char **g_fc_names;         /* entries of the directory being completed; dirs end in '/' */
+static int    g_fc_count, g_fc_cap;
+static bool   g_fc_dirs_only;     /* cd/mkdir/rmdir: only directories make sense */
+
+static void fc_reset(void)
+{
+    for (int i = 0; i < g_fc_count; i++) free(g_fc_names[i]);
+    g_fc_count = 0;
+}
+
+static void fc_add(const char *name, bool is_dir)
+{
+    if (!name[0] || strcmp(name, ".") == 0 || strcmp(name, "..") == 0) return;
+    if (g_fc_count == g_fc_cap) {
+        int ncap = g_fc_cap ? g_fc_cap * 2 : 32;
+        char **nn = realloc(g_fc_names, ncap * sizeof *nn);
+        if (!nn) return;
+        g_fc_names = nn; g_fc_cap = ncap;
+    }
+    size_t l = strlen(name);
+    char *s = malloc(l + 2);
+    if (!s) return;
+    memcpy(s, name, l);
+    if (is_dir) s[l++] = '/';
+    s[l] = '\0';
+    g_fc_names[g_fc_count++] = s;
+}
+
+/* Fill g_fc_names with the entries of the resolved device directory `dirpath`. */
+static void fc_list(const char *dirpath)
+{
+#ifdef HAS_PROTO
+    if (use_ble || use_usb) {
+        if (!ser_connected) return;   /* a dead link would just sit in proto_recv timeouts */
+        CliRequest req = CliRequest_init_zero;
+        req.id = ++proto_req_id;
+        req.which_payload = CliRequest_dir_list_tag;
+        strncpy(req.payload.dir_list.path, dirpath,
+                sizeof(req.payload.dir_list.path) - 1);
+        if (proto_send(&req) < 0) return;
+        CliResponse resp;
+        do {
+            if (proto_recv(&resp) < 0) break;
+            if (resp.which_payload == CliResponse_dir_entry_tag)
+                fc_add(resp.payload.dir_entry.name, resp.payload.dir_entry.is_dir);
+        } while (resp.has_next);
+        return;
+    }
+#endif
+    /* Serial + MSC path. Only when the FAT is reachable without disturbing the
+     * device: already mounted, or the block device already exposed (composite
+     * FZ/CU, where fat_mount just mounts it). */
+    if (!g_mnt[0]) {
+        char blk[64];
+        if (!wait_for_fantasi_block(blk, sizeof blk, 0)) return;
+        if (!fat_mount()) return;
+    }
+    char host[512];
+    snprintf(host, sizeof host, "%s", fat_path(dirpath));   /* fat_path's static buffer is reused below */
+    DIR *d = opendir(host);
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        char full[800];
+        snprintf(full, sizeof full, "%s/%s", host, e->d_name);
+        struct stat st;
+        fc_add(e->d_name, stat(full, &st) == 0 && S_ISDIR(st.st_mode));
+    }
+    closedir(d);
+}
+
+static char *devfile_generator(const char *text, int state)
+{
+    static int idx; static size_t blen;
+    static char dirpfx[192], base[192];   /* "apps/fo" -> dirpfx "apps/", base "fo" */
+    if (state == 0) {
+        idx = 0;
+        const char *slash = strrchr(text, '/');
+        const char *b = slash ? slash + 1 : text;
+        size_t dl = slash ? (size_t)(slash - text) + 1 : 0;   /* keep the '/' */
+        if (dl >= sizeof dirpfx || strlen(b) >= sizeof base) return NULL;
+        memcpy(dirpfx, text, dl); dirpfx[dl] = '\0';
+        snprintf(base, sizeof base, "%s", b);
+        blen = strlen(base);
+
+        char resolved[256];
+        resolve_path(dirpfx, resolved, sizeof resolved);   /* "" -> cwd; relative vs cwd; "/x/" -> "/x" */
+        fc_reset();
+        fc_list(resolved);
+    }
+    while (idx < g_fc_count) {
+        const char *nm = g_fc_names[idx++];
+        if (g_fc_dirs_only && nm[strlen(nm) - 1] != '/') continue;
+        if (strncmp(nm, base, blen) != 0) continue;
+        char *m = malloc(strlen(dirpfx) + strlen(nm) + 1);
+        if (!m) return NULL;
+        strcpy(m, dirpfx);
+        strcat(m, nm);
+        return m;
+    }
+    return NULL;
+}
+
+/* Commands whose arguments are device paths. `upload` is special-cased in
+ * cli_completion: its first argument is a host file, device from the second on. */
+static bool takes_device_paths(const char *cmd)
+{
+    static const char *const names[] = { "ls", "cd", "cat", "rm", "mkdir", "rmdir",
+                                         "crc32", "edit", "cp", "mv", "launch" };
+    for (size_t i = 0; i < sizeof names / sizeof names[0]; i++)
+        if (strcmp(cmd, names[i]) == 0) return true;
+    return false;
+}
+
 static char **cli_completion(const char *text, int start, int end)
 {
     (void)end;
-    if (start == 0) {                            /* the command word */
+
+    /* Complete within the current ';'-separated segment (see exec_commands). */
+    int seg = 0;
+    for (int i = 0; i < start; i++)
+        if (rl_line_buffer[i] == ';') seg = i + 1;
+    while (rl_line_buffer[seg] == ' ' || rl_line_buffer[seg] == '\t') seg++;
+
+    if (start <= seg) {                          /* the command word */
         rl_attempted_completion_over = 1;        /* command list only - no host-file fallback */
         return rl_completion_matches(text, cmd_generator);
     }
-    if (strncmp(rl_line_buffer, "upload ", 7) != 0)   /* args are device paths (except upload's host file) */
-        rl_attempted_completion_over = 1;
-    return NULL;
+
+    /* An argument: find the segment's command word and which argument this is. */
+    char cmd[24] = "";
+    int argn = 0;                                /* 1 = completing the first argument */
+    for (int i = seg; i < start; ) {
+        while (i < start && (rl_line_buffer[i] == ' ' || rl_line_buffer[i] == '\t')) i++;
+        if (i >= start) break;
+        int ws = i;
+        while (i < start && rl_line_buffer[i] != ' ' && rl_line_buffer[i] != '\t') i++;
+        if (argn == 0) {
+            int cl = i - ws;
+            if (cl >= (int)sizeof cmd) cl = (int)sizeof cmd - 1;
+            memcpy(cmd, rl_line_buffer + ws, cl);
+            cmd[cl] = '\0';
+        }
+        argn++;
+    }
+
+    if (strcmp(cmd, "upload") == 0 && argn == 1)
+        return NULL;                             /* upload's source is a host file: readline's default */
+
+    rl_attempted_completion_over = 1;            /* device args never fall back to host files */
+    if (!takes_device_paths(cmd) && !(strcmp(cmd, "upload") == 0 && argn >= 2))
+        return NULL;
+
+    g_fc_dirs_only = strcmp(cmd, "cd") == 0 || strcmp(cmd, "mkdir") == 0 ||
+                     strcmp(cmd, "rmdir") == 0;
+    char **m = rl_completion_matches(text, devfile_generator);
+    /* A directory match ends in '/': suppress the trailing space so the next TAB
+     * descends into it. */
+    if (m && m[0][0] && m[0][strlen(m[0]) - 1] == '/')
+        rl_completion_append_character = '\0';
+    return m;
 }
 
 /* Refresh the client-side settings cached from the device. Currently that's just the active theme (read
@@ -1575,7 +1743,7 @@ int main(int argc, char **argv)
         g_no_history = true;                             /* -c: run one command, save nothing */
         exec_commands(oneshot);
     } else {
-        rl_attempted_completion_function = cli_completion;   /* TAB completes the command word */
+        rl_attempted_completion_function = cli_completion;   /* TAB: command word + device filenames */
         /* The idle-reconnect hook is only useful for an interactive session. With
          * piped (non-TTY) input a non-NULL rl_event_hook keeps readline's read loop
          * alive at EOF instead of returning NULL, so a script that doesn't end in
@@ -1608,6 +1776,13 @@ int main(int argc, char **argv)
             strncpy(line, rl, sizeof(line) - 1);
             line[sizeof(line) - 1] = '\0';
             free(rl);
+
+            /* rtrim: a tab-completed filename gets a trailing space appended, which
+             * would otherwise end up inside the path argument ("open failed"). */
+            size_t ll = strlen(line);
+            while (ll > 0 && (line[ll - 1] == ' ' || line[ll - 1] == '\t'))
+                line[--ll] = '\0';
+            if (!ll) continue;
 
             if (!exec_commands(line)) break;
         }

@@ -75,6 +75,12 @@ void cli_write(const char *s)
     }
 }
 
+void cli_flush(void)
+{
+    cli_ctx_t *ctx = cli_current_ctx();
+    if (ctx && ctx->transport.flush) ctx->transport.flush();
+}
+
 int cli_printf(const char *fmt, ...)
 {
     char buf[CLI_PRINT_BUF];
@@ -192,9 +198,8 @@ void cli_task_with_transport(void *arg)
         if (ctx->transport.poll) ctx->transport.poll();
         size_t n = ctx->transport.read(buf, sizeof(buf), ctx->transport.ctx);
         if (n == 0) {
-            /* Event-driven transports block here until their RX callback
-             * signals (the timeout only bounds a missed wakeup); others keep
-             * the historical 5 ms poll. */
+            /* Event-driven transports wait for an RX signal. Others poll at
+             * 5 ms intervals. */
             if (ctx->transport.wait) ctx->transport.wait(100);
             else                     vTaskDelay(pdMS_TO_TICKS(5));
             continue;
@@ -214,8 +219,7 @@ static bool usb_connected(void *c) {
     (void)c; return hal_serial_connected();
 }
 
-/* Poll fallback for platforms whose serial has no RX-event wait (PM3's
- * interrupt CDC glue): keep the historical 5 ms cadence. */
+/* Poll fallback for serial transports without an RX-event wait. */
 __attribute__((weak)) void hal_serial_wait(uint32_t timeout_ms)
 {
     uint32_t ms = timeout_ms > 5 ? 5 : timeout_ms;

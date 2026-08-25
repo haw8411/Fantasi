@@ -71,7 +71,9 @@ void fantasi_log_stream(void)
     cli_ctx_t *ctx = cli_current_ctx();
     if (!ctx) return;
 
+    xSemaphoreTake(log_mutex, portMAX_DELAY);
     uint16_t cursor = ring_tail;
+    xSemaphoreGive(log_mutex);
     char line[LOG_ENTRY_MAX + 4];
 
     for (;;) {
@@ -90,20 +92,24 @@ void fantasi_log_stream(void)
         if (ctx->transport.connected && !ctx->transport.connected(ctx->transport.ctx))
             return;
 
-        xSemaphoreTake(log_mutex, portMAX_DELAY);
-
-        int lpos = 0;
-        while (cursor != ring_head && lpos < (int)sizeof(line) - 1) {
-            line[lpos++] = ring[cursor];
-            cursor = (cursor + 1) % LOG_RING_SIZE;
-            if (line[lpos - 1] == '\n') {
-                line[lpos] = '\0';
-                cli_write(line);
-                lpos = 0;
+        /* Copy at most one complete entry under the ring lock, then release it
+         * before touching this session's transport. A WebUSB reader may apply
+         * mailbox backpressure; it must not stall log producers or a second log
+         * session while its own output is blocked. */
+        for (;;) {
+            int lpos = 0;
+            xSemaphoreTake(log_mutex, portMAX_DELAY);
+            while (cursor != ring_head && lpos < (int)sizeof(line) - 1) {
+                line[lpos++] = ring[cursor];
+                cursor = (cursor + 1) % LOG_RING_SIZE;
+                if (line[lpos - 1] == '\n') break;
             }
+            xSemaphoreGive(log_mutex);
+            if (!lpos) break;
+            line[lpos] = '\0';
+            cli_write(line);
+            if (line[lpos - 1] != '\n') break;
         }
-
-        xSemaphoreGive(log_mutex);
 
         if (ctx->transport.flush) ctx->transport.flush();
         vTaskDelay(pdMS_TO_TICKS(100));

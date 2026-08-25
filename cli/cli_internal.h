@@ -99,7 +99,7 @@ extern bool g_no_history;                    /* -c one-shot mode: don't read or 
 bool  fat_mount(void);                       /* ensure the Fantasi FAT is mounted */
 void  fat_unmount(void);
 const char *fat_path(const char *vpath);     /* device path -> host mount path */
-void  fat_sync(void);
+bool  fat_sync(void);
 
 extern int  ser_fd;                          /* serial fd, <0 if not open */
 extern bool msc_active;                      /* MSC mount currently active */
@@ -114,6 +114,7 @@ extern bool     g_switch_mode;               /* device is switch-mode (PM3): its
                                               * so uploads pace one chunk at a time */
 #ifdef HAS_PROTO
 extern uint32_t proto_req_id;                  /* monotonic protobuf request id */
+extern uint32_t proto_session_id;              /* device-owned logical session; 0 = legacy */
 extern size_t   proto_rx_len;                  /* protobuf RX accumulator length */
 /* No complete response arrived before the receive deadline. Unlike -1, this
  * does not mean that the transport disconnected or the frame was invalid. */

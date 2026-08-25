@@ -46,6 +46,11 @@ int32_t  ramfs_size(const char *name);
  * the file is written or removed. Used by the app loader to read in place. */
 const uint8_t *ramfs_get(const char *name, uint32_t *len);
 
+/* Remove a file-table entry without freeing its backing buffer and transfer
+ * that allocation to the caller. Used to turn a transient module ELF into its
+ * loaded image without requiring a second large contiguous heap block. */
+int      ramfs_take(const char *name, uint8_t **data, uint32_t *len);
+
 int      ramfs_remove(const char *name);
 
 /* Rename by relabeling the existing entry; the data buffer is not moved. */

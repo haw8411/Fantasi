@@ -293,6 +293,7 @@ typedef struct {
  * Reset compare-values (C1/C2/C3) are already set for the 48 MHz USB path, so
  * bring-up is just: clock-enable + set ENTRIM|CALON. */
 #define ACC_CTRL1        (*(volatile uint32_t *)(0x40017400UL + 0x04u))
+#define ACC_CTRL1_SOF_OTG2 (1u << 2) /* use OTGFS2 SOF as calibration reference */
 #define ACC_CTRL1_ENTRIM (1u << 1)   /* calibrate HICKTRIM (finer, 20 kHz/step) */
 #define ACC_CTRL1_CALON  (1u << 0)   /* start calibrating off USB_SOF */
 

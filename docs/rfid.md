@@ -65,7 +65,9 @@ and `emulate` are answered on the host; the rest dispatch to the device. `write`
 
 ## Protocols
 
-`list` presents a band > tech > protocol tree.
+`list` presents a band > tech > protocol tree. Feature availability is shown
+per-protocol. For example, MIFARE Classic lists its `read`, `sniff`, `raw`, `emulate`,
+and `collect` implementations.
 
 The three available bands are: **LF**, **HF**, and **UHF**, in order.
 
@@ -102,9 +104,7 @@ own format that dumps interchange for the common cases.
 
 ## Modularity
 
-The app itself carries almost no protocol code. Each feature is a separate ELF module
-built from the same folder: the HF reader, the LF reader, the sniffer, raw transceive,
-T5577 read/write, and the MIFARE collect, read and emulate stages. A module is fetched
-from the host over the protobuf link the moment it is needed, run, then deleted, so only
-one is ever resident. That discipline fits the whole subsystem inside the tight flash
-and heap of the smallest target, the Proxmark3.
+The RFID app itself is a loader: it contains almost no protocol code. Modules are
+obtained the moment they are needed, run, then deleted from RAMFS, so only one is
+ever resident. This design allows Fantasi to not face future RFID-related flash
+constraints in even the smallest target, the Proxmark3.

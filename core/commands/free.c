@@ -2,14 +2,22 @@
 #include "../../hal/hal.h"
 
 #include "FreeRTOS.h"
+#include "task.h"
 
 static int cmd_free(int argc, char **argv)
 {
     (void)argc; (void)argv;
+    /* Let the idle task reclaim terminated session workers before sampling. */
+    vTaskDelay(pdMS_TO_TICKS(15));
     size_t now = hal_free_heap_bytes();
     size_t lo  = hal_min_ever_free_heap_bytes();
     cli_printf("heap: %u/%u B free (min-ever: %u)\r\n",
                (unsigned)now, (unsigned)configTOTAL_HEAP_SIZE, (unsigned)lo);
+    HeapStats_t hs;
+    vPortGetHeapStats(&hs);
+    cli_printf("heap blocks: %u, largest: %u B\r\n",
+               (unsigned)hs.xNumberOfFreeBlocks,
+               (unsigned)hs.xSizeOfLargestFreeBlockInBytes);
 
     extern volatile uint32_t g_oom_count, g_oom_free_at_fail;
     if (g_oom_count)

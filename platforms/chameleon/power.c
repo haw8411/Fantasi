@@ -260,12 +260,18 @@ void cu_suppress_ticks_and_sleep(uint32_t expected_idle_ticks)
      * by hand, lazily, here - CLOCK registers are unrestricted with no SD. */
     if (!s_rtc_running) {
         if (NRF_RTC1->COUNTER == 0) {
+            /* Keep the ownership check and CLOCK task indivisible with
+             * respect to the runtime `ble on` task.  Otherwise BLE could
+             * take SoftDevice ownership between the check and TASKS_START,
+             * or wait forever on a kickoff this task has not issued yet. */
+            taskENTER_CRITICAL();
             if (!s_lfclk_kicked && !cu_ble_sd_is_active()) {
-                s_lfclk_kicked = true;
                 NRF_CLOCK->LFCLKSRC = CLOCK_LFCLKSRC_SRC_Xtal << CLOCK_LFCLKSRC_SRC_Pos;
                 NRF_CLOCK->EVENTS_LFCLKSTARTED = 0;
                 NRF_CLOCK->TASKS_LFCLKSTART = 1;
+                s_lfclk_kicked = true;
             }
+            taskEXIT_CRITICAL();
             return;
         }
         s_rtc_running = true;
@@ -378,14 +384,62 @@ void cu_suppress_ticks_and_sleep(uint32_t expected_idle_ticks)
     __enable_irq();
 }
 
-void cu_power_release_lfclk_for_sd(void)
+bool cu_power_release_lfclk_for_sd(void)
 {
-    if (!s_lfclk_kicked) return;
-    s_lfclk_kicked = false;
+    if (!s_lfclk_kicked) return true;
+
+    /* LFCLKSTART is asynchronous. Usually the LFXO has long since settled by the time a runtime `ble on`
+     * reaches here, but handle the boundary where tickless idle has only just kicked it: LFCLKSTOP is not a
+     * valid task until the clock reports running. SysTick remains live while this task spins, giving both
+     * waits real bounded deadlines without sleeping on the RTC whose clock we are about to stop. */
+    TickType_t started = xTaskGetTickCount();
+    while (!(NRF_CLOCK->LFCLKSTAT & CLOCK_LFCLKSTAT_STATE_Msk) &&
+           (TickType_t)(xTaskGetTickCount() - started) < pdMS_TO_TICKS(500)) { }
+    if (!(NRF_CLOCK->LFCLKSTAT & CLOCK_LFCLKSTAT_STATE_Msk)) return false;
+
     NRF_CLOCK->TASKS_LFCLKSTOP = 1;
-    /* The SD restarts the LFXO from its sd_lfclk_cfg before sd_enable
-     * returns; RTC1 freezes only across that call, during which no task
-     * runs, so the tickless readiness latch can stay set. */
+    started = xTaskGetTickCount();
+    while ((NRF_CLOCK->LFCLKSTAT & CLOCK_LFCLKSTAT_STATE_Msk) &&
+           (TickType_t)(xTaskGetTickCount() - started) < pdMS_TO_TICKS(50)) { }
+    if (NRF_CLOCK->LFCLKSTAT & CLOCK_LFCLKSTAT_STATE_Msk) return false;
+
+    s_lfclk_kicked = false;
+    NRF_CLOCK->EVENTS_LFCLKSTARTED = 0;
+    /* The SD restarts LFCLK from its own configuration before sd_enable returns. RTC1 freezes only across
+     * that call, during which no task runs, so the tickless readiness latch can stay set. */
+    return true;
+}
+
+bool cu_power_reclaim_lfclk_after_sd_failure(void)
+{
+    /* The SoftDevice is inactive here: either sd_softdevice_enable failed,
+     * or a later init step failed and the caller successfully disabled it.
+     * CLOCK is app-owned again, so restore the state tickless idle had
+     * before the attempted handoff. */
+    NRF_CLOCK->LFCLKSRC = CLOCK_LFCLKSRC_SRC_Xtal << CLOCK_LFCLKSRC_SRC_Pos;
+    NRF_CLOCK->EVENTS_LFCLKSTARTED = 0;
+    s_lfclk_kicked = true;
+    NRF_CLOCK->TASKS_LFCLKSTART = 1;
+
+    TickType_t started = xTaskGetTickCount();
+    while (!(NRF_CLOCK->LFCLKSTAT & CLOCK_LFCLKSTAT_STATE_Msk) &&
+           (TickType_t)(xTaskGetTickCount() - started) < pdMS_TO_TICKS(500)) { }
+    if (NRF_CLOCK->LFCLKSTAT & CLOCK_LFCLKSTAT_STATE_Msk) return true;
+
+    /* Do not leave tickless idle trusting an RTC that froze during the
+     * failed handoff.  Reset its readiness and counter, but retain the
+     * ownership latch: TASKS_LFCLKSTART was issued above and the crystal can
+     * still come up just after this deadline, so a later `ble on` must stop
+     * and hand that app-owned clock back. */
+    NRF_RTC1->TASKS_STOP = 1;
+    NRF_RTC1->TASKS_CLEAR = 1;
+    NRF_RTC1->INTENCLR = RTC_INTENCLR_COMPARE0_Msk | RTC_INTENCLR_OVRFLW_Msk;
+    NRF_RTC1->EVENTS_COMPARE[0] = 0;
+    NRF_RTC1->EVENTS_OVRFLW = 0;
+    NVIC_ClearPendingIRQ(RTC1_IRQn);
+    NRF_RTC1->TASKS_START = 1;        /* it counts if/when the pending LFXO start completes */
+    s_rtc_running = false;
+    return false;
 }
 
 /* ---- Init ---- */

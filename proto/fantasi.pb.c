@@ -12,6 +12,9 @@ PB_BIND(CliRequest, CliRequest, 2)
 PB_BIND(CliResponse, CliResponse, 2)
 
 
+PB_BIND(CancelRequest, CancelRequest, AUTO)
+
+
 PB_BIND(FileWriteChunk, FileWriteChunk, 2)
 
 

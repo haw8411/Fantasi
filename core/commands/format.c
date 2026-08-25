@@ -14,6 +14,7 @@ static int cmd_format(int argc, char **argv)
     }
 
     cli_write("formatting internal storage...\r\n");
+    cli_flush();
     int err = hal_storage_format();
     if (err) cli_printf("format failed (%d)\r\n", err);
     else     cli_write("internal storage erased\r\n");

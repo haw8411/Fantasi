@@ -67,6 +67,12 @@
 #define ACI_GAP_SEND_PAIRING_REQ        0xFC9F
 #define ACI_GAP_TERMINATE               0xFC93
 #define ACI_GAP_TERMINATE_GAP_PROC      0xFC9D
+#define ACI_GATT_UPDATE_CHAR_VALUE      0xFD06
+
+/* Legacy advertising has 31 bytes total. The stack also contributes Flags and
+ * TX Power, leaving 23 bytes for the complete local name. Keep GAP's Device
+ * Name characteristic identical to the advertised identity. */
+#define BLE_DEVICE_NAME_MAX             23
 
 #define GAP_EVT_PAIRING_COMPLETE        0x0401
 #define GAP_EVT_PASS_KEY_REQ            0x0402
@@ -309,10 +315,27 @@ static int hci_send_locked(uint16_t opcode, const void *params, uint8_t plen);
 static TimerHandle_t  adv_timer;
 static void ble_start_background_adv(void);
 
+static uint8_t ble_format_device_name(char out[BLE_DEVICE_NAME_MAX + 1])
+{
+    const char *src = "Fantasi ";
+    uint8_t len = 0;
+    while (*src && len < BLE_DEVICE_NAME_MAX)
+        out[len++] = *src++;
+
+    src = hal_device_name();
+    while (src && *src && len < BLE_DEVICE_NAME_MAX)
+        out[len++] = *src++;
+    out[len] = '\0';
+    return len;
+}
+
 static void adv_timer_cb(TimerHandle_t t)
 {
-    (void)t;
     ble_start_background_adv();
+    /* Connection teardown may outlive the disconnect event. Retry until CPU2
+     * accepts SET_DISCOVERABLE. */
+    if (adv_restart_needed)
+        (void)xTimerStart(t, 0);
 }
 
 /* ------------------------------------------------------------------ */
@@ -508,6 +531,10 @@ static void handle_connection_complete(const uint8_t *p, uint8_t len,
     s_att_mtu = 23;
     s_dle_tx  = 27;
     if (status == 0) {
+        /* A successful CONNECT_IND ends advertising. Cancel any retry left by
+         * an earlier aborted attempt; a stale timer callback also checks the
+         * active connection table before touching GAP state. */
+        adv_restart_needed = false;
         pwr_inhibit_enter(PWR_CLIENT_BLE_LINK);   /* atomic - ISR-safe */
         for (int i = 0; i < BLE_MAX_CONN; i++) {
             if (!ble_conns[i].active) {
@@ -518,8 +545,8 @@ static void handle_connection_complete(const uint8_t *p, uint8_t len,
                 break;
             }
         }
-        /* Ask for the faster 15 ms connection interval (done in task
-         * context from ble_serial_poll - hci_send can't run from here). */
+        /* Request the flash-safe connection interval in task context
+         * (hci_send cannot run from this ISR). */
         ble_serial_on_connect(handle);
     } else {
         /* Connection attempt failed/aborted (status != 0) - e.g. the central
@@ -1083,13 +1110,13 @@ c2_ok:
                        &ble_init_params, sizeof(ble_init_params));
     if (rc != 0) { cli_printf("ble: BLE_Init rc=%d\r\n", rc); goto fail; }
 
-    /* Flash activity control: tell CPU2 to check HSEM7 before flash ops */
-    uint8_t flash_act = 1;
-    int fa_rc = shci_send(SHCI_OPCODE_SET_FLASH_ACT, &flash_act, 1);
-    if (fa_rc != 0) {
-        flash_act = 0;
-        shci_send(SHCI_OPCODE_SET_FLASH_ACT, &flash_act, 1);
-    }
+    /* Use CPU2's default PESD timing protection for flash access. SEM7 mode can
+     * leave CPU1 waiting for the semaphore for an entire busy BLE connection,
+     * eventually tripping the supervision timeout during a sustained upload.
+     * The flash driver polls PESD before every operation (and retains the SEM7
+     * compatibility check), matching ST's dual-mode reference algorithm. */
+    uint8_t flash_act = 0;  /* FLASH_ACTIVITY_CONTROL_PES */
+    (void)shci_send(SHCI_OPCODE_SET_FLASH_ACT, &flash_act, 1);
 
     /* HCI Reset */
     rc = hci_send(0x0C03, NULL, 0);
@@ -1121,10 +1148,38 @@ c2_ok:
     rc = hci_send(0xFD01, NULL, 0);
     if (rc != 0) { cli_printf("ble: gatt_init rc=%d\r\n", rc); goto fail; }
 
-    /* GAP Init (0xFC8A): role=CENTRAL|PERIPHERAL (0x05), no privacy, name=24 */
-    uint8_t gap_params[] = { 0x05, 0x00, 0x18 };
-    rc = hci_send(0xFC8A, gap_params, sizeof(gap_params));
-    if (rc != 0) { cli_printf("ble: gap_init rc=%d\r\n", rc); goto fail; }
+    /* GAP Init (0xFC8A): role=CENTRAL|PERIPHERAL, no privacy. Keep the Device
+     * Name characteristic consistent with the advertised identity. */
+    char device_name[BLE_DEVICE_NAME_MAX + 1];
+    uint8_t device_name_len = ble_format_device_name(device_name);
+    uint8_t gap_params[] = { 0x05, 0x00, device_name_len };
+    uint8_t gap_resp[6];
+    uint8_t gap_resp_len = 0;
+    rc = hci_send_resp(0xFC8A, gap_params, sizeof(gap_params),
+                       gap_resp, sizeof(gap_resp), &gap_resp_len);
+    if (rc != 0 || gap_resp_len != sizeof(gap_resp)) {
+        cli_printf("ble: gap_init rc=%d len=%u\r\n", rc, gap_resp_len);
+        goto fail;
+    }
+
+    uint16_t gap_service_handle = (uint16_t)gap_resp[0]
+                                | ((uint16_t)gap_resp[1] << 8);
+    uint16_t name_char_handle = (uint16_t)gap_resp[2]
+                              | ((uint16_t)gap_resp[3] << 8);
+    uint8_t name_update[6 + BLE_DEVICE_NAME_MAX];
+    name_update[0] = (uint8_t)gap_service_handle;
+    name_update[1] = (uint8_t)(gap_service_handle >> 8);
+    name_update[2] = (uint8_t)name_char_handle;
+    name_update[3] = (uint8_t)(name_char_handle >> 8);
+    name_update[4] = 0;                    /* value offset */
+    name_update[5] = device_name_len;
+    memcpy(&name_update[6], device_name, device_name_len);
+    rc = hci_send(ACI_GATT_UPDATE_CHAR_VALUE, name_update,
+                  (uint8_t)(6 + device_name_len));
+    if (rc != 0) {
+        cli_printf("ble: device_name rc=%d\r\n", rc);
+        goto fail;
+    }
 
     ble_state = BLE_READY;
 
@@ -1174,17 +1229,21 @@ static void ble_start_background_adv(void)
 {
     if (ble_state != BLE_READY) return;
 
-    const char *name = hal_device_name();
-    char full[32];
-    int i = 0;
-    const char *prefix = "Fantasi ";
-    while (*prefix && i < 30) full[i++] = *prefix++;
-    while (*name && i < 30)   full[i++] = *name++;
-    full[i] = '\0';
+    /* This profile intentionally exposes one physical peripheral link and
+     * multiplexes independent CLI sessions over it. A delayed retry from a
+     * failed/aborted connection attempt must not disturb a link that has since
+     * completed successfully. */
+    for (int i = 0; i < BLE_MAX_CONN; i++) {
+        if (ble_conns[i].active) {
+            adv_restart_needed = false;
+            return;
+        }
+    }
 
-    uint8_t nlen = (uint8_t)i;
+    char full[BLE_DEVICE_NAME_MAX + 1];
+    uint8_t nlen = ble_format_device_name(full);
     uint8_t name_field_len = nlen + 1;
-    uint8_t p[13 + 29];
+    uint8_t p[14 + BLE_DEVICE_NAME_MAX];
     uint8_t plen = 13 + name_field_len;
     /* Idle power policy: 160-320 ms while in use, 1000-1200 ms when idle
      * (~6x less radio duty; discovery still works, any activity restores

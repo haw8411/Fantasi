@@ -4,7 +4,7 @@
 #include "../../core/log.h"
 #include "../../hal/hal.h"
 #include "FreeRTOS.h"
-#include "stream_buffer.h"
+#include "message_buffer.h"
 #include "semphr.h"
 #include <string.h>
 
@@ -39,12 +39,12 @@ static bool     service_ready;
 
 /* ---- Buffers ---- */
 
-/* Must hold the host's pipelined upload window (UPLOAD_WINDOW=6 framed
- * ~482 B chunks ≈ 3 KB) between ISR delivery and the proto task draining it;
- * a smaller buffer overflows when full and drops bytes, corrupting uploads. */
+/* Preserve ATT-write boundaries so logical-session fragments from independent
+ * host processes remain routable after the ISR. This also holds the pipelined
+ * upload window (~3 KB) between ISR delivery and the proto task draining it. */
 #define RX_BUF_SIZE 4096
 
-static StreamBufferHandle_t rx_stream;
+static MessageBufferHandle_t rx_stream;
 static SemaphoreHandle_t    tx_sem;   /* "WS notification pool has space" signal */
 
 static volatile bool        pair_pending;
@@ -81,7 +81,7 @@ static volatile uint16_t    s_conn_handle = 0xFFFF;
 
 int ble_serial_init(void)
 {
-    rx_stream = xStreamBufferCreate(RX_BUF_SIZE, 1);
+    rx_stream = xMessageBufferCreate(RX_BUF_SIZE);
     tx_sem    = xSemaphoreCreateBinary();
     if (!rx_stream || !tx_sem) return -1;
     /* tx_sem starts empty: it signals TX-pool-available (given by the
@@ -163,7 +163,7 @@ void ble_serial_on_attr_modified(uint16_t conn_handle, uint16_t handle,
     if (handle == rx_char_handle + 1) {
         if (len > 0) {
             BaseType_t woken = pdFALSE;
-            xStreamBufferSendFromISR(rx_stream, data, len, &woken);
+            xMessageBufferSendFromISR(rx_stream, data, len, &woken);
             portYIELD_FROM_ISR(woken);
         }
     }
@@ -286,7 +286,7 @@ size_t ble_serial_write(const uint8_t *buf, size_t len, void *ctx)
 size_t ble_serial_read(uint8_t *buf, size_t len, void *ctx)
 {
     (void)ctx;
-    return xStreamBufferReceive(rx_stream, buf, len, 0);
+    return xMessageBufferReceive(rx_stream, buf, len, 0);
 }
 
 /* Event-driven wait: the IPCC RX ISR (ble.c handle_ble_evt) wakes the proto
@@ -298,7 +298,7 @@ void ble_serial_wait(uint32_t timeout_ms)
     s_ble_waiter = xTaskGetCurrentTaskHandle();
     /* Re-check after registering: bytes/flags that raced in between the
      * caller's read() and here must not sleep a full timeout. */
-    if (!(rx_stream && xStreamBufferBytesAvailable(rx_stream) > 0) &&
+    if (!(rx_stream && !xMessageBufferIsEmpty(rx_stream)) &&
         !conn_param_pending && !pair_pending)
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(timeout_ms));
     s_ble_waiter = NULL;

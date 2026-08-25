@@ -25,17 +25,10 @@ __attribute__((weak)) void platform_usb_task(void *arg) { (void)arg; vTaskSuspen
 #ifndef CLI_TASK_STACK
 #define CLI_TASK_STACK     (configMINIMAL_STACK_SIZE * 8)
 #endif
-/* TinyUSB's tud_task drains events and runs class drivers in the same task -
- * descriptor callbacks, cdc_device, usbd_control. Its real peak is tiny
- * (~72 words measured on PM3 via uxTaskGetSystemState). Default 8× for
- * platforms with roomy heaps; small-heap targets (PM3) override
- * USB_TASK_STACK down to their measured need + margin. */
+/* TinyUSB runs descriptor and class callbacks on this task. Platforms may
+ * override the default stack size for their memory budget. */
 #ifndef USB_TASK_STACK
 #define USB_TASK_STACK     (configMINIMAL_STACK_SIZE * 8)
-#endif
-
-#ifdef FANTASI_ENABLE_BLE_CLI
-static cli_ctx_t ble_cli_ctx;
 #endif
 
 #ifdef FANTASI_ENABLE_PWR_BUTTON
@@ -55,7 +48,7 @@ static void pwr_button_task(void *arg)
     bool fired = false;
     for (;;) {
         if (hal_shutdown_button_held()) {
-            /* Hold in progress: poll at the historical 50 ms cadence. */
+            /* Poll while the button remains held. */
             vTaskDelay(pdMS_TO_TICKS(PWR_BUTTON_POLL_MS));
             if (!hal_shutdown_button_held()) continue;   /* released mid-wait */
             held_ms += PWR_BUTTON_POLL_MS;
@@ -99,33 +92,23 @@ int main(void)
 #endif
 
 #ifdef FANTASI_ENABLE_WEBUSB
-    /* WebUSB protobuf transport. This and the BLE proto task below both default
-     * to x4 (16 KB), sized for the Chameleon: there the LittleFS write path nests
-     * SoftDevice flash SVCs (plus BLE event pumping, for blecli) and x2 tripped
-     * the stack-overflow hook during uploads. Platforms without a SoftDevice run
-     * that path shallow and sequential (the Flipper measured usbproto at 1312 B
-     * and blecli at 1368 B under full transfers), so their Makefiles override these
-     * stacks down e.g. with -DWEBUSB_PROTO_STACK=1024 and -DPROTO_STACK=1024. */
+    /* The RX task handles framing and routing. Session workers run commands
+     * and storage operations. */
 #ifndef WEBUSB_PROTO_STACK
-#define WEBUSB_PROTO_STACK (CLI_TASK_STACK * 4)
+#define WEBUSB_PROTO_STACK 512
 #endif
     xTaskCreate(usb_proto_task, "usbproto", WEBUSB_PROTO_STACK,
                 NULL, tskIDLE_PRIORITY + 1, NULL);
 #endif
 
 #ifdef FANTASI_ENABLE_BLE_CLI
-    ble_cli_ctx.transport.write     = ble_serial_write;
-    ble_cli_ctx.transport.read      = ble_serial_read;
-    ble_cli_ctx.transport.connected = ble_serial_connected;
-    ble_cli_ctx.transport.poll      = ble_serial_poll;
-    ble_cli_ctx.transport.wait      = ble_serial_wait;
-    ble_cli_ctx.transport.ctx       = NULL;
-    /* Defaults to x4; see WEBUSB_PROTO_STACK above for the shared sizing rationale. */
+    /* Polling, packet routing and protobuf probing only. Command execution has
+     * its own active-session stack and no cli_ctx is retained while idle. */
 #ifndef PROTO_STACK
-#define PROTO_STACK (CLI_TASK_STACK * 4)
+#define PROTO_STACK 1024
 #endif
     xTaskCreate(proto_task, "blecli", PROTO_STACK,
-                &ble_cli_ctx, tskIDLE_PRIORITY + 1, NULL);
+                NULL, tskIDLE_PRIORITY + 1, NULL);
 #endif
 
     vTaskStartScheduler();
@@ -142,14 +125,9 @@ int main(void)
  * fantasi_reset(); the weak fallback spins for platforms that don't. */
 __attribute__((weak)) void fantasi_reset(void) { for (;;); }
 
-/* A failed heap allocation is recoverable and must not brick the device: every
- * runtime allocator here checks the result (a ramfs/file upload that outgrows
- * the heap fails the write and reports an error to the host). Resetting here
- * would be worse than the OOM: on STM32WB a warm reset hangs CPU2 and drops USB.
- * Return instead; pvPortMalloc hands the caller NULL to handle. */
-/* OOM breadcrumb. The hook runs inside pvPortMalloc with the scheduler suspended,
- * so it must not log (fantasi_log takes a mutex) - just record, and let `free`/`ps`
- * surface it. */
+/* Allocation failures return NULL to checked callers. This hook runs with the
+ * scheduler suspended, so retain diagnostics for `free` and `ps` instead of
+ * logging through a mutex. */
 volatile uint32_t g_oom_count;
 volatile uint32_t g_oom_free_at_fail;
 void vApplicationMallocFailedHook(void)
@@ -166,4 +144,3 @@ void vApplicationStackOverflowHook(TaskHandle_t t, char *n)
     hal_crash_note(HAL_CRASH_STACK_OVERFLOW);
     fantasi_reset();
 }
-

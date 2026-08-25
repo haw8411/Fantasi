@@ -1397,13 +1397,14 @@ static int rfid_hf_emu_send_stream_u(uint8_t (*next)(void *ctx), void *ctx, int 
 #define T55_WRITE_1_US    400   /* 50 fc */
 #define T55_POWERUP_MS    8     /* field on before the command, to charge the tag  */
 #define T55_PROGRAM_MS    6     /* field on after, for the EEPROM write to commit   */
-/* Field-ON settle after the read command, before capturing the reply. Stock (armsrc/lfops.c
- * T55xxReadBlock) waits 137*8 us here via turn_read_lf_on, then captures a long window (12000 samples ~=
- * 6 block repeats) so the settled repeating data - not the noisy first bits - is what the demod frames
- * ("we want to go past the start and let the repeating data settle in"). We keep this short so the leading
- * quiet gap stays in the (shorter) capture as a frame anchor, and skip the settling-corrupted first copy
- * in the demodulator instead. */
-#define T55_READ_SETTLE_US 120    /* ~15 fc - land just before the reply so the gap is captured */
+#define T55_READ_RESET_MS 20    /* field-off POR gap before another read command    */
+/* Field-ON settle after the read command, before capturing the reply. Match stock T55xxReadBlock's
+ * turn_read_lf_on(137 * 8): the PM3 LF peak detector is still ringing near the start of the response, and
+ * treating those crossings as data creates short false runs. The block repeats continuously and the module
+ * finds its rotation from block 0, so retaining the first response edge is neither necessary nor useful. */
+#define T55_READ_SETTLE_CYCLES 137  /* stock turn_read_lf_on(137 * 8), counted by RX DMA */
+#define T55_DMA_SIZE 256       /* 2.0 ms ping-pong DMA; transient on the existing app-task stack */
+#define T55_DMA_HALF (T55_DMA_SIZE / 2)
 
 /* Fast LF field on/off for gap modulation - just the FPGA config word (the divisor is already set
  * by set_mode(LF_READER)); no SSC/settle, unlike lf_energize which is for capture. */
@@ -1412,21 +1413,37 @@ static void lf_tx_off(void) { fpga_conf(FPGA_MAJOR_MODE_OFF); }
 
 /* Gap-modulate the T5577 reader->tag command in `p` (one byte per bit, 0/1, MSB-first). Charges the
  * tag, then IRQs-off sends start_gap + each bit's field-ON/gap-OFF (the per-bit timing must not be
- * preempted). Leaves the field on at exit (IRQs back on) - the caller decides what happens next: a
- * write holds it for the EEPROM commit, a read holds it for the tag's reply. Shared by modulate+read. */
-static void lf_tx_cmd(const uint8_t *p, int nbits)
+ * preempted). Leaves the field on at exit. Normally IRQs are restored; a read can ask to retain the
+ * critical section just long enough to phase-lock the RX DMA. Shared by modulate+read. */
+/* If keep_critical is true, return with this function's critical section held so the caller can arm RX DMA
+ * at a deterministic offset from the final field restore; the caller must taskEXIT_CRITICAL(). */
+static void lf_tx_cmd(const uint8_t *p, int nbits, bool keep_critical)
 {
     lf_tx_on();
     spin_ms(T55_POWERUP_MS);                             /* charge the tag (IRQs on, field steady) */
 
+    /* A one bit in the fixed-length downlink is exactly one half-bit (32 carrier cycles) longer than a
+     * zero. Without compensation, changing the block-address bits moves the tag reply by half a bit, while
+     * the module intentionally transfers block 0's framing rotation to the target block. Start from a fresh
+     * SSC carrier boundary and pad the whole command to a 64-cycle data-bit multiple, as the Flipper path
+     * does. Every block then restores the field at the same carrier phase regardless of its address/data. */
+    int cycles = T55_START_GAP_US / 8;
+    for (int i = 0; i < nbits; i++)
+        cycles += (p[i] ? T55_WRITE_1_US : T55_WRITE_0_US) / 8 + T55_WRITE_GAP_US / 8;
+    int pad = (64 - (cycles & 63)) & 63;
+
+    fpga_ssc_setup();
     taskENTER_CRITICAL();                                /* gap timing must not be preempted */
+    for (uint32_t w = 0; !(AT91C_BASE_SSC->SSC_SR & AT91C_SSC_RXRDY) && w < 200000u; w++) { }
+    if (AT91C_BASE_SSC->SSC_SR & AT91C_SSC_RXRDY) (void)AT91C_BASE_SSC->SSC_RHR;
+    if (pad) spin_us((uint32_t)pad * 8);                  /* field stays on during phase padding */
     lf_tx_off(); spin_us(T55_START_GAP_US);              /* start gap */
     for (int i = 0; i < nbits; i++) {
         lf_tx_on();  spin_us(p[i] ? T55_WRITE_1_US : T55_WRITE_0_US);
         lf_tx_off(); spin_us(T55_WRITE_GAP_US);
     }
     lf_tx_on();                                          /* field back on */
-    taskEXIT_CRITICAL();
+    if (!keep_critical) taskEXIT_CRITICAL();
 }
 
 /* T5577 block WRITE downlink (TX only): gap-modulate `p` then hold the field for the EEPROM commit.
@@ -1436,7 +1453,7 @@ static int rfid_lf_modulate_u(const uint8_t *p, int nbits, uint32_t opts)
     (void)opts;
     if (s_mode != RFID_LF_READER || !p || nbits <= 0) return RFID_ERR_UNSUPP;
 
-    lf_tx_cmd(p, nbits);
+    lf_tx_cmd(p, nbits, false);
     spin_ms(T55_PROGRAM_MS);                             /* EEPROM programming (IRQs on, field steady) */
     lf_tx_off();
     return 0;
@@ -1444,66 +1461,146 @@ static int rfid_lf_modulate_u(const uint8_t *p, int nbits, uint32_t opts)
 
 /* LF reader->tag round-trip capture (see app_rfid.h): optionally gap-modulate a downlink command, hold the
  * field, and stream-demodulate the reply into `buf` as inter-edge run lengths (sample counts of each level
- * run), up to `cap` runs - never a raw envelope buffer, so it costs no heap. The runs alternate low, high,
- * low... from the first falling edge (the gap->block transition); the caller reconstructs half-bit levels
- * and frames the block. For a
+ * run), up to `cap` bytes - never a raw envelope buffer, so it costs no heap. A [0, initial_level] prefix
+ * preserves the fixed capture-time phase before the alternating run lengths; the caller reconstructs
+ * half-bit levels and frames the block. For a
  * T5577 read the command is opcode 10 + lock 0 + 3-bit block address; the field stays on and the tag clocks
  * the block out continuously. Returns the run count, or <0. */
 static int rfid_lf_transceive_u(const uint8_t *cmd, int nbits, uint8_t *buf, int cap)
 {
     if (s_mode != RFID_LF_READER || !buf || cap <= 0) return RFID_ERR_UNSUPP;
 
-    if (cmd && nbits > 0) lf_tx_cmd(cmd, nbits);         /* send downlink; field left ON */
-    else                  lf_tx_on();
-    fpga_ssc_setup();                                    /* (re)arm the envelope sample stream */
-    spin_us(T55_READ_SETTLE_US);                         /* wait past the peak-detector settle */
+    /* USB normally outranks apps and can remain runnable for an entire multi-packet response. Briefly run
+     * above it while SSC capture is live; otherwise even a `ps` reply can park the demodulator long enough
+     * to drain both PDC banks. The USB IRQ still keeps the endpoint alive, the task drains between captures,
+     * and the caller's priority is restored before return. One capture is bounded to about 65 ms. */
+    UBaseType_t base_prio = uxTaskPriorityGet(NULL);
+    UBaseType_t capture_prio = tskIDLE_PRIORITY + 3;
+    if (base_prio < capture_prio) vTaskPrioritySet(NULL, capture_prio);
+
+    uint8_t dma[T55_DMA_SIZE] __attribute__((aligned(4)));
+    if (cmd && nbits > 0) {
+        lf_tx_cmd(cmd, nbits, true);                     /* returns IRQs-off with field ON */
+    } else {
+        lf_tx_on();
+        fpga_ssc_setup();
+        taskENTER_CRITICAL();
+    }
     if (AT91C_BASE_SSC->SSC_SR & AT91C_SSC_RXRDY) (void)AT91C_BASE_SSC->SSC_RHR;   /* flush stale */
+
+    /* Receive through a small PDC ping-pong buffer instead of polling SSC_RHR directly. The USB task has higher
+     * priority than an app and can preempt it for several LF carrier samples; polling silently loses those
+     * samples and turns a real 32-cycle Manchester half-bit into a 3- or 10-cycle run. DMA preserves the
+     * sample clock while all tasks and IRQs remain schedulable. The ring is transient stack scratch, so this
+     * adds no heap/BSS and no per-session memory. */
+    AT91C_BASE_SSC->SSC_PTCR = AT91C_PDC_RXTDIS;
+    AT91C_BASE_SSC->SSC_RPR  = (uint32_t)(uintptr_t)dma;
+    AT91C_BASE_SSC->SSC_RCR  = T55_DMA_HALF;
+    AT91C_BASE_SSC->SSC_RNPR = (uint32_t)(uintptr_t)(dma + T55_DMA_HALF);
+    AT91C_BASE_SSC->SSC_RNCR = T55_DMA_HALF;
+    AT91C_BASE_SSC->SSC_PTCR = AT91C_PDC_RXTEN;
+    taskEXIT_CRITICAL();                                 /* RX sample zero is phase-locked to field restore */
     TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(300);
 
     /* Demodulate streaming, one SSC sample at a time, storing only the reply's inter-edge run lengths -
-     * never a raw envelope buffer. A boxcar
-     * denoises; EMA trackers give the envelope mean (dc) and a hysteresis band (amp); a two-state edge
-     * detector emits the sample count of each level run. The read gap is unmodulated carrier = envelope
-     * high, so we start `high` and anchor recording on the first falling edge - the gap->block transition,
-     * whose timing is data-independent (to +-1 half-bit). Anchoring instead on the first rising edge would
-     * start 1-2 half-bits into the block depending on its first bits, a data-dependent full-bit phase.
-     * The runs alternate low, high, low... from that edge. */
+     * never a raw envelope buffer. A boxcar denoises; EMA trackers give the envelope mean (dc) and a
+     * hysteresis band (amp); a two-state edge detector emits the sample count of each level run. Let those
+     * adaptive trackers converge before recording. The response is a gapless repeating block and its module
+     * searches all rotations, so the first recorded falling edge may be anywhere in the block. */
     int32_t dc = -1, amp = 0;
     uint8_t win[LF_SMOOTH] = {0};
     int32_t wsum = 0;
     int count = 0, last_edge = -1;
     int high = 1, started = 0;
+    int seen = 0;
+    int status = 0;
+    int requeue_half = 0;                                /* A is free after the initial A -> B handoff */
+    uint8_t *data = dma;
 
-    for (int i = 0; i < LF_SPAN && count < cap; i++) {
-        while (!(AT91C_BASE_SSC->SSC_SR & AT91C_SSC_RXRDY))
-            if (xTaskGetTickCount() > deadline) { lf_tx_off(); return count; }
-        uint8_t s = (uint8_t)AT91C_BASE_SSC->SSC_RHR;
+    while (seen < LF_SPAN + T55_READ_SETTLE_CYCLES && count < cap) {
+        /* Both PDC banks drained before we could refill the next pointer. Fail this capture: resuming after
+         * the SSC has dropped samples would destroy both Manchester timing and the fixed framing phase. */
+        if (AT91C_BASE_SSC->SSC_RCR == 0) {
+            AT91C_BASE_SSC->SSC_PTCR = AT91C_PDC_RXTDIS;
+            status = -2;
+            break;
+        }
 
-        wsum += (int32_t)s - win[i % LF_SMOOTH];         /* rolling boxcar over the last LF_SMOOTH cycles */
-        win[i % LF_SMOOTH] = s;
-        int32_t v = (wsum / LF_SMOOTH) << 8;
+        /* The two descriptors point at distinct halves. Requeue the completed half only after the reader
+         * has entered the half the PDC is currently filling. Thus DMA can never silently lap unread bytes:
+         * if this task is preempted for the full 2.0 ms capacity, the PDC stops and the branch above reports
+         * a failed capture instead of joining samples from different response repetitions. */
+        uintptr_t wp = (uintptr_t)AT91C_BASE_SSC->SSC_RPR;
+        int wr = (int)(wp - (uintptr_t)dma);
+        if (wr < 0 || wr > T55_DMA_SIZE) { status = -3; break; }
+        int rd = (int)(data - dma);
+        int rhalf = rd >= T55_DMA_HALF;
+        if (AT91C_BASE_SSC->SSC_RNCR == 0 && rhalf != requeue_half) {
+            uint8_t *next = dma + requeue_half * T55_DMA_HALF;
+            AT91C_BASE_SSC->SSC_RNPR = (uint32_t)(uintptr_t)next;
+            AT91C_BASE_SSC->SSC_RNCR = T55_DMA_HALF;
+            requeue_half ^= 1;
+        }
 
-        if (dc < 0) dc = v;
-        dc += (v - dc) >> 7;
-        int ac = (int)((v - dc) >> 8);
-        amp += ((((int32_t)(ac < 0 ? -ac : ac)) << 8) - amp) >> 6;
+        int avail = (rd <= wr) ? (wr - rd) : (T55_DMA_SIZE - rd + wr);
+        if (avail == 0) {
+            if ((int32_t)(xTaskGetTickCount() - deadline) > 0) { status = -4; break; }
+            continue;
+        }
 
-        int band = (int)(amp >> 8) / 2;
-        if (band < 2) band = 2;                          /* floor: don't chase pure noise */
+        for (int j = 0; j < avail && seen < LF_SPAN + T55_READ_SETTLE_CYCLES && count < cap; j++) {
+            uint8_t s = *data;
+            if (++data == dma + T55_DMA_SIZE) data = dma;
+            int i = seen++;
 
-        if (i >= 24) {                                   /* fast-arm: field already steady */
-            if (high && ac < -band) {                    /* falling edge (high -> low) */
-                if (started) { int d = i - last_edge; buf[count++] = d > 0xFF ? 0xFF : (uint8_t)d; }
-                else started = 1;                        /* first falling edge = gap->block: begin, no run yet */
-                last_edge = i; high = 0;
-            } else if (!high && ac > band) {             /* rising edge (low -> high) */
-                if (started) { int d = i - last_edge; buf[count++] = d > 0xFF ? 0xFF : (uint8_t)d; }
-                last_edge = i; high = 1;
+            /* The analog peak detector gets stock's 137-cycle recovery window. Counting it in the DMA
+             * stream (rather than sleeping before DMA starts) keeps the later framing anchor deterministic
+             * even when the higher-priority USB task runs meanwhile. */
+            if (i < T55_READ_SETTLE_CYCLES) continue;
+            int di = i - T55_READ_SETTLE_CYCLES;
+
+            wsum += (int32_t)s - win[di % LF_SMOOTH];    /* rolling boxcar over the last LF_SMOOTH cycles */
+            win[di % LF_SMOOTH] = s;
+            int32_t v = (wsum / LF_SMOOTH) << 8;
+
+            if (dc < 0) dc = v;
+            dc += (v - dc) >> 7;
+            int ac = (int)((v - dc) >> 8);
+            amp += ((((int32_t)(ac < 0 ? -ac : ac)) << 8) - amp) >> 6;
+
+            int band = (int)(amp >> 8) / 2;
+            if (band < 2) band = 2;                      /* floor: don't chase pure noise */
+
+            if (di == LF_WARMUP) {
+                /* Extended run-stream header: 0 cannot be a duration, so [0, initial_level] marks a fixed
+                 * capture-time anchor and tells the module whether its first partial run is high or low.
+                 * Older frontends start with a nonzero low run and remain wire-compatible. */
+                if (cap < 3) { count = 0; break; }
+                high = ac >= 0;
+                buf[count++] = 0;
+                buf[count++] = (uint8_t)high;
+                last_edge = i;
+                started = 1;
+            } else if (di > LF_WARMUP) {
+                if (high && ac < -band) {                /* falling edge (high -> low) */
+                    if (started) { int d = i - last_edge; buf[count++] = d > 0xFF ? 0xFF : (uint8_t)d; }
+                    last_edge = i; high = 0;
+                } else if (!high && ac > band) {         /* rising edge (low -> high) */
+                    if (started) { int d = i - last_edge; buf[count++] = d > 0xFF ? 0xFF : (uint8_t)d; }
+                    last_edge = i; high = 1;
+                }
             }
         }
     }
+    AT91C_BASE_SSC->SSC_PTCR = AT91C_PDC_RXTDIS;
     lf_tx_off();
-    return count;
+    if (base_prio < capture_prio) vTaskPrioritySet(NULL, base_prio);
+    /* A short off/on cycle is not a reliable T5577 reset: the next command can be interpreted in the
+     * previous read state and return a deterministic but unrelated 32-bit stream. Hold the field off for
+     * the same 20 ms drain interval used between dump blocks. This delay is at the caller's normal priority,
+     * so USB and other sessions run while the tag resets. */
+    spin_ms(T55_READ_RESET_MS);
+    return status ? status : count;
 }
 
 /* ---- SPI0 bus arbitration: FPGA config register vs onboard flash --------------

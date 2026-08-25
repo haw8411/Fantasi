@@ -21,13 +21,16 @@
 #include "../../hal/hal_name.h"
 #include "../../hal/hal_power.h"
 #include "hal_storage.h"
+#include "fat_ramdisk.h"
 #include "flash_storage.h"
 #include "spi_bus.h"
 #include "spi_flash.h"
+#include "../../core/usb_proto.h"
 
 #include "FreeRTOS.h"
 #include "task.h"
 #include "tusb.h"
+#include "device/dcd.h"
 #include "app_api.h"   /* FANTASI_HID_* bits for hal_hid_host */
 #ifdef FANTASI_ENABLE_APPS
 #include "cli.h"
@@ -66,6 +69,20 @@ static void udp_irq_trampoline(void)
 void pm3_launcher_init(void);   /* button/LED shortcut launcher, defined below */
 #endif
 
+/* A level interrupt can deassert before the AIC_IVR read, which invokes the
+ * AIC spurious vector. Acknowledge it and return to the interrupted code. */
+static void pm3_aic_spurious(void) __attribute__((naked));
+static void pm3_aic_spurious(void)
+{
+    __asm volatile(
+        "push  {r0}                  \n\t"  /* IRQ-banked sp is valid (startup.S) */
+        "ldr   r0, =0xFFFFF000       \n\t"
+        "str   r0, [r0, #0x130]      \n\t"  /* AIC_EOICR: any write acknowledges  */
+        "pop   {r0}                  \n\t"
+        "subs  pc, lr, #4            \n\t"
+        ::: "memory");
+}
+
 /* Kick the watchdog. WDTC_WDMR is write-once per reset: under our own bootloader hal_init's WDDIS write
  * disables the WDT, but a stock bootloader left in 0x100000 - which an app-only reflash can't replace -
  * may enable it first, making WDDIS a silent no-op and resetting us every ~16 s. Called from the launcher
@@ -73,10 +90,11 @@ void pm3_launcher_init(void);   /* button/LED shortcut launcher, defined below *
  * loop and halves its modulation sensitivity). Kicking a disabled WDT is a harmless no-op. */
 void pm3_wdt_kick(void) { AT91C_BASE_WDTC->WDTC_WDCR = 0xA5000000 | AT91C_WDTC_WDRSTT; }
 
+
 void hal_init(void)
 {
     /* Try to disable the watchdog (works under our own bootloader, where WDTC_WDMR is still pristine).
-     * If a foreign bootloader already enabled it, this write is ignored - vApplicationTickHook kicks it. */
+     * If a foreign bootloader already enabled it, this write is ignored - the launcher/sniff loops kick it. */
     AT91C_BASE_WDTC->WDTC_WDMR = AT91C_WDTC_WDDIS;
 
     /* Peripheral clocks:
@@ -98,6 +116,7 @@ void hal_init(void)
      * is mid-range; the FreeRTOS tick IRQ (priority 7) will still
      * preempt us if a USB transfer runs long. */
     AT91PS_AIC aic = AT91C_BASE_AIC;
+    aic->AIC_SPU = (uint32_t)pm3_aic_spurious;
     aic->AIC_IDCR = (1u << AT91C_ID_UDP);
     aic->AIC_SVR[AT91C_ID_UDP] = (uint32_t)udp_irq_trampoline;
     aic->AIC_SMR[AT91C_ID_UDP] = AT91C_AIC_SRCTYPE_INT_HIGH_LEVEL | 4u;
@@ -131,22 +150,58 @@ void hal_init(void)
      * USB task. See platform_usb_task comment below. */
 }
 
-/* Mode-switching state - the USB task checks this flag each iteration
- * and re-enumerates with the appropriate descriptor set. */
+/* Mode-switching state - the USB task checks this value each iteration and
+ * re-enumerates with the appropriate descriptor set.  Keep the request as one
+ * aligned, keyed word: on this RAM-constrained target that costs only three
+ * bytes over a uint8_t, while preventing an unrelated single-byte overwrite
+ * from looking like a valid personality switch and dropping the USB pull-up. */
+#define PM3_MODE_REQUEST_KEY  0x4d4f4400u
+#define PM3_MODE_REQUEST_MASK 0xffffff00u
+#define PM3_MODE_REQUEST_NONE 0xffffffffu
+
 extern volatile uint8_t pm3_usb_mode;
-static volatile uint8_t pm3_mode_request = 0xFF;
+static volatile uint32_t pm3_mode_request = PM3_MODE_REQUEST_NONE;
+static volatile uint8_t pm3_msc_activity;
+
+void hal_on_msc_activity(void)
+{
+    pm3_msc_activity++;
+}
+
+static void pm3_request_mode(uint8_t mode)
+{
+    if (mode <= 3)
+        pm3_mode_request = PM3_MODE_REQUEST_KEY | mode;
+}
+
+static bool pm3_take_mode_request(uint8_t *mode)
+{
+    uint32_t request = pm3_mode_request;
+    if (request == PM3_MODE_REQUEST_NONE)
+        return false;
+
+    /* Consume malformed values too.  Only an explicit writer of the complete
+     * keyed word is authorized to tear down and rebuild the USB device stack. */
+    pm3_mode_request = PM3_MODE_REQUEST_NONE;
+    if ((request & PM3_MODE_REQUEST_MASK) != PM3_MODE_REQUEST_KEY ||
+        (request & 0xffu) > 3)
+        return false;
+
+    *mode = (uint8_t)request;
+    return true;
+}
 
 int hal_enter_msc_mode(void)
 {
     if (!hal_storage_mounted()) return -2;
     hal_storage_unmount();
-    pm3_mode_request = 1;
+    pm3_request_mode(1);
     return 0;
 }
 
 void hal_on_msc_eject(void)
 {
-    pm3_mode_request = 0;
+    pm3_request_mode(0);
 }
 
 /* WebUSB (vendor protobuf) switch-mode: re-enumerate as a vendor-only device
@@ -155,13 +210,13 @@ void hal_on_msc_eject(void)
  * disconnect/reconnect (see platform_usb_task). */
 int hal_enter_webusb_mode(void)
 {
-    pm3_mode_request = 2;
+    pm3_request_mode(2);
     return 0;
 }
 
 int hal_enter_cdc_mode(void)
 {
-    pm3_mode_request = 0;
+    pm3_request_mode(0);
     return 0;
 }
 
@@ -176,7 +231,7 @@ int hal_hid_enable(int on)
 {
     if (on) {
         pm3_prev_mode   = pm3_usb_mode;   /* usually 0 (CDC) or 2 (vendor) */
-        pm3_mode_request = 3;             /* USB task re-enumerates as HID-only */
+        pm3_request_mode(3);              /* USB task re-enumerates as HID-only */
         for (int i = 0; i < 4000; i++) {
             if (pm3_usb_mode == 3 && tud_mounted() && tud_hid_ready()) return 0;
             vTaskDelay(pdMS_TO_TICKS(1));
@@ -194,7 +249,7 @@ int hal_hid_enable(int on)
 
     uint8_t empty[6] = { 0 };
     if (tud_hid_ready()) tud_hid_keyboard_report(0, 0, empty);   /* release keys */
-    pm3_mode_request = pm3_prev_mode;                            /* back to CDC/vendor */
+    pm3_request_mode(pm3_prev_mode);                             /* back to CDC/vendor */
     return 0;
 }
 
@@ -232,6 +287,15 @@ uint32_t hal_hid_host(void)
 #define PM3_LED_D     AT91C_PIO_PA8   /* blue, always on */
 #define PM3_BUTTON    AT91C_PIO_PA23  /* active-low (pull-up) */
 #define PM3_HOLD_MS   600
+
+/* Wait out an in-flight app SPI operation, then suspend it before it can
+ * reacquire the bus. This keeps forced RFID cleanup from inheriting its lock. */
+void hal_app_suspend_task(TaskHandle_t task)
+{
+    spi_bus_lock();
+    vTaskSuspend(task);
+    spi_bus_unlock();
+}
 
 static void pm3_leds_show(uint8_t slot)
 {
@@ -335,6 +399,8 @@ void pm3_launcher_init(void)
 void platform_usb_task(void *arg)
 {
     (void)arg;
+    extern void fantasi_dcd_poll(void);
+    uint8_t vendor_run_budget = 0;
     tud_init(0);
     for (;;) {
         /* Bounded timeout (not the default block-forever tud_task()): with no USB
@@ -343,18 +409,48 @@ void platform_usb_task(void *arg)
          * to check pm3_mode_request, so a mode switch requested by the app (arm
          * HID) would never happen. Waking every 10 ms lets the switch run. */
         tud_task_ext(10, false);
+        fantasi_dcd_poll();
 
-        if (pm3_mode_request != 0xFF) {
-            uint8_t new_mode = pm3_mode_request;
-            pm3_mode_request = 0xFF;
+        uint8_t new_mode;
+        if (pm3_take_mode_request(&new_mode)) {
 
-            tud_disconnect();
+            /* Drain replies and queued MSC I/O before changing personality.
+             * Recreate TinyUSB device state while application tasks and RAM
+             * remain active. */
+            TickType_t drain_start = xTaskGetTickCount();
+            TickType_t drain_last  = drain_start;
+            uint8_t drain_activity = pm3_msc_activity;
+            for (;;) {
+                tud_task_ext(2, false);
+                fantasi_dcd_poll();
+                TickType_t now = xTaskGetTickCount();
+                uint8_t activity = pm3_msc_activity;
+                if (activity != drain_activity) {
+                    drain_activity = activity;
+                    drain_last = now;
+                }
+                if ((now - drain_last) >= pdMS_TO_TICKS(250) ||
+                    (now - drain_start) >= pdMS_TO_TICKS(5000))
+                    break;
+                vTaskDelay(1);
+            }
+            /* START STOP releases the model before this drain, but a queued
+             * post-eject READ10 can lazily rebuild it. Drop that final transient
+             * view at the actual MSC teardown boundary so CDC idle pins no FAT
+             * model or reconciliation buffers. */
+            if (pm3_usb_mode == 1) fatrd_release();
+            tud_deinit(0);
+            usb_proto_transport_down();
             vTaskDelay(pdMS_TO_TICKS(800));
             pm3_usb_mode = new_mode;
-            tud_connect();
+            tud_init(0);
         }
 
-        vTaskDelay(1);
+        /* CDC, MSC, and HID yield every pass so the higher-priority USB task
+         * cannot starve commands or watchdog service. Vendor mode yields once
+         * per 64 busy passes; idle USB already blocks in tud_task_ext(). */
+        if (pm3_usb_mode != 2 || (++vendor_run_budget & 0x3fu) == 0)
+            vTaskDelay(1);
     }
 }
 

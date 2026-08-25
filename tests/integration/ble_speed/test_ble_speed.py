@@ -28,8 +28,8 @@ import time
 import zlib
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from lib.device import (USB_VID, USB_PID, find_usb_device, find_cdc_port,
-                        send_serial_cmd)
+from lib.device import (USB_VID, USB_PID, CLI_WEBUSB_SENTINEL,
+                        find_usb_device, find_cdc_port, send_serial_cmd)
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
 CLI_BIN = os.path.join(REPO_ROOT, "build/cli/fantasi")
@@ -393,8 +393,8 @@ def main():
     if not usb_dev:
         return skip("Fantasi device not found on USB")
     cdc_port = find_cdc_port(usb_dev)
-    if not cdc_port:
-        return skip("CDC port not found")
+    if cdc_port in (None, CLI_WEBUSB_SENTINEL):
+        return skip("real CDC port required for BLE passkey capture")
 
     # Reset the host BLE adapter first. Across many runs BlueZ accumulates
     # stale state (from repeated pair/connect/disconnect) and silently stops

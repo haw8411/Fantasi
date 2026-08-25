@@ -3,7 +3,7 @@ ROOT    := $(abspath ..)
 BUILD   := $(ROOT)/build/cli
 
 CC      := cc
-CFLAGS  := -Wall -Wextra -O2 -std=gnu11 -I.
+CFLAGS  := -Wall -Wextra -O2 -std=gnu11 -I. -MMD -MP
 
 LDLIBS  := -lreadline
 
@@ -40,6 +40,7 @@ LDLIBS += $(shell pkg-config --libs libusb-1.0)
 endif
 
 OBJS    := $(patsubst %.c,$(BUILD)/%.o,$(notdir $(SRCS)))
+DEPS    := $(OBJS:.o=.d)
 
 vpath %.c . commands $(ROOT)/third_party/nanopb $(ROOT)/proto
 
@@ -56,3 +57,5 @@ $(BUILD)/%.o: %.c
 
 clean:
 	rm -rf $(BUILD)
+
+-include $(DEPS)

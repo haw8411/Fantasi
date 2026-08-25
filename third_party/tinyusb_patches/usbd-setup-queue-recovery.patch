@@ -1,0 +1,124 @@
+diff --git a/src/device/usbd.c b/src/device/usbd.c
+index 67faf0d..d8b06b0 100644
+--- a/src/device/usbd.c
++++ b/src/device/usbd.c
+@@ -343,11 +343,50 @@ tu_static osal_queue_t _usbd_q;
+ #endif
+ 
+ TU_ATTR_ALWAYS_INLINE static inline bool queue_event(dcd_event_t const * event, bool in_isr) {
+-  TU_ASSERT(osal_queue_send(_usbd_q, event, in_isr));
++  bool const sent = osal_queue_send(_usbd_q, event, in_isr);
++#if CFG_TUSB_MCU == OPT_MCU_AT91SAM7S
++  if (!sent) return false;   /* SAM7 DCD retains the FIFO condition and retries */
++#else
++  TU_ASSERT(sent);
++#endif
+   tud_event_hook_cb(event->rhport, event->event_id, in_isr);
+   return true;
+ }
+ 
++#if CFG_TUSB_MCU == OPT_MCU_AT91SAM7S
++/* The SAM7 control endpoint is only eight bytes, so a large request produces
++ * hundreds of setup/data/status interrupts.  Its DCD must not retire a FIFO
++ * condition unless every event it is about to publish fits in this finite
++ * queue.  Query with the ISR-safe FreeRTOS primitive; no queue storage or
++ * per-session state is added. */
++bool fantasi_usbd_event_queue_has_space(uint8_t count) {
++  UBaseType_t const waiting = uxQueueMessagesWaitingFromISR(_usbd_q);
++  return count <= CFG_TUD_TASK_QUEUE_SZ &&
++         waiting <= (UBaseType_t)(CFG_TUD_TASK_QUEUE_SZ - count);
++}
++
++/* The SAM7 DCD overrides this.  It re-enables a level interrupt that was
++ * paused while the queue was full, immediately after the consumer makes room. */
++TU_ATTR_WEAK void fantasi_dcd_event_queue_space(void) {}
++
++/* Zero-timeout event enqueue for USB-task context.  The SAM7 DCD finishes an
++ * early-consumed EP0 phase inside dcd_edpt_xfer (task context): the FromISR
++ * primitives are unsafe there, and the blocking task-side send would deadlock
++ * the queue's own consumer if the queue were full. */
++bool fantasi_usbd_queue_event_task(dcd_event_t const* event) {
++  if (xQueueSendToBack(_usbd_q, event, 0) != pdTRUE) return false;
++  tud_event_hook_cb(event->rhport, event->event_id, false);
++  return true;
++}
++
++/* PM3 EP0 completion events carry a seven-bit control-transaction epoch in
++ * the high byte of len. Synchronize the DCD task epoch only while the queued
++ * SETUP count is protected, closing the ISR race between deciding that a
++ * SETUP is current and beginning to process it. */
++void fantasi_dcd_control_task_sync(void);
++bool fantasi_dcd_control_event_matches_task(uint8_t epoch);
++#endif
++
+ //--------------------------------------------------------------------+
+ // Prototypes
+ //--------------------------------------------------------------------+
+@@ -576,6 +615,10 @@ void tud_task_ext(uint32_t timeout_ms, bool in_isr) {
+     dcd_event_t event;
+     if (!osal_queue_receive(_usbd_q, &event, timeout_ms)) return;
+ 
++#if CFG_TUSB_MCU == OPT_MCU_AT91SAM7S
++    fantasi_dcd_event_queue_space();
++#endif
++
+ #if CFG_TUSB_DEBUG >= CFG_TUD_LOG_LEVEL
+     if (event.event_id == DCD_EVENT_SETUP_RECEIVED) TU_LOG_USBD("\r\n"); // extra line for setup
+     TU_LOG_USBD("USBD %s ", event.event_id < DCD_EVENT_COUNT ? _usbd_event_str[event.event_id] : "CORRUPTED");
+@@ -595,10 +638,27 @@ void tud_task_ext(uint32_t timeout_ms, bool in_isr) {
+         break;
+ 
+       case DCD_EVENT_SETUP_RECEIVED:
++        #if CFG_TUSB_MCU == OPT_MCU_AT91SAM7S
++        /* The UDP ISR can append a newer SETUP while this task consumes the
++         * previous one.  A volatile byte's -- is still a load/modify/store;
++         * make that sequence atomic or the ISR increment can be lost and every
++         * later SETUP will be skipped with a permanently stale count. */
++        taskENTER_CRITICAL();
++        uint8_t const had_queued_setup = _usbd_queued_setup;
++        if (had_queued_setup) _usbd_queued_setup--;
++        uint8_t const newer_setup_queued = _usbd_queued_setup;
++        if (had_queued_setup && !newer_setup_queued) {
++          fantasi_dcd_control_task_sync();
++        }
++        taskEXIT_CRITICAL();
++        if (!had_queued_setup) break; // stale event superseded by reset/recovery
++        #else
+         TU_ASSERT(_usbd_queued_setup > 0,);
+         _usbd_queued_setup--;
++        uint8_t const newer_setup_queued = _usbd_queued_setup;
++        #endif
+         TU_LOG_BUF(CFG_TUD_LOG_LEVEL, &event.setup_received, 8);
+-        if (_usbd_queued_setup) {
++        if (newer_setup_queued) {
+           TU_LOG_USBD("  Skipped since there is other SETUP in queue\r\n");
+           break;
+         }
+@@ -628,6 +688,14 @@ void tud_task_ext(uint32_t timeout_ms, bool in_isr) {
+         uint8_t const epnum = tu_edpt_number(ep_addr);
+         uint8_t const ep_dir = tu_edpt_dir(ep_addr);
+ 
++        #if CFG_TUSB_MCU == OPT_MCU_AT91SAM7S
++        if (0 == epnum) {
++          uint8_t const epoch = (uint8_t)((event.xfer_complete.len >> 24) & 0x7fu);
++          event.xfer_complete.len &= 0xffffu;
++          if (!fantasi_dcd_control_event_matches_task(epoch)) break;
++        }
++        #endif
++
+         TU_LOG_USBD("on EP %02X with %u bytes\r\n", ep_addr, (unsigned int) event.xfer_complete.len);
+ 
+         _usbd_dev.ep_status[epnum][ep_dir].busy = 0;
+@@ -1201,8 +1269,14 @@ TU_ATTR_FAST_FUNC void dcd_event_handler(dcd_event_t const* event, bool in_isr)
+       break;
+ 
+     case DCD_EVENT_SETUP_RECEIVED:
++      // Count only queued SETUP events. Increment first because a task-context
++      // enqueue may wake the consumer before queue_event() returns.
+       _usbd_queued_setup++;
+-      send = true;
++      if (!queue_event(event, in_isr)) _usbd_queued_setup--;
++      send = false;
+       break;
+ 
+     default:

@@ -174,6 +174,22 @@ const uint8_t *ramfs_get(const char *name, uint32_t *len)
     return f->buf;
 }
 
+int ramfs_take(const char *name, uint8_t **data, uint32_t *len)
+{
+    if (!data || !len) return -1;
+    lock();
+    ramfs_file_t *f = find(name);
+    if (!f || !f->buf) { unlock(); return -1; }
+    *data = f->buf;
+    *len = f->size;
+    f->buf = NULL;
+    f->size = 0;
+    f->cap = 0;
+    f->used = false;
+    unlock();
+    return 0;
+}
+
 int ramfs_remove(const char *name)
 {
     lock();
@@ -202,8 +218,20 @@ int ramfs_rename(const char *from, const char *to)
 
 void ramfs_iterate(ramfs_iter_fn fn, void *ctx)
 {
-    lock();
-    for (int i = 0; i < RAMFS_MAX_FILES; i++)
-        if (s_files[i].used) fn(s_files[i].name, s_files[i].size, ctx);
-    unlock();
+    for (int i = 0; i < RAMFS_MAX_FILES; i++) {
+        char name[RAMFS_NAME_MAX];
+        uint32_t size = 0;
+        bool used;
+        lock();
+        used = s_files[i].used;
+        if (used) {
+            memcpy(name, s_files[i].name, sizeof(name));
+            name[sizeof(name) - 1] = '\0';
+            size = s_files[i].size;
+        }
+        unlock();
+        /* A listing callback may block on its own response transport. Never
+         * retain the filesystem lock across that session-specific wait. */
+        if (used) fn(name, size, ctx);
+    }
 }

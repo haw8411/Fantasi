@@ -13,10 +13,9 @@ typedef struct cli_transport {
     bool   (*connected)(void *ctx);
     void   (*poll)(void);
     void   (*flush)(void);
-    /* Optional: block until input may be available or timeout_ms elapsed
-     * (event-driven transports signal it from their RX callback/ISR). NULL ->
-     * the reader falls back to its historical fixed-period poll. May return
-     * early (spurious wake); callers must re-check read(). */
+    /* Optional: block until input may be available or timeout_ms elapsed.
+     * NULL selects fixed-period polling. May return early; callers must
+     * re-check read(). */
     void   (*wait)(uint32_t timeout_ms);
     void   *ctx;
 } cli_transport_t;
@@ -35,7 +34,7 @@ typedef struct cli_ctx {
  * CLI_COMMAND() macro below - there is no central table. Each registration is
  * emitted into the "cli_cmd" linker section; the linker concatenates them and
  * provides __start_cli_cmd / __stop_cli_cmd bounding the array. The Makefiles
- * pick up new files via $(wildcard core/commands/*.c), so adding a command is
+ * pick up every C file under core/commands/, so adding a command is
  * just dropping in a file and rebuilding. See core/commands/README.md. */
 
 typedef int (*cli_cmd_fn)(int argc, char **argv);
@@ -70,6 +69,9 @@ void cli_task_with_transport(void *arg);
 
 int  cli_printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void cli_write(const char *s);
+/* Publish output accumulated by a transport at an interactive/progress
+ * boundary. Byte-stream transports may leave flush NULL, making this a no-op. */
+void cli_flush(void);
 
 /* ---- Context access for commands that need raw transport I/O ---- */
 

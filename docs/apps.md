@@ -123,6 +123,13 @@ to stop a running app - its task is killed and all of its memory is freed.
 Verify with `free` before and after: the heap returns to its pre-launch value.
 (`make launch APP=<name>`, above, builds, uploads, and runs this in one step.)
 
+Only one user app can run on the device at a time, even when several BLE or
+WebUSB sessions are active. A second session can continue running ordinary
+commands, but its own `launch` receives `an app is already running`. `ps` shows
+one `app` task (plus the `apppump` output helper for a protobuf launch). Run
+`kill` from any session to stop that app, or `kill <pid>` using the exact `app`
+PID printed by `ps`.
+
 Apps that need uninterruptible timing can wrap a region in
 `api->critical_enter()` / `api->critical_exit()`.
 

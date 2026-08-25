@@ -148,23 +148,26 @@ static uint8_t s_wcache[STORAGE_CACHE_SIZE] __attribute__((aligned(4)));
 
 int hal_storage_read_file(const char *path, void *buf, uint32_t max_len)
 {
+    fatrd_store_lock();
     if (!mounted) hal_storage_mount();
-    if (!mounted) return -1;
+    if (!mounted) { fatrd_store_unlock(); return -1; }
 
     struct lfs_file_config fcfg = { .buffer = s_rcache };
 
     lfs_file_t f;
     if (lfs_file_opencfg(&lfs, &f, path, LFS_O_RDONLY, &fcfg) < 0)
-        return -1;
+        { fatrd_store_unlock(); return -1; }
     lfs_ssize_t n = lfs_file_read(&lfs, &f, buf, max_len);
     lfs_file_close(&lfs, &f);
+    fatrd_store_unlock();
     return (n < 0) ? -1 : (int)n;
 }
 
 int hal_storage_write_file(const char *path, const void *buf, uint32_t len)
 {
+    fatrd_store_lock();
     if (!mounted) hal_storage_mount();
-    if (!mounted) return -1;
+    if (!mounted) { fatrd_store_unlock(); return -1; }
     fatrd_invalidate();   /* settings.cfg / ble_bond.bin appear in the FAT model */
 
     struct lfs_file_config fcfg = { .buffer = s_wcache };
@@ -172,9 +175,10 @@ int hal_storage_write_file(const char *path, const void *buf, uint32_t len)
     lfs_file_t f;
     int rc = lfs_file_opencfg(&lfs, &f, path,
                               LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC, &fcfg);
-    if (rc < 0) return -1;
+    if (rc < 0) { fatrd_store_unlock(); return -1; }
     lfs_ssize_t n = lfs_file_write(&lfs, &f, buf, len);
     int crc = lfs_file_close(&lfs, &f);
+    fatrd_store_unlock();
     if (n < 0 || crc < 0) return -1;
     return (int)n;
 }
@@ -210,8 +214,9 @@ static int cfg_getc(cfg_reader *r)
  * is not set. Streamed through cfg_getc, so the config size is unbounded. */
 int hal_settings_get(const char *key, char *buf, int len)
 {
+    fatrd_store_lock();
     if (!mounted) hal_storage_mount();
-    if (!mounted || len < 1) return -1;
+    if (!mounted || len < 1) { fatrd_store_unlock(); return -1; }
 
     int klen = 0;
     while (key[klen]) klen++;
@@ -219,7 +224,7 @@ int hal_settings_get(const char *key, char *buf, int len)
     struct lfs_file_config fcfg = { .buffer = s_rcache };
     lfs_file_t f;
     if (lfs_file_opencfg(&lfs, &f, SETTINGS_PATH, LFS_O_RDONLY, &fcfg) < 0)
-        return -1;
+        { fatrd_store_unlock(); return -1; }
 
     cfg_reader r = { &f, {0}, 0, 0 };
     int result = -1;
@@ -240,6 +245,7 @@ int hal_settings_get(const char *key, char *buf, int len)
     }
 
     lfs_file_close(&lfs, &f);
+    fatrd_store_unlock();
     return result;
 }
 
@@ -305,18 +311,38 @@ static int settings_rewrite(const char *key, const char *value)
     return 0;
 }
 
-int hal_settings_set(const char *key, const char *value) { return settings_rewrite(key, value); }
-int hal_settings_unset(const char *key)                  { return settings_rewrite(key, NULL); }
+int hal_settings_set(const char *key, const char *value)
+{
+    fatrd_store_lock();
+    int rc = settings_rewrite(key, value);
+    fatrd_store_unlock();
+    return rc;
+}
+
+int hal_settings_unset(const char *key)
+{
+    fatrd_store_lock();
+    int rc = settings_rewrite(key, NULL);
+    fatrd_store_unlock();
+    return rc;
+}
 
 int hal_settings_foreach(void (*cb)(const char *line, void *ctx), void *ctx)
 {
+    fatrd_store_lock();
     if (!mounted) hal_storage_mount();
-    if (!mounted) return -1;
+    if (!mounted) { fatrd_store_unlock(); return -1; }
 
-    struct lfs_file_config fcfg = { .buffer = s_rcache };
+    /* This iterator drops the store lock around callbacks, so its open file
+     * needs a private cache rather than the module-global cache another session
+     * may use during that callback. */
+    uint8_t cache[STORAGE_CACHE_SIZE] __attribute__((aligned(4)));
+    struct lfs_file_config fcfg = { .buffer = cache };
     lfs_file_t f;
-    if (lfs_file_opencfg(&lfs, &f, SETTINGS_PATH, LFS_O_RDONLY, &fcfg) < 0)
+    if (lfs_file_opencfg(&lfs, &f, SETTINGS_PATH, LFS_O_RDONLY, &fcfg) < 0) {
+        fatrd_store_unlock();
         return 0;   /* no config yet = no lines */
+    }
 
     /* Stream line by line: only one line is buffered (256 B, ample for a key
      * plus a filesystem path), so the config itself is unbounded. */
@@ -326,20 +352,26 @@ int hal_settings_foreach(void (*cb)(const char *line, void *ctx), void *ctx)
     while ((c = cfg_getc(&r)) >= 0) {
         if (c == '\n') {
             line[o] = '\0';
-            if (o) cb(line, ctx);              /* skip empty lines */
+            if (o) {
+                fatrd_store_unlock();
+                cb(line, ctx);                 /* skip empty lines */
+                fatrd_store_lock();
+            }
             o = 0;
         } else if (o < (int)sizeof(line) - 1) {
             line[o++] = (char)c;
         }
     }
-    if (o) { line[o] = '\0'; cb(line, ctx); }   /* last line, no trailing newline */
+    if (o) {
+        line[o] = '\0';
+        fatrd_store_unlock();
+        cb(line, ctx);                         /* last line, no trailing newline */
+        fatrd_store_lock();
+    }
 
     lfs_file_close(&lfs, &f);
+    fatrd_store_unlock();
     return 0;
 }
 
-/* The MSC LUN is the synthetic FAT (msc_device.c → fatrd_*); reads/writes go
- * through the lfs file API above. The old raw 512-byte block layer and its
- * deferred page-cache flush machinery (hal_storage_flush/request_flush/service,
- * flush_for_reuse, the sd_active/flush_yield hooks) were its only users and are
- * gone. */
+/* The synthetic FAT MSC LUN accesses LittleFS through the file APIs above. */

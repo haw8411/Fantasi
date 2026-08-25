@@ -9,10 +9,13 @@
 
 #define _GNU_SOURCE
 #include "ble_transport.h"
+#include "../proto/ble_mux.h"
+#include "fantasi.pb.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <unistd.h>
 #include <systemd/sd-bus.h>
 
@@ -45,17 +48,33 @@ static char tx_char_path[256];
 static bool connected;
 static uint16_t write_mtu = 20;
 static sd_bus_slot *tx_match_slot;  /* TX-notify match; replaced on reconnect */
+static sd_bus_slot *device_match_slot; /* live Device1.Connected changes */
+static bool physical_connected;
+static bool services_resolved;
+
+typedef enum {
+    RECONNECT_IDLE,
+    RECONNECT_CONNECT_PENDING,
+    RECONNECT_NOTIFY_PENDING,
+} reconnect_phase_t;
+
+static reconnect_phase_t reconnect_phase;
+static sd_bus_slot *reconnect_call_slot;
+static struct {
+    int done;
+    int result;
+} reconnect_call;
 
 /* Ring buffer for incoming indications */
-/* Large enough to absorb a full download burst: BlueZ can deliver many queued
- * notifications in a single sd_bus_process() pump, and the device streams the
- * `cat` download back-to-back with no per-chunk ACK. Regression risk: if this
- * ring is too small, a burst can overrun it between drains; rx_push() drops
- * bytes on overflow, which desyncs the 2-byte length-prefixed protobuf stream
- * and truncates the file. Size it to hold a whole in-flight transfer. */
+/* Hold a complete in-flight download because BlueZ may deliver many
+ * notifications without per-chunk acknowledgement. Regression risk: a smaller
+ * ring can drop bytes in rx_push() and desynchronize protobuf framing. */
 #define RX_BUF_SIZE 65536
 static uint8_t rx_buf[RX_BUF_SIZE];
 static size_t  rx_head, rx_tail;
+static fantasi_ble_mux_response_rx_t response_rx;
+static uint8_t response_frame[2 + CliResponse_size];
+static uint32_t response_session;
 
 static size_t rx_available(void)
 {
@@ -70,6 +89,25 @@ static void rx_push(const uint8_t *data, size_t len)
         rx_buf[rx_head] = data[i];
         rx_head = next;
     }
+}
+
+static void rx_notification(const uint8_t *data, size_t len)
+{
+    size_t complete_len = 0;
+    fantasi_ble_mux_response_result_t result =
+        fantasi_ble_mux_response_accept(&response_rx,
+                                        response_frame, sizeof(response_frame),
+                                        data, len, &complete_len);
+    if (result == FANTASI_BLE_MUX_RESPONSE_RAW && !response_session)
+        rx_push(data, len);                    /* old/implicit byte stream */
+    else if (result == FANTASI_BLE_MUX_RESPONSE_COMPLETE &&
+             (!response_session || response_rx.session == response_session))
+        rx_push(response_frame, complete_len); /* exactly one de-duplicated frame */
+}
+
+void ble_transport_set_response_session(uint32_t session)
+{
+    response_session = session;
 }
 
 /* ---- D-Bus helpers ---- */
@@ -281,7 +319,7 @@ static int on_properties_changed(sd_bus_message *msg, void *userdata,
             const void *data;
             size_t len;
             if (sd_bus_message_read_array(msg, 'y', &data, &len) >= 0)
-                rx_push((const uint8_t *)data, len);
+                rx_notification((const uint8_t *)data, len);
             sd_bus_message_exit_container(msg);
         } else {
             sd_bus_message_skip(msg, "v");
@@ -291,6 +329,104 @@ static int on_properties_changed(sd_bus_message *msg, void *userdata,
     }
 
     return 0;
+}
+
+static int on_device_properties_changed(sd_bus_message *msg, void *userdata,
+                                        sd_bus_error *ret_error)
+{
+    (void)userdata;
+    (void)ret_error;
+
+    const char *iface;
+    if (sd_bus_message_read_basic(msg, 's', &iface) < 0) return 0;
+    if (strcmp(iface, "org.bluez.Device1") != 0) return 0;
+    if (sd_bus_message_enter_container(msg, 'a', "{sv}") < 0) return 0;
+
+    while (sd_bus_message_enter_container(msg, 'e', "sv") > 0) {
+        const char *prop;
+        if (sd_bus_message_read_basic(msg, 's', &prop) < 0) {
+            sd_bus_message_exit_container(msg);
+            break;
+        }
+
+        if (strcmp(prop, "Connected") == 0) {
+            int value = 0;
+            if (sd_bus_message_enter_container(msg, 'v', "b") > 0) {
+                if (sd_bus_message_read_basic(msg, 'b', &value) >= 0) {
+                    physical_connected = value != 0;
+                    if (!physical_connected) {
+                        connected = false;
+                        services_resolved = false;
+                    }
+                }
+                sd_bus_message_exit_container(msg);
+            } else {
+                sd_bus_message_skip(msg, "v");
+            }
+        } else if (strcmp(prop, "ServicesResolved") == 0) {
+            int value = 0;
+            if (sd_bus_message_enter_container(msg, 'v', "b") > 0) {
+                if (sd_bus_message_read_basic(msg, 'b', &value) >= 0)
+                    services_resolved = value != 0;
+                sd_bus_message_exit_container(msg);
+            } else {
+                sd_bus_message_skip(msg, "v");
+            }
+        } else {
+            sd_bus_message_skip(msg, "v");
+        }
+        sd_bus_message_exit_container(msg);
+    }
+    return 0;
+}
+
+static int on_reconnect_reply(sd_bus_message *reply, void *userdata,
+                              sd_bus_error *ret_error)
+{
+    (void)userdata;
+    (void)ret_error;
+    int message_errno = sd_bus_message_get_errno(reply);
+    reconnect_call.result = sd_bus_message_is_method_error(reply, NULL)
+        ? (message_errno > 0 ? -message_errno : -EIO) : 0;
+    if (reconnect_call.result == 0 &&
+        reconnect_phase == RECONNECT_CONNECT_PENDING)
+        physical_connected = true;
+    reconnect_call.done = 1;
+    return 1;
+}
+
+static void reconnect_call_cancel(void)
+{
+    if (reconnect_call_slot) {
+        sd_bus_slot_unref(reconnect_call_slot);
+        reconnect_call_slot = NULL;
+    }
+    reconnect_phase = RECONNECT_IDLE;
+    reconnect_call.done = 0;
+    reconnect_call.result = 0;
+}
+
+/* Queue a reconnect phase without waiting for its BlueZ reply.  Readline's
+ * event hook calls ble_transport_reconnect() periodically; keeping the slot
+ * alive lets sd-bus finish the call across those short ticks while `exit`,
+ * Ctrl-D, and normal line editing remain immediately available. */
+static int reconnect_call_start(reconnect_phase_t phase, const char *path,
+                                const char *iface, const char *method,
+                                uint64_t timeout_us)
+{
+    sd_bus_message *message = NULL;
+    int r = sd_bus_message_new_method_call(bus, &message, "org.bluez", path,
+                                           iface, method);
+    if (r >= 0) {
+        reconnect_call.done = 0;
+        reconnect_call.result = 0;
+        reconnect_phase = phase;
+        r = sd_bus_call_async(bus, &reconnect_call_slot, message,
+                              on_reconnect_reply, NULL, timeout_us);
+    }
+    sd_bus_message_unref(message);
+    if (r < 0) reconnect_call_cancel();
+    return r;
 }
 
 /* ---- Pairing agent ----
@@ -457,30 +593,63 @@ static int connect_and_subscribe(bool verbose)
 
     if (!is_connected) {
         if (verbose) printf("ble: connecting...\n");
-        err = SD_BUS_ERROR_NULL;
-        int r = sd_bus_call_method(bus, "org.bluez", device_path,
-                                   "org.bluez.Device1", "Connect", &err, NULL, "");
-        if (r < 0) {
-            if (verbose)
-                fprintf(stderr, "ble: connect failed: %s\n",
-                        err.message ? err.message : strerror(-r));
+        char last_error[256] = "connection attempt failed";
+        int last_r = -1;
+        for (int attempt = 0; attempt < 5 && !is_connected; attempt++) {
+            err = SD_BUS_ERROR_NULL;
+            last_r = sd_bus_call_method(bus, "org.bluez", device_path,
+                                        "org.bluez.Device1", "Connect",
+                                        &err, NULL, "");
+            if (last_r >= 0) {
+                is_connected = 1;
+                sd_bus_error_free(&err);
+                break;
+            }
+            snprintf(last_error, sizeof(last_error), "%s",
+                     err.message ? err.message : strerror(-last_r));
             sd_bus_error_free(&err);
+
+            /* Disconnect completion, the peripheral's advertising restart,
+             * and BlueZ's cached Device1 state are independent. A Connect can
+             * therefore report InProgress/abort while the link completes a
+             * moment later, or just before the next advertisement. Poll the
+             * property briefly, then retry the connection initiation. */
+            for (int wait = 0; wait < 10 && !is_connected; wait++) {
+                while (sd_bus_process(bus, NULL) > 0) {}
+                usleep(100000);
+                sd_bus_error cerr = SD_BUS_ERROR_NULL;
+                sd_bus_get_property_trivial(bus, "org.bluez", device_path,
+                                            "org.bluez.Device1", "Connected",
+                                            &cerr, 'b', &is_connected);
+                sd_bus_error_free(&cerr);
+            }
+        }
+        if (!is_connected) {
+            if (verbose)
+                fprintf(stderr, "ble: connect failed: %s\n", last_error);
             return -1;
         }
-        sd_bus_error_free(&err);
     }
+    physical_connected = true;
 
-    /* Wait for GATT service discovery (services appear shortly after connect). */
-    for (int w = 0; w < 60; w++) {
-        int resolved = 0;
+    /* Wait for GATT service discovery (services appear shortly after connect).
+     * Stale characteristic objects can remain cached while this is false, so
+     * finding their paths is not proof they can accept StartNotify yet. */
+    int resolved = 0;
+    for (int w = 0; w < 100 && !resolved; w++) {
         sd_bus_error werr = SD_BUS_ERROR_NULL;
         sd_bus_get_property_trivial(bus, "org.bluez", device_path,
                                     "org.bluez.Device1", "ServicesResolved",
                                     &werr, 'b', &resolved);
         sd_bus_error_free(&werr);
-        if (resolved) break;
+        while (sd_bus_process(bus, NULL) > 0) {}
         usleep(100000);
     }
+    if (!resolved) {
+        if (verbose) fprintf(stderr, "ble: GATT service discovery timed out\n");
+        return -1;
+    }
+    services_resolved = true;
 
     /* Pair if needed (encrypted chars require a bond). A bonded device - the
      * normal reconnect case - skips this. The KeyboardOnly agent (registered
@@ -511,55 +680,135 @@ static int connect_and_subscribe(bool verbose)
         printf("ble: TX=%s\n", tx_char_path);
     }
 
+    /* Track the physical Device1 link as a signal, too. The RFID command reads
+     * this transport directly and otherwise cannot notice that BlueZ dropped
+     * the connection while no write is in progress. */
+    if (device_match_slot) {
+        sd_bus_slot_unref(device_match_slot);
+        device_match_slot = NULL;
+    }
+    char match[512];
+    snprintf(match, sizeof(match),
+             "type='signal',sender='org.bluez',path='%s',"
+             "interface='org.freedesktop.DBus.Properties',"
+             "member='PropertiesChanged'", device_path);
+    sd_bus_add_match(bus, &device_match_slot, match,
+                     on_device_properties_changed, NULL);
+
     /* (Re)subscribe to TX notifications. Replace any prior match first so a
      * reconnect can't leave a duplicate handler double-pushing rx bytes. */
     if (tx_match_slot) {
         sd_bus_slot_unref(tx_match_slot);
         tx_match_slot = NULL;
     }
-    char match[512];
     snprintf(match, sizeof(match),
              "type='signal',sender='org.bluez',path='%s',"
              "interface='org.freedesktop.DBus.Properties',"
              "member='PropertiesChanged'", tx_char_path);
     sd_bus_add_match(bus, &tx_match_slot, match, on_properties_changed, NULL);
 
-    err = SD_BUS_ERROR_NULL;
-    int r = sd_bus_call_method(bus, "org.bluez", tx_char_path,
-                               "org.bluez.GattCharacteristic1", "StartNotify",
-                               &err, NULL, "");
-    if (r < 0 && verbose)
-        fprintf(stderr, "ble: StartNotify failed: %s\n",
-                err.message ? err.message : strerror(-r));
-    sd_bus_error_free(&err);
+    bool subscribed = false;
+    char notify_error[256] = "notification subscription failed";
+    for (int attempt = 0; attempt < 30 && !subscribed; attempt++) {
+        err = SD_BUS_ERROR_NULL;
+        int r = sd_bus_call_method(bus, "org.bluez", tx_char_path,
+                                   "org.bluez.GattCharacteristic1", "StartNotify",
+                                   &err, NULL, "");
+        if (r >= 0) {
+            subscribed = true;
+            sd_bus_error_free(&err);
+            break;
+        }
+        snprintf(notify_error, sizeof(notify_error), "%s",
+                 err.message ? err.message : strerror(-r));
+        sd_bus_error_free(&err);
+        while (sd_bus_process(bus, NULL) > 0) {}
+        usleep(100000);
+    }
+    if (!subscribed) {
+        connected = false;
+        if (verbose)
+            fprintf(stderr, "ble: StartNotify failed: %s\n", notify_error);
+        return -1;
+    }
 
     connected = true;
     rx_head = rx_tail = 0;
+    memset(&response_rx, 0, sizeof(response_rx));
+    response_session = 0;
 
     /* Query the negotiated ATT MTU from BlueZ */
     sd_bus_error merr = SD_BUS_ERROR_NULL;
     uint16_t mtu = 0;
     if (sd_bus_get_property_trivial(bus, "org.bluez", rx_char_path,
-            "org.bluez.GattCharacteristic1", "MTU", &merr, 'q', &mtu) >= 0 && mtu > 3)
+            "org.bluez.GattCharacteristic1", "MTU", &merr, 'q', &mtu) >= 0 && mtu > 3) {
         write_mtu = mtu - 3;
+        /* The largest Fantasi RX characteristic is 486 bytes (Flipper); keep
+         * each preserved ATT datagram within the firmware's 512-byte receiver. */
+        if (write_mtu > 486) write_mtu = 486;
+    }
     sd_bus_error_free(&merr);
 
     if (verbose) printf("ble: connected (MTU %u)\n", write_mtu + 3);
     return 0;
 }
 
-/* Re-establish a dropped link (e.g. after the device reboots). Quiet: returns
- * false if the device isn't reachable yet so the caller can retry later. */
+/* Advance a dropped-link reconnect without ever waiting inside readline's
+ * event hook.  Connect and StartNotify remain owned by persistent async slots;
+ * each call here only pumps ready D-Bus work or queues the next phase. */
 bool ble_transport_reconnect(void)
 {
     if (!bus || !device_path[0]) return false;
-    return connect_and_subscribe(false) == 0;
+
+    while (sd_bus_process(bus, NULL) > 0) {}
+    if (connected) return true;
+
+    if (!physical_connected) {
+        if (reconnect_phase == RECONNECT_NOTIFY_PENDING)
+            reconnect_call_cancel();
+        if (reconnect_phase == RECONNECT_CONNECT_PENDING) {
+            if (!reconnect_call.done) return false;
+            reconnect_call_cancel();
+        }
+        (void)reconnect_call_start(RECONNECT_CONNECT_PENDING, device_path,
+                                   "org.bluez.Device1", "Connect", 0);
+        return false;
+    }
+
+    /* A successful Connect reply or Connected=true signal makes any still
+     * pending Connect slot redundant.  Service resolution completes through
+     * the same Device1 PropertiesChanged match. */
+    if (reconnect_phase == RECONNECT_CONNECT_PENDING)
+        reconnect_call_cancel();
+    if (!services_resolved) return false;
+
+    if (reconnect_phase == RECONNECT_NOTIFY_PENDING) {
+        if (!reconnect_call.done) return false;
+        bool subscribed = reconnect_call.result >= 0;
+        reconnect_call_cancel();
+        if (!subscribed) return false;       /* retry on a later hook tick */
+
+        connected = true;
+        rx_head = rx_tail = 0;
+        memset(&response_rx, 0, sizeof(response_rx));
+        response_session = 0;
+        return true;
+    }
+
+    if (!tx_char_path[0]) return false;
+    (void)reconnect_call_start(RECONNECT_NOTIFY_PENDING, tx_char_path,
+                               "org.bluez.GattCharacteristic1", "StartNotify",
+                               5000000);
+    return false;
 }
 
 /* ---- Public API ---- */
 
 int ble_transport_open(void)
 {
+    reconnect_call_cancel();
+    physical_connected = false;
+    services_resolved = false;
     int r = sd_bus_default_system(&bus);
     if (r < 0) {
         fprintf(stderr, "ble: cannot open system bus: %s\n", strerror(-r));
@@ -630,7 +879,7 @@ int ble_transport_open(void)
     printf("ble: found %s\n", device_path);
 
     if (connect_and_subscribe(true) < 0) {
-        sd_bus_unref(bus); bus = NULL;
+        ble_transport_close();
         return -1;
     }
     return 0;
@@ -638,32 +887,34 @@ int ble_transport_open(void)
 
 void ble_transport_close(void)
 {
+    reconnect_call_cancel();
     if (bus) {
-        sd_bus_error err = SD_BUS_ERROR_NULL;
-        if (tx_char_path[0]) {
-            sd_bus_call_method(bus, "org.bluez", tx_char_path,
-                               "org.bluez.GattCharacteristic1", "StopNotify",
-                               &err, NULL, "");
-            sd_bus_error_free(&err);
+        /* StartNotify is owned by this D-Bus sender. Dropping the sender lets
+         * BlueZ release exactly this client's notification reference; an
+         * explicit StopNotify can race another independent CLI and globally
+         * silence the characteristic on BlueZ versions without per-call refs. */
+        if (tx_match_slot) {
+            sd_bus_slot_unref(tx_match_slot);
+            tx_match_slot = NULL;
+        }
+        if (device_match_slot) {
+            sd_bus_slot_unref(device_match_slot);
+            device_match_slot = NULL;
         }
         sd_bus_unref(bus);
         bus = NULL;
     }
     connected = false;
+    physical_connected = false;
+    services_resolved = false;
+    response_session = 0;
 }
 
 bool ble_transport_connected(void)
 {
-    /* Reflect the live link state: BlueZ clears Device1.Connected when the
-     * device drops (e.g. a reboot), which our cached flag wouldn't catch. */
-    if (connected && bus && device_path[0]) {
-        int c = 0;
-        sd_bus_error err = SD_BUS_ERROR_NULL;
-        if (sd_bus_get_property_trivial(bus, "org.bluez", device_path,
-                "org.bluez.Device1", "Connected", &err, 'b', &c) >= 0 && !c)
-            connected = false;
-        sd_bus_error_free(&err);
-    }
+    /* Process connection changes without a synchronous property query. */
+    if (bus)
+        while (sd_bus_process(bus, NULL) > 0) {}
     return connected;
 }
 
@@ -673,6 +924,7 @@ ssize_t ble_transport_read(void *buf, size_t len)
 
     /* Process any pending D-Bus messages first */
     while (sd_bus_process(bus, NULL) > 0) {}
+    if (!connected) return -1;
 
     size_t avail = rx_available();
     if (avail == 0) return 0;
@@ -686,16 +938,20 @@ ssize_t ble_transport_read(void *buf, size_t len)
     return (ssize_t)len;
 }
 
-static ssize_t ble_write_one(const void *buf, size_t len)
+static ssize_t ble_write_one(const void *buf, size_t len, bool command)
 {
-    /* Write-without-response ("command"): BlueZ doesn't wait for an ATT
-     * response, so writes pipeline within a connection event instead of
-     * one round-trip each. It has no ATT-level flow control, though, so the
-     * pipelined upload's burst can outrun the controller's TX buffer and
-     * BlueZ returns a transient error - retry with a short backoff (which
-     * paces us to the link rate) rather than failing the transfer. A real
-     * disconnect is not retryable and fails fast. */
-    for (int attempt = 0; attempt < 80; attempt++) {
+    /* Normally use acknowledged ATT Write Requests. Write Commands have no end-to-end
+     * flow control across independent D-Bus clients: each short-lived process
+     * can successfully enqueue its write after the previous sender exits even
+     * though BlueZ/controller credits have not recovered, silently losing a
+     * later session OPEN. The narrowly exposed command path is only for
+     * absolute-offset file chunks: their correlated protobuf ACK detects a
+     * lost fragment and the caller retries the idempotent write. */
+    /* A second process can receive InProgress for the duration of another
+     * process's multi-fragment request.  Five seconds covers a full maximum
+     * protobuf message at the minimum ATT MTU without making a dead link hang
+     * indefinitely. */
+    for (int attempt = 0; attempt < 1000; attempt++) {
         sd_bus_error err = SD_BUS_ERROR_NULL;
         sd_bus_message *msg = NULL;
 
@@ -711,7 +967,7 @@ static ssize_t ble_write_one(const void *buf, size_t len)
         sd_bus_message_open_container(msg, 'e', "sv");
         sd_bus_message_append(msg, "s", "type");
         sd_bus_message_open_container(msg, 'v', "s");
-        sd_bus_message_append(msg, "s", "command");
+        sd_bus_message_append(msg, "s", command ? "command" : "request");
         sd_bus_message_close_container(msg);
         sd_bus_message_close_container(msg);
         sd_bus_message_close_container(msg);
@@ -724,18 +980,25 @@ static ssize_t ble_write_one(const void *buf, size_t len)
             return (ssize_t)len;
         }
 
-        bool disconnected = err.name &&
-            (strstr(err.name, "NotConnected") ||
-             strstr(err.name, "DoesNotExist") ||
-             strstr(err.name, "Disconnected"));
+        const char *ename = err.name ? err.name : "";
+        const char *emsg = err.message ? err.message : "";
+        bool disconnected = strstr(ename, "NotConnected") ||
+                            strstr(ename, "DoesNotExist") ||
+                            strstr(ename, "UnknownObject") ||
+                            strstr(ename, "Disconnected") ||
+                            strstr(emsg, "Not connected") ||
+                            strstr(emsg, "not connected") ||
+                            strstr(emsg, "Disconnected") ||
+                            strstr(emsg, "disconnected");
         if (disconnected) {
+            connected = false;
             fprintf(stderr, "ble: write failed: %s\n",
                     err.message ? err.message : strerror(-r));
             sd_bus_error_free(&err);
             return -1;
         }
         sd_bus_error_free(&err);
-        usleep(2000);   /* let the TX buffer drain, then retry */
+        usleep(5000);   /* let the other D-Bus writer complete, then retry */
     }
     fprintf(stderr, "ble: write failed: transient errors did not clear\n");
     return -1;
@@ -747,13 +1010,83 @@ ssize_t ble_transport_write(const void *buf, size_t len)
 
     const uint8_t *p = (const uint8_t *)buf;
     size_t remaining = len;
+    size_t packet_mtu = write_mtu;
+    if (packet_mtu > FANTASI_BLE_MUX_PACKET_MAX)
+        packet_mtu = FANTASI_BLE_MUX_PACKET_MAX;
     while (remaining > 0) {
-        size_t chunk = (remaining > write_mtu) ? write_mtu : remaining;
-        if (ble_write_one(p, chunk) < 0) return -1;
+        size_t chunk = (remaining > packet_mtu) ? packet_mtu : remaining;
+        if (ble_write_one(p, chunk, false) < 0) return -1;
         p += chunk;
         remaining -= chunk;
     }
     return (ssize_t)len;
+}
+
+static void put_u16le(uint8_t *out, uint16_t value)
+{
+    out[0] = (uint8_t)value;
+    out[1] = (uint8_t)(value >> 8);
+}
+
+static void put_u32le(uint8_t *out, uint32_t value)
+{
+    out[0] = (uint8_t)value;
+    out[1] = (uint8_t)(value >> 8);
+    out[2] = (uint8_t)(value >> 16);
+    out[3] = (uint8_t)(value >> 24);
+}
+
+static ssize_t ble_write_session(uint32_t session, const void *message,
+                                 size_t len, bool command)
+{
+    size_t packet_mtu = write_mtu;
+    if (packet_mtu > FANTASI_BLE_MUX_PACKET_MAX)
+        packet_mtu = FANTASI_BLE_MUX_PACKET_MAX;
+    if (!connected || !rx_char_path[0] || !session || !message ||
+        len == 0 || len > UINT16_MAX ||
+        packet_mtu <= FANTASI_BLE_MUX_HEADER_SIZE)
+        return -1;
+
+    /* Host memory is not firmware memory, so one MTU-sized scratch allocation
+     * is preferable to burdening every device session with a receive buffer. */
+    uint8_t *packet = malloc(packet_mtu);
+    if (!packet) return -1;
+    packet[0] = FANTASI_BLE_MUX_MAGIC_0;
+    packet[1] = FANTASI_BLE_MUX_MAGIC_1;
+    packet[2] = FANTASI_BLE_MUX_MAGIC_2;
+    packet[3] = FANTASI_BLE_MUX_MAGIC_3;
+    put_u32le(packet + 4, session);
+    put_u16le(packet + 8, (uint16_t)len);
+
+    const uint8_t *src = message;
+    size_t payload_cap = packet_mtu - FANTASI_BLE_MUX_HEADER_SIZE;
+    size_t offset = 0;
+    while (offset < len) {
+        size_t chunk = len - offset;
+        if (chunk > payload_cap) chunk = payload_cap;
+        put_u16le(packet + 10, (uint16_t)offset);
+        memcpy(packet + FANTASI_BLE_MUX_HEADER_SIZE, src + offset, chunk);
+        if (ble_write_one(packet, FANTASI_BLE_MUX_HEADER_SIZE + chunk,
+                          command) < 0) {
+            free(packet);
+            return -1;
+        }
+        offset += chunk;
+    }
+    free(packet);
+    return (ssize_t)len;
+}
+
+ssize_t ble_transport_write_session(uint32_t session,
+                                    const void *message, size_t len)
+{
+    return ble_write_session(session, message, len, false);
+}
+
+ssize_t ble_transport_write_session_command(uint32_t session,
+                                            const void *message, size_t len)
+{
+    return ble_write_session(session, message, len, true);
 }
 
 int ble_transport_fd(void)

@@ -137,7 +137,9 @@ __vectors_src:
     ldr     pc, [pc, #-0xF20]       @ IRQ → AIC_IVR (0xFFFFF100)
     ldr     pc, _vec_fiq
 
-_vec_reset: .word  Vector
+_vec_reset: .word  _arm_start   @ ARM-mode entry: `ldr pc` does not interwork
+                                @ on ARMv4T, so this row must never name the
+                                @ Thumb trampoline `Vector`.
 _vec_undef: .word  __fantasi_unhandled
 _vec_swi:   .word  vPortYieldProcessor
 _vec_pabt:  .word  __fantasi_unhandled

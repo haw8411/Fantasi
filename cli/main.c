@@ -22,6 +22,7 @@
 #include <dirent.h>
 #include <signal.h>
 #include <poll.h>
+#include <time.h>
 #include <readline/readline.h>
 #include <readline/history.h>
 
@@ -393,9 +394,9 @@ void dir_target(const char *src_resolved, const char *dst_raw,
  * kernel to expose the Fantasi block device, and mounts it via udisksctl.
  * fat_path() maps a device path ("/apps/x") to the host mountpoint
  * ("<g_mnt>/apps/x"); the file ops are then plain stdio against that path.
- * The synthetic FAT commits writes synchronously, so no explicit sync is
- * needed - but we fsync the mount before returning so the device sees the
- * data before any subsequent eject. */
+ * Synthetic-FAT data is captured in bounded RAM staging and committed at SCSI
+ * SYNCHRONIZE CACHE boundaries. Local mutators therefore flush the host mount
+ * and issue that command explicitly before reporting completion or ejecting. */
 
 const char *fat_path(const char *vpath)
 {
@@ -433,12 +434,32 @@ static bool fat_scsi_sync(const char *blk)
     return ok;
 }
 
-void fat_sync(void)
+bool fat_sync(void)
 {
-    if (!g_mnt[0]) return;
-    sync();
-    if (!fat_scsi_sync(g_blk))
+    if (!g_mnt[0]) return true;
+    /* Flush only this mounted filesystem. `sync()` dirties latency and error
+     * reporting with every unrelated filesystem on the host, and Linux may
+     * legitimately omit SYNCHRONIZE CACHE for this write-through MSC LUN. */
+    int mfd = open(g_mnt, O_RDONLY | O_DIRECTORY);
+    if (mfd < 0) {
+        fprintf(stderr, "cannot open filesystem for sync: %s\n", strerror(errno));
+        return false;
+    }
+    int src = syncfs(mfd);
+    int sync_errno = errno;
+    close(mfd);
+    if (src < 0) {
+        errno = sync_errno;
+        fprintf(stderr, "host filesystem sync failed: %s\n", strerror(errno));
+        return false;
+    }
+
+    /* Issue SYNCHRONIZE CACHE so the device commits staged MSC writes. */
+    if (!fat_scsi_sync(g_blk)) {
         fprintf(stderr, "device filesystem sync failed: %s\n", strerror(errno));
+        return false;
+    }
+    return true;
 }
 
 /* ---- Command dispatch ---- */
@@ -466,6 +487,11 @@ const local_cmd_t *cli_local_match(const char *line)
 #ifdef HAS_PROTO
 bool     use_ble;       /* talking to the device over BLE rather than USB/MSC */
 uint32_t proto_req_id;    /* monotonic protobuf request id */
+uint32_t proto_session_id; /* device-owned session (zero on legacy firmware) */
+static uint32_t proto_active_request;
+static int proto_session_ensure(void);
+static void proto_session_ping(void);
+static void proto_session_close_client(void);
 #endif
 
 static bool handle_local(const char *line)
@@ -478,6 +504,7 @@ static bool handle_local(const char *line)
 
 #ifdef HAS_PROTO
     if ((use_ble || use_usb) && c->proto_fn) {
+        if (proto_session_ensure() < 0) return true;
         c->proto_fn(arg);
         return true;
     }
@@ -802,11 +829,50 @@ bool fat_mount(void)
     return false;
 }
 
+/* Linux can return from a FAT unmount while asynchronous readahead submitted by
+ * the final metadata invalidation is still draining through usb-storage. On a
+ * switch-mode PM3, sending START STOP immediately would ask the firmware to drop
+ * MSC underneath that READ10. Watch the block queue until both completions and
+ * in-flight I/O have been quiet, with a finite fallback for unusual kernels. */
+static void fat_wait_block_quiet(const char *blk)
+{
+    const char *name = strrchr(blk, '/');
+    name = name ? name + 1 : blk;
+    if (!name[0]) { usleep(300000); return; }
+
+    char stat_path[160];
+    snprintf(stat_path, sizeof stat_path, "/sys/class/block/%s/stat", name);
+    uint64_t previous = UINT64_MAX;
+    unsigned quiet_ms = 0;
+
+    for (unsigned elapsed = 0; elapsed < 8000; elapsed += 50) {
+        FILE *f = fopen(stat_path, "r");
+        unsigned long long reads, read_merges, read_sectors, read_ms;
+        unsigned long long writes, write_merges, write_sectors, write_ms, inflight;
+        int fields = f ? fscanf(f, "%llu %llu %llu %llu %llu %llu %llu %llu %llu",
+                                &reads, &read_merges, &read_sectors, &read_ms,
+                                &writes, &write_merges, &write_sectors, &write_ms,
+                                &inflight) : 0;
+        if (f) fclose(f);
+        if (fields != 9) { usleep(300000); return; }
+
+        uint64_t completed = (uint64_t)reads + (uint64_t)writes;
+        if (inflight == 0 && completed == previous) quiet_ms += 50;
+        else                                        quiet_ms = 0;
+        previous = completed;
+        if (quiet_ms >= 300) return;
+        usleep(50000);
+    }
+}
+
 void fat_unmount(void)
 {
     if (!g_mnt[0]) return;
 
-    sync();
+    /* Commit any last metadata/data the command left dirty before the switch-mode
+     * eject tears down MSC and releases the device-side staging model. Continue
+     * with the eject even on failure so a constrained device can recover to CDC. */
+    (void)fat_sync();
 
     /* Composite devices (FZ/CU) expose MSC and CDC at once, so there is nothing to
      * switch back to - leave the drive mounted (udisks manages it) instead of
@@ -820,6 +886,7 @@ void fat_unmount(void)
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "udisksctl unmount -b %s >/dev/null 2>&1", g_blk);
     (void)system(cmd);
+    fat_wait_block_quiet(g_blk);
     g_mnt[0] = '\0';
     msc_active = false;
 
@@ -888,6 +955,11 @@ static int rl_poll_serial(void)
 
 #ifdef HAS_PROTO
     if (use_ble) {
+        static int session_heartbeat;
+        if (ser_connected && ++session_heartbeat >= 100) {
+            session_heartbeat = 0;
+            proto_session_ping();
+        }
         if (ser_connected) {
             ble_transport_process();
             if (!ble_transport_connected()) {
@@ -902,6 +974,13 @@ static int rl_poll_serial(void)
             if (++throttle >= 10) {
                 throttle = 0;
                 if (ble_transport_reconnect()) {
+                    proto_session_id = 0;
+                    proto_rx_len = 0;
+                    ble_transport_set_response_session(0);
+                    /* OPEN is deliberately lazy: doing protocol negotiation
+                     * inside readline's idle hook would make `exit`/Ctrl-D
+                     * wait behind a missing response.  The next remote command
+                     * calls proto_session_ensure() before it writes. */
                     ser_connected = true;
                     printf("\n  reconnected over BLE\n");
                     rl_set_prompt("fantasi> ");
@@ -916,8 +995,9 @@ static int rl_poll_serial(void)
 #ifdef HAS_USB_VENDOR
     if (use_usb) {
         if (ser_connected) {
-            /* No bulk traffic at idle to surface a removal, so actively probe
-             * EP0 a couple times a second (the hook fires ~10/s). */
+            /* The presence check is cheap and frequent; usb_transport_alive()
+             * internally rate-limits and session-jitters actual EP0 lease
+             * heartbeats so many idle CLI processes do not form a burst. */
             static int probe;
             if (++probe >= 5) {
                 probe = 0;
@@ -934,6 +1014,8 @@ static int rl_poll_serial(void)
             if (++uthrottle >= 10) {
                 uthrottle = 0;
                 if (usb_reconnect()) {
+                    proto_session_id = usb_transport_session_id();
+                    proto_rx_len = 0;
                     ser_connected = true;
                     printf("\n  reconnected over USB\n");
                     rl_set_prompt("fantasi> ");
@@ -981,11 +1063,32 @@ size_t  proto_rx_len;
 
 static volatile sig_atomic_t proto_stream_interrupted;
 
+/* A resynchronizing BLE parser examines arbitrary byte offsets after joining a
+ * broadcast mid-frame or dropping an overflowing backlog. Requiring the normal
+ * response invariants makes a protobuf-looking substring inside an incomplete
+ * frame extraordinarily unlikely to be accepted as a new boundary. */
+static bool proto_response_sane(const CliResponse *response)
+{
+    if (!response->id || (response->has_session && !response->session))
+        return false;
+    switch (response->which_payload) {
+    case CliResponse_output_tag:
+    case CliResponse_file_data_tag:
+    case CliResponse_dir_entry_tag:
+    case CliResponse_error_tag:
+    case CliResponse_module_request_tag:
+        return true;
+    default:
+        return false;
+    }
+}
+
 #ifdef HAS_USB_VENDOR
 /* Same framed protobuf over the USB vendor bulk pipe (libusb). The device runs
  * the identical engine, so requests/responses are byte-for-byte the BLE ones. */
 static uint8_t usb_rx_accum[4096];
 static size_t  usb_rx_len;
+static unsigned usb_fast_polls;
 
 static int usb_write_req(CliRequest *req)
 {
@@ -1001,13 +1104,24 @@ static int usb_write_req(CliRequest *req)
 static int usb_send_proto(CliRequest *req)
 {
     uint8_t d[512];
-    while (usb_transport_read(d, sizeof(d)) > 0) {}   /* drain stale */
+    while (usb_transport_read(d, sizeof(d)) > 0) {}   /* drain stale (advances+releases) */
+    usb_transport_read_reset();                        /* rewind read offset for the new response */
     usb_rx_len = 0;
-    return usb_write_req(req);
+    int rc = usb_write_req(req);
+    /* Small command replies are latency-sensitive and normally ready within a
+     * scheduler turn. Do not add speculative EP0 reads to every upload ACK:
+     * two independent writers already contend for that single control pipe,
+     * and extra READs can starve the other process's WRITE retry budget. */
+    usb_fast_polls = (rc == 0 &&
+                      req->which_payload == CliRequest_command_tag) ? 3u : 0u;
+    return rc;
 }
 
 static int usb_recv_proto(CliResponse *resp)
 {
+    /* Reset the idle budget only when the accumulated frame grows. Bytes that
+     * cannot fit are not progress and must not keep the loop alive. */
+    unsigned resync = 0;
     for (int idle = 0; idle < 200; idle++) {
         if (proto_stream_interrupted) return -1;         /* ^C during a stream */
         if (!usb_transport_connected()) return -1;
@@ -1015,14 +1129,46 @@ static int usb_recv_proto(CliResponse *resp)
         ssize_t n = usb_transport_read(chunk, sizeof(chunk));
         if (n < 0) return -1;
         if (n > 0) {
-            idle = 0;
-            size_t copy = (size_t)n;
-            if (usb_rx_len + copy > sizeof(usb_rx_accum)) copy = sizeof(usb_rx_accum) - usb_rx_len;
-            memcpy(usb_rx_accum + usb_rx_len, chunk, copy);
-            usb_rx_len += copy;
+            size_t room = sizeof(usb_rx_accum) - usb_rx_len;
+            size_t copy = (size_t)n < room ? (size_t)n : room;
+            if (copy > 0) {
+                memcpy(usb_rx_accum + usb_rx_len, chunk, copy);
+                usb_rx_len += copy;
+                idle = 0;                 /* progress: the frame grew */
+            } else {
+                usleep(50000);            /* bytes we can't accumulate: no progress */
+            }
+        } else {
+            /* A multiplexed EP0 READ returns an empty packet immediately when
+             * its mailbox is empty. Preserve the legacy bulk path's roughly
+             * ten-second response deadline without spinning on control I/O.
+             * Immediately after submitting a request or acknowledging a
+             * has_next frame, however, the lower-priority device worker is
+             * normally only one scheduler turn behind us. A few short polls
+             * avoid turning that benign race into a fixed 50 ms delay. */
+            if (usb_fast_polls) {
+                usb_fast_polls--;
+                usleep(2000);
+            } else {
+                usleep(50000);
+            }
         }
         if (usb_rx_len >= 2) {
             uint16_t msg_len = (uint16_t)usb_rx_accum[0] | ((uint16_t)usb_rx_accum[1] << 8);
+            if (2u + (unsigned)msg_len > sizeof(usb_rx_accum)) {
+                /* The declared frame cannot fit our accumulator, so the framing
+                 * is desynchronized from the device mailbox (e.g. a stale prefix
+                 * left in front of a fresh frame). The offset READ is idempotent
+                 * and stateless, so discard the accumulator and re-read this
+                 * frame from the top; that heals a host-side desync with no data
+                 * loss. Bound the attempts so a genuinely oversized frame fails
+                 * the command (caller re-issues) instead of hanging. */
+                if (resync++ >= 4) return -1;
+                usb_rx_len = 0;
+                usb_transport_read_reset();
+                idle = 0;
+                continue;
+            }
             if (usb_rx_len >= 2u + msg_len) {
                 pb_istream_t stream = pb_istream_from_buffer(usb_rx_accum + 2, msg_len);
                 *resp = (CliResponse){0};
@@ -1030,6 +1176,10 @@ static int usb_recv_proto(CliResponse *resp)
                 size_t consumed = 2 + msg_len;
                 usb_rx_len -= consumed;
                 if (usb_rx_len > 0) memmove(usb_rx_accum, usb_rx_accum + consumed, usb_rx_len);
+                /* Release this frame's device mailbox so a streamed next frame
+                 * (has_next) can be emitted, and rewind the read offset. */
+                usb_transport_frame_consumed();
+                usb_fast_polls = (ok && resp->has_next) ? 3u : 0u;
                 return ok ? 0 : -1;
             }
         }
@@ -1038,26 +1188,137 @@ static int usb_recv_proto(CliResponse *resp)
 }
 #endif /* HAS_USB_VENDOR */
 
-/* Encode + write a request without touching the receive side. The pipelined
- * upload uses this so it doesn't drain pending acks between sends. */
-int proto_write_req(CliRequest *req)
+static int ble_recv_proto_raw(CliResponse *resp);
+
+static int ble_write_req_raw(CliRequest *req)
 {
-#ifdef HAS_USB_VENDOR
-    if (use_usb) return usb_write_req(req);
-#endif
     uint8_t buf[2 + CliRequest_size];
     pb_ostream_t stream = pb_ostream_from_buffer(buf + 2, sizeof(buf) - 2);
     if (!pb_encode(&stream, CliRequest_fields, req)) return -1;
     uint16_t len = (uint16_t)stream.bytes_written;
     buf[0] = (uint8_t)(len & 0xFF);
     buf[1] = (uint8_t)(len >> 8);
-    return (ble_transport_write(buf, 2 + len) > 0) ? 0 : -1;
+    if (req->has_session && req->session) {
+        ssize_t written = req->which_payload == CliRequest_file_write_tag
+            ? ble_transport_write_session_command(req->session, buf + 2, len)
+            : ble_transport_write_session(req->session, buf + 2, len);
+        return written == len
+             ? 0 : -1;
+    }
+    return (ble_transport_write(buf, 2 + len) == (ssize_t)(2 + len)) ? 0 : -1;
+}
+
+/* Establish a firmware-owned logical session. BLE performs this in-band (all
+ * host processes see notifications and select the OPEN reply by randomized
+ * request id); WebUSB receives its session directly from the EP0 OPEN request.
+ * A legacy firmware response has no session field, which selects the
+ * legacy single-stream behavior. */
+static int proto_session_ensure(void)
+{
+#ifdef HAS_USB_VENDOR
+    if (use_usb) {
+        uint32_t current = usb_transport_session_id();
+        if (current != proto_session_id) {
+            proto_session_id = current;
+            usb_rx_len = 0;
+        }
+        return usb_transport_connected() ? 0 : -1;
+    }
+#endif
+    if (!use_ble || proto_session_id) return 0;
+
+    ble_transport_process();
+    uint8_t discard[512];
+    while (ble_transport_read(discard, sizeof(discard)) > 0) {}
+    proto_rx_len = 0;
+
+    CliRequest request = CliRequest_init_zero;
+    request.id = ++proto_req_id;
+    request.which_payload = CliRequest_session_open_tag;
+    request.payload.session_open = true;
+    if (ble_write_req_raw(&request) < 0) return -1;
+
+    for (;;) {
+        CliResponse response;
+        int rc = ble_recv_proto_raw(&response);
+        if (rc < 0) return rc;
+        if (response.id != request.id) continue;
+        if (response.has_session && response.session) {
+            proto_session_id = response.session;
+            ble_transport_set_response_session(proto_session_id);
+            return 0;
+        }
+        /* Legacy firmware decoded the new oneof as unknown and answered on its
+         * implicit stream. Continue in compatibility mode. */
+        return 0;
+    }
+}
+
+static void proto_session_ping(void)
+{
+    if (!proto_session_id || !use_ble) return;
+    CliRequest ping = CliRequest_init_zero;
+    ping.id = ++proto_req_id;
+    ping.which_payload = CliRequest_session_ping_tag;
+    ping.payload.session_ping = true;
+    (void)proto_write_req(&ping);
+}
+
+/* BLE sessions are leased by host ingress. Device output deliberately does not
+ * renew a lease, otherwise a dead `log` process could survive forever while a
+ * different process kept the shared physical link connected. This heartbeat is
+ * used both while readline is idle and while a command is waiting for output. */
+static void proto_stream_heartbeat(void)
+{
+    static struct timespec last;
+    struct timespec now;
+    if (!use_ble || !proto_session_id ||
+        clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+        return;
+    int64_t elapsed_ms = (int64_t)(now.tv_sec - last.tv_sec) * 1000 +
+                         (now.tv_nsec - last.tv_nsec) / 1000000;
+    if (last.tv_sec == 0 || elapsed_ms >= 10000) {
+        last = now;
+        proto_session_ping();
+    }
+}
+
+static void proto_session_close_client(void)
+{
+    if (!proto_session_id || !use_ble || !ble_transport_connected()) return;
+    CliRequest close = CliRequest_init_zero;
+    close.id = ++proto_req_id;
+    close.which_payload = CliRequest_session_close_tag;
+    close.payload.session_close = true;
+    (void)proto_write_req(&close);
+    proto_session_id = 0;
+    ble_transport_set_response_session(0);
+}
+
+/* Encode + write a request without touching the receive side. The pipelined
+ * upload uses this so it doesn't drain pending acks between sends. */
+int proto_write_req(CliRequest *req)
+{
+    if (proto_session_ensure() < 0) return -1;
+    if (proto_session_id) {
+        req->has_session = true;
+        req->session = proto_session_id;
+    }
+#ifdef HAS_USB_VENDOR
+    if (use_usb) return usb_write_req(req);
+#endif
+    return ble_write_req_raw(req);
 }
 
 int proto_send(CliRequest *req)
 {
+    if (proto_session_ensure() < 0) return -1;
+    proto_active_request = req->id;
 #ifdef HAS_USB_VENDOR
-    if (use_usb) return usb_send_proto(req);
+    if (use_usb) {
+        if (proto_session_id) { req->has_session = true; req->session = proto_session_id; }
+        return usb_send_proto(req);
+    }
 #endif
     /* Drain stale data from both transport and accumulator */
     ble_transport_process();
@@ -1067,14 +1328,11 @@ int proto_send(CliRequest *req)
     return proto_write_req(req);
 }
 
-int proto_recv(CliResponse *resp)
+static int ble_recv_proto_raw(CliResponse *resp)
 {
-#ifdef HAS_USB_VENDOR
-    if (use_usb) return usb_recv_proto(resp);
-#endif
-
     for (int idle = 0; idle < 200; idle++) {
         if (proto_stream_interrupted) return -1;
+        proto_stream_heartbeat();
         /* If the device dropped (e.g. a reboot), stop waiting for a response
          * that will never come - checked periodically (the query isn't free). */
         if ((idle % 10) == 9 && !ble_transport_connected()) return -1;
@@ -1084,11 +1342,9 @@ int proto_recv(CliResponse *resp)
             poll(&pfd, 1, proto_rx_len > 0 ? 1 : 50);
         }
         ble_transport_process();
-        /* Drain the transport ring COMPLETELY each iteration so it can never
-         * back up and overflow (a dropped byte desyncs the 2-byte framing and
-         * truncates the transfer). Regression risk: reading a fixed amount per
-         * iteration lets the ring grow whenever a burst delivers more than one
-         * read removes, until it overflows and drops bytes. */
+        /* Drain the transport ring completely so a notification burst cannot
+         * overflow the length-prefixed protobuf stream. Regression risk: one
+         * fixed-size read per iteration can let the ring grow between drains. */
         uint8_t chunk[1024];
         ssize_t n;
         while ((n = ble_transport_read(chunk, sizeof(chunk))) > 0) {
@@ -1101,32 +1357,75 @@ int proto_recv(CliResponse *resp)
             if (proto_rx_len == sizeof(proto_rx_accum)) break;
         }
 
-        if (proto_rx_len > 0 && proto_rx_accum[0] == 0) {
-            size_t skip = 0;
-            while (skip < proto_rx_len && proto_rx_accum[skip] == 0) skip++;
-            proto_rx_len -= skip;
-            if (proto_rx_len > 0)
-                memmove(proto_rx_accum, &proto_rx_accum[skip], proto_rx_len);
-        }
-
-        if (proto_rx_len >= 2) {
-            uint16_t msg_len = (uint16_t)proto_rx_accum[0] |
-                               ((uint16_t)proto_rx_accum[1] << 8);
-            if (proto_rx_len >= 2u + msg_len) {
+        /* Notifications are broadcast to every subscribed process. An idle
+         * process can discard an overflowing backlog or subscribe while some
+         * other session is mid-frame, so do not assume byte zero is a frame
+         * boundary. Scan for the first complete response that nanopb validates.
+         * A complete frame is at most CliResponse_size + 2, which also bounds
+         * how much unmatched suffix we retain. */
+        for (;;) {
+            bool discarded_foreign = false;
+            for (size_t pos = 0; pos + 2 <= proto_rx_len; pos++) {
+                uint16_t msg_len = (uint16_t)proto_rx_accum[pos] |
+                                   ((uint16_t)proto_rx_accum[pos + 1] << 8);
+                if (!msg_len || msg_len > CliResponse_size ||
+                    pos + 2u + msg_len > proto_rx_len)
+                    continue;
+                CliResponse candidate = CliResponse_init_zero;
                 pb_istream_t stream = pb_istream_from_buffer(
-                    &proto_rx_accum[2], msg_len);
-                *resp = (CliResponse){0};
-                bool ok = pb_decode(&stream, CliResponse_fields, resp);
-                size_t consumed = 2 + msg_len;
+                    &proto_rx_accum[pos + 2], msg_len);
+                if (!pb_decode(&stream, CliResponse_fields, &candidate) ||
+                    !proto_response_sane(&candidate))
+                    continue;
+                size_t consumed = pos + 2u + msg_len;
                 proto_rx_len -= consumed;
                 if (proto_rx_len > 0)
-                    memmove(proto_rx_accum,
-                            &proto_rx_accum[consumed], proto_rx_len);
-                return ok ? 0 : -1;
+                    memmove(proto_rx_accum, &proto_rx_accum[consumed],
+                            proto_rx_len);
+
+                /* Every BlueZ subscriber sees every notification. Once OPEN
+                 * gives this process a SID, consume another process's complete
+                 * response immediately. Leaving it at the head of the buffer
+                 * makes the short buffered-data poll spin on the same frame and
+                 * exhaust the timeout before our own response arrives. */
+                if (proto_session_id &&
+                    (!candidate.has_session ||
+                     candidate.session != proto_session_id)) {
+                    discarded_foreign = true;
+                    break;
+                }
+                *resp = candidate;
+                return 0;
             }
+            if (!discarded_foreign) break;
+        }
+        size_t keep = 2u + CliResponse_size;
+        if (proto_rx_len > keep) {
+            memmove(proto_rx_accum, proto_rx_accum + proto_rx_len - keep, keep);
+            proto_rx_len = keep;
         }
     }
     return PROTO_RECV_TIMEOUT;
+}
+
+int proto_recv(CliResponse *resp)
+{
+    if (proto_session_ensure() < 0) return -1;
+    for (;;) {
+#ifdef HAS_USB_VENDOR
+        int rc = use_usb ? usb_recv_proto(resp) : ble_recv_proto_raw(resp);
+#else
+        int rc = ble_recv_proto_raw(resp);
+#endif
+        if (rc != 0) return rc;
+        if (proto_session_id) {
+            if (resp->has_session && resp->session == proto_session_id) return 0;
+        } else if (!resp->has_session) {
+            return 0;
+        }
+        /* BLE notifications are broadcast to every subscribed host process.
+         * A response for a different device session is simply not ours. */
+    }
 }
 
 void proto_send_cmd(const char *cmd)
@@ -1149,7 +1448,6 @@ static void proto_read_response(bool forward_stdin)
     sigaction(SIGINT, &sa, NULL);
 
     CliResponse resp;
-    bool got_data = false;
     bool has_more = false;
 
     for (;;) {
@@ -1161,7 +1459,10 @@ static void proto_read_response(bool forward_stdin)
          * interrupts it. Ordinary requests still retain the receive deadline. */
         if (rc == PROTO_RECV_TIMEOUT && has_more) continue;
         if (rc < 0) break;
-        got_data = true;
+        /* A late/duplicated terminal response from the preceding request must
+         * not complete this one. This matters particularly on BlueZ versions
+         * that fan one notification out once per StartNotify owner. */
+        if (resp.id != proto_active_request) continue;
         if (resp.which_payload == CliResponse_output_tag && resp.payload.output[0]) {
             if (g_cap) cap_puts(resp.payload.output);
             else {
@@ -1189,24 +1490,34 @@ static void proto_read_response(bool forward_stdin)
         }
     }
 
-    /* Streaming exit: tell the device to stop. Route the raw stop byte to the
-     * active transport - ble_transport_write only speaks BLE, so over WebUSB it
-     * silently failed and a launched app was never killed. */
-    if (got_data) {
-        uint8_t ctrl_c = 0x03;
+    /* Streaming exit: cancellation is an out-of-band protobuf request in a
+     * multiplexed session, so it reaches the blocked worker without injecting
+     * bytes into another client's stream. Raw ^C remains the legacy fallback. */
+    if (proto_active_request) {
+        if (proto_session_id) {
+            CliRequest cancel = CliRequest_init_zero;
+            cancel.id = ++proto_req_id;
+            cancel.which_payload = CliRequest_cancel_tag;
+            cancel.payload.cancel.request_id = proto_active_request;
+            (void)proto_write_req(&cancel);
+        } else {
+            uint8_t ctrl_c = 0x03;
 #ifdef HAS_USB_VENDOR
-        if (use_usb) usb_transport_write(&ctrl_c, 1);
-        else
+            if (use_usb) usb_transport_write(&ctrl_c, 1);
+            else
 #endif
-        ble_transport_write(&ctrl_c, 1);
+            ble_transport_write(&ctrl_c, 1);
+        }
+        proto_stream_interrupted = 0;
         CliResponse drain;
         for (int i = 0; i < 20; i++) {
             if (proto_recv(&drain) < 0) break;
-            if (!drain.has_next) break;
+            if (drain.id == proto_active_request && !drain.has_next) break;
         }
     }
 
 done:
+    proto_active_request = 0;
     signal(SIGINT, sigint_handler);
 }
 
@@ -1219,6 +1530,14 @@ void proto_drain_quiet(void)
     uint8_t tmp[1024];
     int quiet = 0;
     while (quiet < 6) {
+#ifdef HAS_USB_VENDOR
+        if (use_usb) {
+            if (usb_transport_read(tmp, sizeof(tmp)) > 0) { quiet = 0; continue; }
+            usleep(3000);
+            quiet++;
+            continue;
+        }
+#endif
         ble_transport_process();
         if (ble_transport_read(tmp, sizeof(tmp)) > 0) { quiet = 0; continue; }
         struct pollfd pfd = { .fd = ble_transport_fd(), .events = POLLIN };
@@ -1226,6 +1545,9 @@ void proto_drain_quiet(void)
         quiet++;
     }
     proto_rx_len = 0;   /* discard partial frame */
+#ifdef HAS_USB_VENDOR
+    usb_rx_len = 0;
+#endif
 }
 
 #endif /* HAS_PROTO */
@@ -1251,17 +1573,23 @@ static void query_device_id(char *out, size_t len)
     else if (strstr(buf, "FZ"))  snprintf(out, len, "FZ");
 }
 
-/* Connect straight to the WebUSB vendor pipe with no serial. Used when the CDC
- * port is gone because a switch-mode device (PM3) is already in WebUSB mode -
- * e.g. a previous fantasi invocation upgraded it and never switched back. Since
- * usb_transport_open() finds the vendor device over libusb (independent of any
- * serial port), this lets repeated invocations keep working over WebUSB. */
-static bool connect_webusb_direct(void)
+/* Connect straight to the WebUSB vendor pipe without opening CDC. Composite
+ * devices expose both interfaces, and going through CDC first would make
+ * otherwise-independent WebUSB processes race for the serial CLI's replies.
+ * A switch-mode device that has already dropped CDC is passed as such so the
+ * host retains its conservative upload pacing. */
+static bool connect_webusb_direct(bool switch_mode)
 {
     if (usb_transport_open() != 0) return false;
     use_usb = true;
     ser_connected = true;
-    g_switch_mode = true;   /* only a switch-mode device (PM3) loses its CDC port */
+    /* The caller's guess (from the connection route) can be wrong: a PM3 reached
+     * directly over the already-open vendor pipe arrives here with switch_mode
+     * false, yet it still needs conservative upload pacing. The device's EP0 size,
+     * now known from the descriptor, is the authoritative signal - a tiny EP0 is
+     * the constrained SAM7S. Without this a directly-connected PM3 pipelines
+     * uploads and overruns its dual-bank OUT, truncating the transfer. */
+    g_switch_mode = switch_mode || usb_transport_constrained_ep0();
     printf("transport: WebUSB\n");
     return true;
 }
@@ -1608,6 +1936,17 @@ int main(int argc, char **argv)
 {
     char blk_path[64] = "";
 
+#ifdef HAS_PROTO
+    /* Request ids are visible on the shared BLE notification stream before a
+     * logical session has been opened. Start each process in a different range
+     * so simultaneous OPEN replies cannot be mistaken for one another. */
+    struct timespec request_seed;
+    clock_gettime(CLOCK_MONOTONIC, &request_seed);
+    proto_req_id = (uint32_t)request_seed.tv_nsec ^
+                   ((uint32_t)getpid() * 2654435761u);
+    if (proto_req_id == UINT32_MAX) proto_req_id = 1;
+#endif
+
     bool force_ble = false;
     bool force_usb = false;
     bool force_serial = false;
@@ -1642,7 +1981,7 @@ int main(int argc, char **argv)
         }
 #endif
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
-            printf("usage: fantasi [--ble[=ADDR]|--usb|--serial] [--name NAME] [-c <command>] [/dev/ttyACMx] [/dev/sdX]\n");
+            printf("usage: fantasi [--ble|--ble-addr=ADDR|--usb|--serial] [--name NAME] [-c <command>] [/dev/ttyACMx] [/dev/sdX]\n");
             printf("  --name NAME   select a specific device by name (see `whoami`) when several are connected;\n");
             printf("                works over USB and BLE\n");
             return 0;
@@ -1676,7 +2015,7 @@ int main(int argc, char **argv)
             /* No CDC serial found - a switch-mode device (PM3) already in WebUSB mode
                exposes only the vendor interface; connect to it directly. --serial stays
                on the CDC path and never touches the vendor pipe. */
-            if (!force_serial) connected = connect_webusb_direct();
+            if (!force_serial) connected = connect_webusb_direct(true);
 #endif
 #ifdef HAS_PROTO
             /* BLE is an auto-detect fallback only: --usb (WebUSB only) and --serial
@@ -1701,11 +2040,20 @@ int main(int argc, char **argv)
 #endif
       if (!use_usb) {   /* skip if case B already connected over the vendor pipe */
 #ifdef HAS_USB_VENDOR
+        /* Prefer an already-present vendor interface before opening CDC. This
+         * is essential for multiplexing: each host process can OPEN its own
+         * WebUSB session, whereas CDC is one shared byte stream whose device-id
+         * probe replies can be consumed by a different process. PM3 in serial
+         * mode has no vendor interface yet, so it falls through to the legacy
+         * serial `webusb` switch below. */
+        if (!force_serial && connect_webusb_direct(false)) {
+            /* connected over the vendor pipe - banner printed there */
+        } else
         /* A switch-mode device (PM3) already in WebUSB mode has no CDC port
            (e.g. a previous fantasi invocation upgraded it and didn't switch
            back). If the serial port is absent, talk to the vendor pipe directly
            rather than failing to open it. */
-        if (access(g_ser_path, F_OK) != 0 && connect_webusb_direct()) {
+        if (access(g_ser_path, F_OK) != 0 && connect_webusb_direct(true)) {
             /* connected over the vendor pipe - banner printed there */
         } else
 #endif
@@ -1791,7 +2139,10 @@ int main(int argc, char **argv)
     if (msc_active) fat_unmount();
     ser_close();
 #ifdef HAS_PROTO
-    if (use_ble) ble_transport_close();
+    if (use_ble) {
+        proto_session_close_client();
+        ble_transport_close();
+    }
 #endif
 #ifdef HAS_USB_VENDOR
     if (use_usb) usb_transport_close();

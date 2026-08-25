@@ -15,7 +15,8 @@ The binary is placed at `build/cli/fantasi`. It has no filesystem dependency of 
 ## Usage
 
 ```
-fantasi [--ble[=ADDR]] [--name NAME] [/dev/ttyACMx] [/dev/sdX]
+fantasi [--usb|--ble|--ble-addr=ADDR|--serial] [--name NAME] [-c COMMAND]
+        [/dev/ttyACMx] [/dev/sdX]
 ```
 
 All arguments are optional:
@@ -25,8 +26,13 @@ All arguments are optional:
 - `--name NAME` - select a specific device by its name (the name `whoami` prints) when several Fantasi devices are connected. The name is the device's USB serial descriptor and BLE advertised name (`Fantasi <NAME>`), so it disambiguates over USB and BLE alike.
 - `--ble` - connect over BLE to the first paired/available Fantasi.
 - `--ble-addr=AA:BB:CC:DD:EE:FF` - connect over BLE to a specific address.
+- `--usb` - require the WebUSB protobuf transport (the default USB upgrade when available).
+- `--serial` - retain the legacy CDC/MSC transport and do not upgrade to WebUSB.
+- `-c COMMAND` - run one command non-interactively and exit.
 
 Over BLE the CLI pairs on demand (it registers a BlueZ `KeyboardOnly` agent before connecting) - enter the passkey shown in the device's USB `log`. See [bluetooth.md](bluetooth.md) for pairing details.
+
+Every `--usb` or `--ble` process opens an independent firmware session. You can, for example, leave `fantasi --usb -c log` running and issue `fantasi --usb -c whoami` from another terminal. `w` lists all live BLE/WebUSB sessions; Ctrl-C sends cancellation only to the command owned by that process. CDC serial remains single-session for compatibility.
 
 The FAT volume is mounted through `udisksctl`, which runs unprivileged for the logged-in user, so the CLI normally needs no `sudo`. BLE access does not touch storage at all.
 
@@ -52,7 +58,7 @@ Local commands:
 | `pwd` | Print working directory |
 | `rm <file>` | Delete a file |
 | `rmdir <dir>` | Remove an empty directory |
-| `upload <local> <remote>` | Copy a host file to the device filesystem |
+| `upload <local> <remote>` | Copy a host file to a device file or directory (`.` means the current device directory) |
 
 Paths are resolved relative to the current directory. Use `/` for absolute paths.
 
@@ -105,15 +111,16 @@ FZ
 
 ## How it works
 
-Device storage is presented over USB MSC as a single synthetic FAT volume (label `Fantasi`). The firmware synthesizes the FAT boot sector, FAT tables, and directory entries on the fly from its real filesystems - internal flash (LittleFS, mounted at `/`) and, on app-capable targets, the RAM-backed `/ramfs` - so there is no second copy of the data and no fixed image size. Reads are served from those filesystems; writes are parsed back out of the FAT directory/data sectors and committed to the underlying filesystem.
+Device storage is presented over USB MSC as a single synthetic FAT volume (label `Fantasi`). The firmware synthesizes the FAT boot sector, FAT tables, and directory entries on the fly from its real filesystems - internal flash (LittleFS, mounted at `/`) and the RAM-backed `/ramfs`. Reads are served from those filesystems; writes are parsed back out of the FAT directory/data sectors and committed to the underlying filesystem. The CLI checkpoints uploads every 4 KiB, bounding firmware staging memory; each checkpoint is explicitly synchronized.
 
 The first local command (`ls`, `upload`, …) triggers the CLI to mount that volume. On composite devices (Flipper, Kiisu, Chameleon, Proxmark5) the block device is always present alongside CDC; on switch-mode devices (Proxmark3, which reuses its CDC endpoints for MSC) the CLI first sends the `msc` command to flip the device into MSC mode. Either way the volume is then mounted with `udisksctl`, and local commands are plain stdio against the mountpoint. When the CLI next needs the serial port (a forwarded firmware command, or exit) it unmounts; on switch-mode devices it also SCSI-ejects so the firmware re-enumerates as CDC.
 
-Serial commands are sent as raw text over the CDC port. The CLI strips echo and prompt lines from the response before printing.
+Serial commands are sent as raw text over the CDC port. WebUSB and BLE commands and file operations use framed protobuf requests in independent logical sessions.
 
 ## Storage notes
 
+- Removable memory cards must be formatted as FAT32. exFAT, NTFS, ext2/3/4, and other filesystems are not currently supported. Until `format external` support arrives, use a host computer to format it as FAT32 before inserting it.
 - Because the FAT is synthetic, the host sees a normal removable drive - you can also mount and browse it with your file manager. Long (non-8.3) filenames are supported via VFAT LFN entries.
-- Composite devices (FZ, Kiisu, CU, PM5) keep CDC and MSC active simultaneously, so the CLI freely interleaves serial commands and storage access (unmounting only momentarily to free the volume for the firmware).
+- Composite devices (FZ, Kiisu, CU, PM5) keep CDC and MSC active simultaneously, so the CLI freely interleaves commands and storage access.
 - Switch-mode devices (PM3) trade the CDC endpoints for MSC, so each storage operation is bracketed by a mode switch in and a SCSI eject out; the CLI handles this transparently and waits for the CDC port to reappear.
 - `crc32 <file>` reads a device file and prints its CRC32 and size - used by `tools/flash.py` to skip re-uploading unchanged resources without capturing binary data over the link.

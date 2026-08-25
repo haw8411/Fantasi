@@ -322,7 +322,7 @@ static volatile bool     s_lf_have_prev;
 static volatile bool     s_lf_capturing;
 static bool              s_lf_warm;         /* LF RX front-end has been settled since the last (re)init */
 
-/* TIM2 CC4: each COMP1 rising edge is captured (free-running 1 MHz counter); the
+/* TIM2 CC4: each enabled COMP1 edge is captured (free-running 1 MHz counter); the
  * delta from the previous capture is the inter-edge interval. Reading CCR4 clears
  * the flag. No FreeRTOS calls here - just fills a buffer. */
 void TIM2_IRQHandler(void)
@@ -2970,7 +2970,9 @@ static void lf_field_ensure(void)
     s_lf_warm = true;
 }
 
-static void lf_t55_cmd(const uint8_t *p, int nbits)
+/* A read keeps the critical section held after the final field restore so its
+ * capture anchor can be established at an exact offset from the downlink. */
+static void lf_t55_cmd(const uint8_t *p, int nbits, bool keep_critical)
 {
     lf_field_ensure();                             /* RFID_PULL stays LOW (its toggle, not the gaps, caused a
                                                     * ~130 ms RX recovery - see hal_rfid_lf_transceive). */
@@ -3000,7 +3002,7 @@ static void lf_t55_cmd(const uint8_t *p, int nbits)
         lf_car_off(); lf_delay_us(T55_WRITE_GAP_US);
     }
     lf_car_on();                                    /* field back on */
-    taskEXIT_CRITICAL();
+    if (!keep_critical) taskEXIT_CRITICAL();
 }
 
 /* T5577 block WRITE downlink (TX only): gap-modulate `p`, hold the field for the EEPROM commit, drop it. */
@@ -3008,7 +3010,7 @@ int hal_rfid_lf_modulate(const uint8_t *p, int nbits, uint32_t opts)
 {
     (void)opts;
     if (s_mode != RFID_LF_READER || !p || nbits <= 0) return RFID_ERR_UNSUPP;
-    lf_t55_cmd(p, nbits);
+    lf_t55_cmd(p, nbits, false);
     vTaskDelay(pdMS_TO_TICKS(T55_PROGRAM_MS));      /* EEPROM programming window, field steady */
     TIM1->CR1 &= ~TIM_CR1_CEN; TIM1->BDTR &= ~TIM_BDTR_MOE; s_lf_warm = false;
     GPIOA->BSRR = (1u << (2 + 16));                 /* RFID_PULL back LOW (read-mode default) */
@@ -3024,18 +3026,25 @@ int hal_rfid_lf_modulate(const uint8_t *p, int nbits, uint32_t opts)
  * two levels alternate, so their single-half-bit widths are the per-parity minimum run; each run then spans
  * round((run - width)/HB) + 1 half-bits. Re-emit every run as that many HB-cycle half-bits, giving a clean
  * symmetric stream. Crucially this resolves the 1.5T ambiguity from the data (a stretched high run is 2 high
- * half-bits, a stretched low run is 2 low). `raw` is the captured runs in carrier cycles; writes clean runs to `out`. */
-static int lf_t55_runs(const uint8_t *raw, int nr, uint8_t *out, int cap)
+ * half-bits, a stretched low run is 2 low). Preserve the first partial run and its explicitly sampled level
+ * behind the shared [0, initial_level] anchor. `raw` is captured in carrier cycles; writes clean runs to `out`. */
+static int lf_t55_runs(const uint8_t *raw, int nr, int initial_level, uint8_t *out, int cap)
 {
-    if (nr < 4) return 0;
+    if (nr < 4 || cap < 3) return 0;
     int w[2] = { 255, 255 };                            /* per-parity single half-bit width (HIGH vs LOW) */
-    for (int i = 0; i < nr; i++) if (raw[i] < w[i & 1]) w[i & 1] = raw[i];
+    for (int i = 1; i < nr; i++)                       /* raw[0] is partial: never use it to estimate width */
+        if (raw[i] < w[i & 1]) w[i & 1] = raw[i];
     if (w[0] < 4) w[0] = 4;
     if (w[1] < 4) w[1] = 4;
     int count = 0;
+    out[count++] = 0;                                  /* fixed-time stream marker (not a real duration) */
+    out[count++] = (uint8_t)(initial_level != 0);
     for (int i = 0; i < nr && count < cap; i++) {
-        int nh = (raw[i] - w[i & 1] + T55_HB / 2) / T55_HB + 1;   /* round((run - width)/HB) + 1 half-bits */
-        if (nh < 1) nh = 1;
+        int delta = (int)raw[i] - w[i & 1];
+        int nh;
+        if (delta >= 0) nh = 1 + (delta + T55_HB / 2) / T55_HB;
+        else            nh = 1 - (-delta + T55_HB / 2) / T55_HB;
+        if (nh < (i == 0 ? 0 : 1)) nh = i == 0 ? 0 : 1;
         if (nh > 4) nh = 4;
         int d = nh * T55_HB;
         out[count++] = d > 0xFF ? 0xFF : (uint8_t)d;    /* one clean HB-multiple run per captured run */
@@ -3055,18 +3064,32 @@ int hal_rfid_lf_transceive(const uint8_t *cmd, int nbits, uint8_t *buf, int cap)
     TIM2->CCER |= TIM_CCER_CC4P | TIM_CCER_CC4NP;
     TIM2->CCER |= TIM_CCER_CC4E;
 
-    if (cmd && nbits > 0) lf_t55_cmd(cmd, nbits);  /* downlink; leaves field on */
-    else lf_field_ensure();
+    if (cmd && nbits > 0) lf_t55_cmd(cmd, nbits, true);  /* downlink; returns IRQs-off with field on */
+    else { lf_field_ensure(); taskENTER_CRITICAL(); }
     /* Deterministic settle after the command, before capture. Two jobs: (1) let the AC-coupled RX front-end
      * recover from the per-read field-off reset (it is slow); the tag keeps modulating the addressed block
      * continuously, so waiting doesn't lose it. (2) being an lf_delay_us (not vTaskDelay) it's an integer
      * carrier phase, so - with the downlink's bit-period pad + carrier alignment - the capture lands at the
      * same point in the reply every read, and block 0's rotation transfers to every block. */
     lf_delay_us(T55_READ_SETTLE_US);
-    s_lf_n = 0; s_lf_have_prev = false;
+
+    /* Capture from a time and level, not merely from the first edge. If an edge races the sample, CC4IF
+     * makes us retry; an edge just after the final check remains pending and is consumed by the ISR after
+     * the critical section. The first stored interval is therefore the partial run from this fixed anchor. */
+    uint8_t initial_level;
+    uint32_t capture_start;
+    do {
+        TIM2->SR = 0;
+        initial_level = (COMP1->CSR & COMP_CSR_VALUE) ? 1 : 0;
+        capture_start = TIM2->CNT;
+    } while (TIM2->SR & TIM_SR_CC4IF);
+    s_lf_n = 0;
+    s_lf_prev = capture_start;
+    s_lf_have_prev = true;
     __asm volatile("" ::: "memory");
     s_lf_capturing = true;
-    TIM2->SR = 0; TIM2->DIER |= TIM_DIER_CC4IE;
+    TIM2->DIER |= TIM_DIER_CC4IE;
+    taskEXIT_CRITICAL();
     vTaskDelay(pdMS_TO_TICKS(T55_CAP_MS));
     TIM2->DIER &= ~TIM_DIER_CC4IE;
     s_lf_capturing = false;
@@ -3086,7 +3109,7 @@ int hal_rfid_lf_transceive(const uint8_t *cmd, int nbits, uint8_t *buf, int cap)
     s_lf_iv = NULL;
     if (!raw) return RFID_ERR_TIMEOUT;
 
-    int count = lf_t55_runs(raw, nr, buf, cap);    /* -> clean half-bit level runs for t55_extract */
+    int count = lf_t55_runs(raw, nr, initial_level, buf, cap); /* fixed-anchor clean runs for t55_extract */
     vPortFree(raw);
     return count;
 }

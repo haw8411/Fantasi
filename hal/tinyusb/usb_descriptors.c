@@ -1,4 +1,6 @@
 #include "tusb.h"
+#include "usb_proto.h"
+#include "usb_mux.h"
 #include "../hal.h"
 
 /* USB IDs - these are test/dev values. Using pid.codes 0x1209/0x0001
@@ -194,6 +196,10 @@ static const tusb_desc_webusb_url_t desc_url = {
 
 bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t const *request)
 {
+    if (request->bmRequestType_bit.type == TUSB_REQ_TYPE_VENDOR &&
+        request->bRequest >= FANTASI_USB_MUX_OPEN &&
+        request->bRequest <= FANTASI_USB_MUX_CHUNK)
+        return usb_proto_control_xfer(rhport, stage, request);
     if (stage != CONTROL_STAGE_SETUP) return true;
 
     switch (request->bmRequestType_bit.type) {

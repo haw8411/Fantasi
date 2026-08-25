@@ -28,6 +28,17 @@ typedef int32_t (*app_read_fn)(void *ctx, uint32_t off, void *dst, uint32_t len)
  * (section headers, symtab, strtab) during the load and frees it before return. */
 int  app_load(app_read_fn read, void *ctx, uint32_t total, app_image_t *img);
 
+/* Load from a borrowed contiguous ELF, using its metadata directly and making
+ * only the final packed-image allocation. The caller retains `elf`. */
+int  app_load_memory(const uint8_t *elf, uint32_t len, app_image_t *img);
+
+/* Relocate an owned, writable ELF buffer in place. Loadable sections already
+ * occupy aligned positions in Fantasi's ET_REL layout; metadata is used
+ * directly, then NOBITS storage reuses the now-dead metadata tail. On success
+ * img owns `elf` and app_unload frees it. On failure ownership stays with the
+ * caller. No heap allocation is performed. */
+int  app_load_inplace(uint8_t *elf, uint32_t len, app_image_t *img);
+
 /* Free every allocation made by app_load. */
 void app_unload(app_image_t *img);
 

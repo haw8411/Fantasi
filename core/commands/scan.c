@@ -14,6 +14,7 @@ static void scan_cb(const uint8_t *addr, uint8_t addr_type, int8_t rssi,
     if (name && name[0])
         cli_printf("  \"%s\"", name);
     cli_write("\r\n");
+    cli_flush();
 }
 
 static int cmd_scan(int argc, char **argv)
@@ -25,6 +26,7 @@ static int cmd_scan(int argc, char **argv)
     }
 
     cli_printf("scanning for %lu s...\r\n", (unsigned long)(dur / 1000));
+    cli_flush();
 
     int n = hal_ble_scan(scan_cb, dur);
     if (n < 0) {

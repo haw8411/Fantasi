@@ -14,6 +14,7 @@ static uint32_t read_passkey_from_serial(void)
     int pos = 0;
 
     cli_write("enter passkey: ");
+    cli_flush();
 
     cli_ctx_t *ctx = cli_current_ctx();
     for (;;) {
@@ -67,6 +68,7 @@ static int cmd_pair(int argc, char **argv)
 
         cli_printf("connecting to %02X:%02X:%02X:%02X:%02X:%02X...\r\n",
                    addr[5], addr[4], addr[3], addr[2], addr[1], addr[0]);
+        cli_flush();
 
         if (hal_ble_pair_connect(addr, addr_type) != 0) {
             cli_write("connect failed\r\n");
@@ -89,6 +91,7 @@ static int cmd_pair(int argc, char **argv)
         cli_printf("connected (handle 0x%04X)\r\n", handle);
 
         cli_write("initiating pairing...\r\n");
+        cli_flush();
         if (hal_ble_pair_initiate(handle) != 0) {
             cli_write("pairing request failed\r\n");
             hal_ble_disconnect(handle);
@@ -110,6 +113,7 @@ static int cmd_pair(int argc, char **argv)
 
             if (evt.type == HAL_BLE_EVT_PASSKEY_DISPLAY) {
                 cli_printf("confirm: %06lu\r\n", (unsigned long)evt.passkey);
+                cli_flush();
                 hal_ble_pair_confirm(handle, true);
                 continue;
             }
@@ -143,6 +147,7 @@ static int cmd_pair(int argc, char **argv)
 
         hal_ble_evt_t evt;
         cli_write("waiting for pairing request (60s)...\r\n");
+        cli_flush();
 
         if (hal_ble_pair_wait(&evt, 60000) != 0 ||
             evt.type != HAL_BLE_EVT_CONNECTED) {
@@ -157,6 +162,7 @@ static int cmd_pair(int argc, char **argv)
 
         uint16_t handle = evt.conn_handle;
         cli_printf("connected (handle 0x%04X)\r\n", handle);
+        cli_flush();
 
         for (;;) {
             if (hal_ble_pair_wait(&evt, 30000) != 0) {
@@ -173,6 +179,7 @@ static int cmd_pair(int argc, char **argv)
 
             if (evt.type == HAL_BLE_EVT_PASSKEY_DISPLAY) {
                 cli_printf("confirm: %06lu\r\n", (unsigned long)evt.passkey);
+                cli_flush();
                 hal_ble_pair_confirm(handle, true);
                 continue;
             }

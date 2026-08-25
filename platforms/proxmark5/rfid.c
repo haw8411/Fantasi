@@ -18,6 +18,7 @@
 
 #include "at32f435.h"
 #include "../../hal/hal_rfid.h"
+#include "../../hal/hal_power.h"
 #include "../../apps/app_rfid.h"   /* FANTASI_RFID_SNIFF_BUFSZ - shared caller/HAL sniff scratch size */
 #include "FreeRTOS.h"
 #include "task.h"
@@ -29,6 +30,10 @@
 #define LF_SPAN     12288   /* max samples streamed per acquire (~3 EM4100 frames) */
 #define LF_WARMUP   256     /* settle dc/amp trackers before arming edge detection */
 #define LF_SMOOTH   4       /* boxcar taps */
+
+/* Shared by the mutually-exclusive LF capture paths.  Keeping the raw DMA
+ * window static avoids both a large app-task stack frame and duplicate BSS. */
+static uint8_t s_lf_raw[LF_SPAN];
 
 /* ---- FPGA command bus (bit-banged, software CS) ---- */
 #define FC_SCK_PORT   GPIOC
@@ -253,7 +258,11 @@ static bool s_setup_done;
 #define PM5_FIELD_IDLE_MS 5000u
 static volatile TickType_t s_field_active_ts;
 static volatile bool s_field_held;   /* explicit hold (`rfid field on` / raw -k) - never auto-parked */
-static inline void rfid_field_touch(void) { s_field_active_ts = xTaskGetTickCount(); }
+static inline void rfid_field_touch(void)
+{
+    s_field_active_ts = xTaskGetTickCount();
+    hal_power_activity();                       /* do not fade/detune the antenna during an RF exchange */
+}
 
 /* Defined further below (SSP sample channel); used by hal_rfid_set_mode. */
 static void fpga_24mhz_clk(void);
@@ -439,10 +448,9 @@ static inline void ssp_phase_lock(void)
     for (uint32_t g = 0; (ssp_clk_get() & 7u) && ++g < 2000000u; ) { }
 }
 
-/* DMA capture of `n` 8-bit samples: SPI4->DT -> buf via DMA1 channel 1 (DMAMUX
- * SPI4_RX), single-shot. Gap-free (unlike polling), so no first-shot overrun.
- * Returns true if the full transfer completed within the deadline. */
-static bool ssc_dma_capture(uint8_t *buf, uint16_t n)
+/* Arm a single-shot SPI4 RX DMA.  Start and wait are separate so timing-sensitive
+ * LF replies can arm the transfer before releasing their critical section. */
+static void ssc_dma_start(uint8_t *buf, uint16_t n)
 {
     CRM->AHBEN1 |= CRM_AHBEN1_DMA1EN;
     (void)CRM->AHBEN1;
@@ -464,6 +472,11 @@ static bool ssc_dma_capture(uint8_t *buf, uint16_t n)
 
     SPI4->CTRL2 |= SPI_CTRL2_DMAREN;           /* SPI4 RX generates DMA requests */
     ch->CTRL |= DMA_CTRL_CHEN;
+}
+
+static bool ssc_dma_finish(void)
+{
+    dma_channel_type *ch = &DMA1->CH[0];
 
     TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(300);
     while (!(DMA1->STS & DMA_STS_FDT1))
@@ -474,6 +487,14 @@ static bool ssc_dma_capture(uint8_t *buf, uint16_t n)
     SPI4->CTRL2 &= ~SPI_CTRL2_DMAREN;
     DMA1->CLR = DMA_CLR_CH1;
     return ok;
+}
+
+/* DMA capture of `n` 8-bit samples: SPI4->DT -> buf via DMA1 channel 1 (DMAMUX
+ * SPI4_RX), single-shot. Gap-free (unlike polling), so no first-shot overrun. */
+static bool ssc_dma_capture(uint8_t *buf, uint16_t n)
+{
+    ssc_dma_start(buf, n);
+    return ssc_dma_finish();
 }
 
 /* ================= HF ISO14443-A reader =================
@@ -573,7 +594,7 @@ static int manchester_decode(uint8_t bit)
         else if ((t & 0x1DC0) == 0x1C00) s = 5;
         else if ((t & 0x0EE0) == 0x0E00) s = 4;
         else if ((t & 0x0770) == 0x0700) s = 3;
-        else if ((t & 0x03B8) == 0x0380) s = 2;
+        else if ((t & 0x0398) == 0x0380) s = 2;
         else if ((t & 0x01DC) == 0x01C0) s = 1;
         else if ((t & 0x00EE) == 0x00E0) s = 0;
         if (s != 0xFFFF) { s_demod.syncBit = s; s_demod.bitCount = 0; s_demod.state = 1; }
@@ -599,7 +620,11 @@ static int manchester_decode(uint8_t bit)
             return 1;
         }
         if (s_demod.len) return 1;
-        demod_reset(s_demod.output, s_demod.par, s_demod.output_len);
+        /* A LISTEN-transition burst can resemble SOC but fail before one bit.
+         * Keep scanning the live window; the real SOC follows a few samples later. */
+        s_demod.state = 0;
+        s_demod.syncBit = 0xFFFF;
+        s_demod.highCnt = 2;
     }
     return 0;
 }
@@ -617,12 +642,12 @@ static int hf_txrx(const uint8_t *tosend, int tlen, uint8_t *rx, int rx_cap, uin
     for (int i = 0; i < 64 && (SPI4->STS & SPI_STS_RDBF); i++) (void)SPI4->DT;
     (void)SPI4->STS;
     fpga_conf(FPGA_MAJOR_MODE_HF_ISO14443A | FPGA_HF_14A_READER_MOD);   /* transmit */
-    if (SPI4->STS & SPI_STS_TDBE) SPI4->DT = SEC_Y;  /* prime: flush an idle byte first */
-    for (int c = 0; c < tlen; ) {
+    for (int c = -1; c < tlen; ) {                   /* c=-1 flushes an idle byte first */
         uint32_t w = 0;
         while (!(SPI4->STS & SPI_STS_TDBE) && ++w < 200000u) { }
         if (!(SPI4->STS & SPI_STS_TDBE)) { taskEXIT_CRITICAL(); return RFID_ERR_FRAMING; }
-        SPI4->DT = tosend[c++];
+        SPI4->DT = (c < 0) ? SEC_Y : tosend[c];
+        c++;
     }
     for (uint32_t w = 0; (SPI4->STS & SPI_STS_BF) && ++w < 200000u; ) { }   /* drain last byte */
 
@@ -635,6 +660,8 @@ static int hf_txrx(const uint8_t *tosend, int tlen, uint8_t *rx, int rx_cap, uin
         uint32_t w = 0;
         while (!(SPI4->STS & SPI_STS_RDBF) && ++w < 4000) { }
         if (!(SPI4->STS & SPI_STS_RDBF)) break;
+        if (nb < 4) { (void)SPI4->DT; continue; }     /* blank the LISTEN transition */
+        if (nb == 4) { s_demod.twoBits = 0; s_demod.highCnt = 2; }
         done = manchester_decode((uint8_t)SPI4->DT);
         if (!done && s_demod.state == 0 && nb >= HF_RX_NOANSWER_BYTES) break;
     }
@@ -1164,8 +1191,7 @@ int hal_rfid_lf_acquire(uint8_t *buf, int max, uint32_t opts)
 
     /* Capture a clean, gap-free block of raw envelope samples via DMA, then demod
      * it. (A static raw buffer keeps this off the caller's small heap/stack.) */
-    static uint8_t raw[LF_SPAN];
-    if (!ssc_dma_capture(raw, LF_SPAN)) return RFID_ERR_TIMEOUT;
+    if (!ssc_dma_capture(s_lf_raw, LF_SPAN)) return RFID_ERR_TIMEOUT;
 
     int32_t dc = -1, amp = 0;
     uint8_t win[LF_SMOOTH] = {0};
@@ -1175,7 +1201,7 @@ int hal_rfid_lf_acquire(uint8_t *buf, int max, uint32_t opts)
     const int warmup = (opts & 1u) ? 24 : LF_WARMUP;
 
     for (int i = 0; i < LF_SPAN && count < max; i++) {
-        uint8_t s = raw[i];
+        uint8_t s = s_lf_raw[i];
 
         wsum += (int32_t)s - win[i % LF_SMOOTH];
         win[i % LF_SMOOTH] = s;
@@ -1214,7 +1240,10 @@ int hal_rfid_lf_acquire(uint8_t *buf, int max, uint32_t opts)
 #define T55_WRITE_1_US     400
 #define T55_POWERUP_MS     8
 #define T55_PROGRAM_MS     6
-#define T55_READ_SETTLE_US 120
+#define T55_READ_RESET_MS  20
+#define T55_READ_SETTLE_CYCLES 137
+/* Skip the reply lead/recovery by one whole block without changing its phase. */
+#define T55_ANCHOR_CYCLES  (LF_WARMUP - 8 + 64 * 32)
 
 /* Fast LF field on/off for gap modulation - just the config word (divisor/drive
  * are already set by set_mode(LF_READER)). */
@@ -1225,19 +1254,32 @@ static void lf_tx_off(void) { fpga_conf(FPGA_MAJOR_MODE_OFF); }
  * caller). Charges the tag, then IRQs-off sends start_gap + each bit's ON/gap. The
  * field is left ON at exit; the caller decides what happens next (a write holds it
  * for the EEPROM commit, a read holds it for the reply). */
-static void lf_tx_cmd(const uint8_t *p, int nbits)
+static void lf_tx_cmd(const uint8_t *p, int nbits, bool keep_critical)
 {
     lf_tx_on();
     spin_ms(T55_POWERUP_MS);                             /* charge the tag (IRQs on) */
 
+    /* A one bit is 32 carrier cycles longer than a zero.  Pad the complete
+     * command to a 64-cycle boundary so block-address changes cannot move the
+     * calibration and target replies by half a Manchester bit. */
+    int cycles = T55_START_GAP_US / 8;
+    for (int i = 0; i < nbits; i++)
+        cycles += (p[i] ? T55_WRITE_1_US : T55_WRITE_0_US) / 8 + T55_WRITE_GAP_US / 8;
+    int pad = (64 - (cycles & 63)) & 63;
+
+    fpga_ssc_setup(false);
     taskENTER_CRITICAL();                                /* gap timing must not be preempted */
+    for (uint32_t w = 0; !(SPI4->STS & SPI_STS_RDBF) && w < 200000u; w++) { }
+    if (SPI4->STS & SPI_STS_RDBF) (void)SPI4->DT;
+    (void)SPI4->STS;
+    if (pad) spin_us((uint32_t)pad * 8);
     lf_tx_off(); spin_us(T55_START_GAP_US);
     for (int i = 0; i < nbits; i++) {
         lf_tx_on();  spin_us(p[i] ? T55_WRITE_1_US : T55_WRITE_0_US);
         lf_tx_off(); spin_us(T55_WRITE_GAP_US);
     }
     lf_tx_on();
-    taskEXIT_CRITICAL();
+    if (!keep_critical) taskEXIT_CRITICAL();
 }
 
 /* T5577 block WRITE downlink (TX only): gap-modulate `p` then hold the field for
@@ -1247,7 +1289,7 @@ int hal_rfid_lf_modulate(const uint8_t *p, int nbits, uint32_t opts)
     (void)opts;
     if (s_mode != RFID_LF_READER || !p || nbits <= 0) return RFID_ERR_UNSUPP;
     rfid_field_touch();
-    lf_tx_cmd(p, nbits);
+    lf_tx_cmd(p, nbits, false);
     spin_ms(T55_PROGRAM_MS);
     lf_tx_off();
     return 0;
@@ -1255,21 +1297,24 @@ int hal_rfid_lf_modulate(const uint8_t *p, int nbits, uint32_t opts)
 
 /* LF reader->tag round-trip: optionally gap-modulate a downlink, hold the field,
  * and stream-demodulate the reply into `buf` as inter-edge run lengths (sample
- * counts of each level run), up to `cap` runs. The runs alternate low, high, ...
- * from the first falling edge (the gap->reply transition); the caller frames the
- * block. Returns the run count, or <0. */
+ * counts of each level run), up to `cap` runs. A [0, initial_level] prefix fixes
+ * the capture phase used by the block-0 calibration and target read. Returns the
+ * run count, or <0. */
 int hal_rfid_lf_transceive(const uint8_t *cmd, int nbits, uint8_t *buf, int cap)
 {
     if (s_mode != RFID_LF_READER || !buf || cap <= 0) return RFID_ERR_UNSUPP;
     rfid_field_touch();
 
-    if (cmd && nbits > 0) lf_tx_cmd(cmd, nbits);         /* send downlink; field left ON */
-    else                  lf_tx_on();
-    fpga_ssc_setup(false);                               /* (re)arm the envelope sample stream */
-    spin_us(T55_READ_SETTLE_US);
-    if (SPI4->STS & SPI_STS_RDBF) (void)SPI4->DT;        /* flush stale */
-    (void)SPI4->STS;
-    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(300);
+    if (cmd && nbits > 0) {
+        lf_tx_cmd(cmd, nbits, true);                      /* returns IRQs-off with field ON */
+    } else {
+        lf_tx_on();
+        fpga_ssc_setup(false);
+        taskENTER_CRITICAL();
+    }
+    ssc_dma_start(s_lf_raw, LF_SPAN);
+    taskEXIT_CRITICAL();                                  /* sample zero is phase-locked to field restore */
+    bool captured = ssc_dma_finish();
 
     int32_t dc = -1, amp = 0;
     uint8_t win[LF_SMOOTH] = {0};
@@ -1277,15 +1322,12 @@ int hal_rfid_lf_transceive(const uint8_t *cmd, int nbits, uint8_t *buf, int cap)
     int count = 0, last_edge = -1;
     int high = 1, started = 0;
 
-    for (int i = 0; i < LF_SPAN && count < cap; i++) {
-        uint32_t w = 0;
-        while (!(SPI4->STS & SPI_STS_RDBF)) {
-            if (xTaskGetTickCount() > deadline || ++w > 2000000u) { lf_tx_off(); return count; }
-        }
-        uint8_t s = (uint8_t)SPI4->DT;
+    for (int i = T55_READ_SETTLE_CYCLES; captured && i < LF_SPAN && count < cap; i++) {
+        int di = i - T55_READ_SETTLE_CYCLES;
+        uint8_t s = s_lf_raw[i];
 
-        wsum += (int32_t)s - win[i % LF_SMOOTH];
-        win[i % LF_SMOOTH] = s;
+        wsum += (int32_t)s - win[di % LF_SMOOTH];
+        win[di % LF_SMOOTH] = s;
         int32_t v = (wsum / LF_SMOOTH) << 8;
 
         if (dc < 0) dc = v;
@@ -1296,10 +1338,16 @@ int hal_rfid_lf_transceive(const uint8_t *cmd, int nbits, uint8_t *buf, int cap)
         int band = (int)(amp >> 8) / 2;
         if (band < 2) band = 2;
 
-        if (i >= 24) {
+        if (di == T55_ANCHOR_CYCLES) {
+            if (cap < 3) { count = 0; break; }
+            high = ac >= 0;
+            buf[count++] = 0;
+            buf[count++] = (uint8_t)high;
+            last_edge = i;
+            started = 1;
+        } else if (di > T55_ANCHOR_CYCLES) {
             if (high && ac < -band) {                    /* falling edge */
                 if (started) { int d = i - last_edge; buf[count++] = d > 0xFF ? 0xFF : (uint8_t)d; }
-                else started = 1;                        /* first falling edge = gap->reply */
                 last_edge = i; high = 0;
             } else if (!high && ac > band) {             /* rising edge */
                 if (started) { int d = i - last_edge; buf[count++] = d > 0xFF ? 0xFF : (uint8_t)d; }
@@ -1308,5 +1356,6 @@ int hal_rfid_lf_transceive(const uint8_t *cmd, int nbits, uint8_t *buf, int cap)
         }
     }
     lf_tx_off();
-    return count;
+    spin_ms(T55_READ_RESET_MS);
+    return captured ? count : RFID_ERR_TIMEOUT;
 }

@@ -7,7 +7,7 @@
  * driver + any modules it streamed, so nothing is pre-staged and nothing
  * persists. Requires the protobuf transport (WebUSB/BLE) - the async protocol
  * needs the device's RX loop free, which the raw serial CLI can't provide. Run
- * the CLI with --usb (or --ble). Replaces the old tools/rfid.py. */
+ * the CLI with --usb or --ble. */
 #include "cli_internal.h"
 #include "theme.h"
 #include "mfc_crypto.h"
@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <errno.h>
+#include <elf.h>
 
 static void cmd_rfid(const char *arg)
 {
@@ -49,6 +50,10 @@ static void cmd_rfid(const char *arg)
  * e.g. an app repo built out of tree (~/FantasiApps/build) - without copying ELFs in. */
 #define APP_DIR    "build/apps"
 #define DRIVER_RAM "/ramfs/rfid"
+#define MFC_CFG_RAM "/ramfs/mfc_cfg"
+#define MFC_EMU_RAM "/ramfs/mfc_emu.bin"
+#define MFC_REQ_RAM "/ramfs/.mfcrreq"
+#define MFC_KEY_RAM "/ramfs/.mfckey"
 
 /* App-ELF directory: $FANTASI_APP_DIR if set (and non-empty), else the build/apps default. */
 static const char *app_dir(void)
@@ -64,14 +69,17 @@ static const struct { const char *name, *ram; } RFID_MODS[] = {
     { "sniff", "/ramfs/rfid_sniff" },
     { "t5577", "/ramfs/rfid_t5577" },
     { "t5577_dump", "/ramfs/rfid_t5577d" },   /* whole-tag dump for bare `read t5577` (one round-trip) */
-    { "mfc_collect", "/rfid_mfcc" },         /* LittleFS: the Hardnested collector is inherently large ... */
-    { "mfc_read",    "/rfid_mfcr" },         /* LittleFS: ~7 KB with the PRNG profiler; off-heap load */
+    { "mfc_collect", "/ramfs/rfid_mfcc" },   /* MIFARE Classic nonce collector */
+    { "mfc_read",    "/ramfs/rfid_mfcr" },   /* MIFARE Classic dictionary reader */
+    { "mfc_block",   "/ramfs/rfid_mfcb" },   /* MIFARE Classic single-block reader */
     { "mfc_emu",     "/ramfs/rfid_mfce" },   /* MIFARE Classic tag emulation */
 };
 #define NMODS ((int)(sizeof RFID_MODS / sizeof RFID_MODS[0]))
 
 static const char *s_arch = "cm4";      /* set from the device: cm4 or arm7 */
 static uint32_t rq_id = 5000;
+static volatile sig_atomic_t g_rfid_sigstop;
+static void rfid_on_sigstop(int s) { (void)s; g_rfid_sigstop = 1; }
 
 /* "<app_dir>/<name>.<arch>.elf" (app_dir = $FANTASI_APP_DIR or build/apps). */
 static const char *elf_path(const char *name)
@@ -79,16 +87,6 @@ static const char *elf_path(const char *name)
     static char buf[256];
     snprintf(buf, sizeof buf, "%s/%s.%s.elf", app_dir(), name, s_arch);
     return buf;
-}
-
-/* Where the driver ELF is staged on the device. The Proxmark3 (arm7) has a tiny
- * WebUSB heap, and keeping the ELF in /ramfs double-counts its ~7 KB against the
- * loader's fresh image -> OOM. Stage it in FLASH (lfs) there instead: the loader
- * streams the source from flash (static 256 B cache, ~0 heap), so only the loaded
- * image lands in RAM. Slower load, but it fits. Other targets keep the RAM path. */
-static const char *driver_path(void)
-{
-    return (strcmp(s_arch, "arm7") == 0) ? "/rfid.drv" : DRIVER_RAM;
 }
 
 static ssize_t tp_write(const void *b, size_t n)
@@ -110,45 +108,133 @@ static ssize_t tp_read(void *b, size_t n)
     return ble_transport_read(b, n);
 }
 
+/* WebUSB mux READs address bytes within one response mailbox.  Once this
+ * private RFID parser has decoded a complete frame it must release that
+ * mailbox and rewind the host offset, exactly as main.c's usb_recv_proto()
+ * does.  BLE is a byte stream and needs no corresponding operation. */
+static void tp_frame_consumed(void)
+{
+#ifdef HAS_USB_VENDOR
+    if (use_usb) usb_transport_frame_consumed();
+#endif
+}
+
 static int send_req(CliRequest *req)
 {
+    if (proto_session_id) {
+        req->has_session = true;
+        req->session = proto_session_id;
+    }
     static uint8_t buf[2 + CliRequest_size];
     pb_ostream_t s = pb_ostream_from_buffer(buf + 2, sizeof buf - 2);
     if (!pb_encode(&s, CliRequest_fields, req)) return -1;
     uint16_t len = (uint16_t)s.bytes_written;
     buf[0] = len & 0xFF; buf[1] = len >> 8;
+#ifdef HAS_USB_VENDOR
+    if (!use_usb && proto_session_id)
+#else
+    if (proto_session_id)
+#endif
+        return (req->which_payload == CliRequest_file_write_tag
+                ? ble_transport_write_session_command(proto_session_id,
+                                                      buf + 2, len)
+                : ble_transport_write_session(proto_session_id, buf + 2, len)) == len
+             ? 0 : -1;
     return tp_write(buf, 2 + len) == (ssize_t)(2 + len) ? 0 : -1;
+}
+
+static int rfid_readline_heartbeat(void)
+{
+    static time_t last;
+    time_t now = time(NULL);
+    if (proto_session_id && now != (time_t)-1 && now - last >= 10) {
+        last = now;
+        CliRequest ping = CliRequest_init_zero;
+        ping.id = ++rq_id;
+        ping.which_payload = CliRequest_session_ping_tag;
+        ping.payload.session_ping = true;
+        (void)send_req(&ping);
+    }
+    return 0;
 }
 
 /* Frame accumulator: pull one CliResponse if a whole frame is buffered, else read
  * more (a short blocking read). Returns 1 (got resp), 0 (none yet), -1 (error). */
 static uint8_t rx_acc[8192];
 static size_t  rx_len;
+
+static bool response_sane(const CliResponse *response)
+{
+    if (!response->id || (response->has_session && !response->session))
+        return false;
+    switch (response->which_payload) {
+    case CliResponse_output_tag:
+    case CliResponse_file_data_tag:
+    case CliResponse_dir_entry_tag:
+    case CliResponse_error_tag:
+    case CliResponse_module_request_tag:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static int recv_resp(CliResponse *resp)
 {
-    if (rx_len < 2 || rx_len < 2u + (rx_acc[0] | (rx_acc[1] << 8))) {
-        uint8_t chunk[1024];
-        ssize_t n = tp_read(chunk, sizeof chunk);
-        if (n < 0) return -1;
-        if (n > 0 && rx_len + (size_t)n <= sizeof rx_acc) { memcpy(rx_acc + rx_len, chunk, n); rx_len += n; }
-    }
-    /* Skip BLE inter-frame zero padding; valid frame lengths are nonzero. */
-    if (rx_len > 0 && rx_acc[0] == 0) {
-        size_t skip = 0;
-        while (skip < rx_len && rx_acc[skip] == 0) skip++;
-        rx_len -= skip;
-        if (rx_len > 0) memmove(rx_acc, rx_acc + skip, rx_len);
-    }
-    if (rx_len >= 2) {
-        uint16_t ml = rx_acc[0] | (rx_acc[1] << 8);
-        if (rx_len >= 2u + ml) {
-            pb_istream_t st = pb_istream_from_buffer(rx_acc + 2, ml);
-            *resp = (CliResponse){0};
-            bool ok = pb_decode(&st, CliResponse_fields, resp);
-            memmove(rx_acc, rx_acc + 2 + ml, rx_len - (2 + ml));
-            rx_len -= 2 + ml;
-            return ok ? 1 : -1;
+    /* The app can spend minutes streaming or waiting for a module response;
+     * those are still live host sessions even though readline is not active. */
+    rfid_readline_heartbeat();
+    uint8_t chunk[1024];
+    ssize_t n = tp_read(chunk, sizeof chunk);
+    if (n < 0) return -1;
+    /* Do not turn an empty app mailbox into an EP0 denial-of-service.  The
+     * PM3 USB task outranks the app/session tasks; issuing the next control
+     * READ immediately can keep that task continuously runnable, preventing
+     * the very producer we are waiting for from running.  One host-side
+     * millisecond leaves bulk transfers untouched and gives every target a
+     * natural scheduling gap while an RFID command is genuinely idle. */
+    if (n == 0) usleep(1000);
+    if (n > 0) {
+        size_t copy = (size_t)n;
+        if (copy > sizeof(rx_acc) - rx_len) {
+            /* Retain only a maximum-frame suffix; the scanner below can recover
+             * at the next complete response boundary. */
+            size_t keep = 2u + CliResponse_size;
+            if (rx_len > keep) {
+                memmove(rx_acc, rx_acc + rx_len - keep, keep);
+                rx_len = keep;
+            }
+            if (copy > sizeof(rx_acc) - rx_len) copy = sizeof(rx_acc) - rx_len;
         }
+        memcpy(rx_acc + rx_len, chunk, copy);
+        rx_len += copy;
+    }
+
+    for (size_t pos = 0; pos + 2 <= rx_len; pos++) {
+        uint16_t ml = (uint16_t)rx_acc[pos] | ((uint16_t)rx_acc[pos + 1] << 8);
+        if (!ml || ml > CliResponse_size || pos + 2u + ml > rx_len) continue;
+        CliResponse candidate = CliResponse_init_zero;
+        pb_istream_t st = pb_istream_from_buffer(rx_acc + pos + 2, ml);
+        if (!pb_decode(&st, CliResponse_fields, &candidate) ||
+            !response_sane(&candidate))
+            continue;
+        if (proto_session_id) {
+            if (!candidate.has_session || candidate.session != proto_session_id)
+                continue;
+        } else if (candidate.has_session) {
+            continue;
+        }
+        size_t consumed = pos + 2u + ml;
+        memmove(rx_acc, rx_acc + consumed, rx_len - consumed);
+        rx_len -= consumed;
+        tp_frame_consumed();
+        *resp = candidate;
+        return 1;
+    }
+    size_t keep = 2u + CliResponse_size;
+    if (rx_len > keep) {
+        memmove(rx_acc, rx_acc + rx_len - keep, keep);
+        rx_len = keep;
     }
     return 0;
 }
@@ -174,45 +260,156 @@ static int publish_file(const char *staged, const char *final)
     return -1;
 }
 
+/* An in-place module uses its RAMFS ELF buffer as text/rodata/data and then reuses
+ * the now-dead ELF metadata tail for NOBITS sections. Return the smallest buffer
+ * which also contains the end of every allocated section. Most ELFs already have
+ * enough metadata tail; padding only the shortfall avoids a second module-sized
+ * allocation in the PM3 loader (raw.cm4 currently needs just 180 extra bytes). */
+static uint32_t inplace_elf_size(FILE *f, uint32_t file_size)
+{
+    Elf32_Ehdr eh;
+    if (fseek(f, 0, SEEK_SET) != 0 || fread(&eh, 1, sizeof eh, f) != sizeof eh ||
+        memcmp(eh.e_ident, ELFMAG, SELFMAG) != 0 ||
+        eh.e_ident[EI_CLASS] != ELFCLASS32 || eh.e_ident[EI_DATA] != ELFDATA2LSB ||
+        eh.e_type != ET_REL || eh.e_machine != EM_ARM ||
+        eh.e_shentsize != sizeof(Elf32_Shdr) || !eh.e_shnum ||
+        (uint64_t)eh.e_shoff + (uint64_t)eh.e_shnum * sizeof(Elf32_Shdr) > file_size) {
+        fseek(f, 0, SEEK_SET);
+        return file_size;
+    }
+
+    uint32_t need = file_size;
+    for (unsigned i = 0; i < eh.e_shnum; i++) {
+        Elf32_Shdr sh;
+        if (fseek(f, (long)eh.e_shoff + (long)i * sizeof sh, SEEK_SET) != 0 ||
+            fread(&sh, 1, sizeof sh, f) != sizeof sh) {
+            need = file_size;
+            break;
+        }
+        if (sh.sh_flags & SHF_ALLOC) {
+            uint64_t end = (uint64_t)sh.sh_offset + sh.sh_size;
+            if (end > UINT32_MAX) { need = file_size; break; }
+            if (end > need) need = (uint32_t)end;
+        }
+    }
+    fseek(f, 0, SEEK_SET);
+    return need;
+}
+
 /* Stream local -> /ramfs path. Fires FileWriteChunks; when drain_acks, waits for
  * their acks here (used before the session loop is running to absorb them). */
-static int upload_ram(const char *ram, const char *local, int drain_acks)
+static int upload_ram_ex(const char *ram, const char *local, int drain_acks, int inplace)
 {
-    (void)drain_acks;   /* window-of-1 acks every chunk inline now */
+    (void)drain_acks;   /* every chunk is correlated and drained here */
     char staged[64];
     int sl = snprintf(staged, sizeof staged, "%s.part", ram);
     if (sl < 0 || (size_t)sl >= sizeof staged) return -1;
     FILE *f = fopen(local, "rb");
     if (!f) { fprintf(stderr, "\nrfid: cannot open %s\n", local); return -1; }
     fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
-    uint32_t off = 0;
-    for (;;) {
-        uint8_t data[480];
-        size_t n = fread(data, 1, sizeof data, f);
-        CliRequest req = CliRequest_init_zero;
-        req.id = ++rq_id; req.which_payload = CliRequest_file_write_tag;
-        FileWriteChunk *fw = &req.payload.file_write;
-        memcpy(fw->path, staged, strlen(staged) + 1);
-        fw->offset = off; memcpy(fw->data.bytes, data, n); fw->data.size = (pb_size_t)n;
-        fw->last = (off + n >= (uint32_t)sz); fw->has_total = true; fw->total = (uint32_t)sz;
-        /* Window of 1; retrying an absolute-offset write is idempotent. */
-        int got = 0;
-        for (int attempt = 0; attempt < 30 && !got; attempt++) {
-            if (send_req(&req) < 0) { fclose(f); return -1; }
-            for (int spin = 0; spin < 100 && !got; spin++) {
-                CliResponse r;
-                int rc = recv_resp(&r);
-                if (rc < 0) { fclose(f); return -1; }
-                if (rc == 1) { if (r.id == req.id) got = 1; } /* skip stale/session frames */
-                else usleep(1000);
+    if (sz < 0 || (uint64_t)sz > UINT32_MAX) { fclose(f); return -1; }
+    uint32_t total = inplace ? inplace_elf_size(f, (uint32_t)sz) : (uint32_t)sz;
+    /* BLE's ATT writes and notifications otherwise alternate one full
+     * round-trip per 480-byte chunk. Keep exactly one additional request in
+     * flight so its fragments travel while the prior ACK is pending. That is
+     * at most one extra transient encoded request (609-byte protocol maximum,
+     * plus a small job/allocator header), still below 1 KB, with no idle-session
+     * RAM cost. WebUSB - including PM3's seven-byte EP0 CHUNK path - retains
+     * the conservative window of one.
+     *
+     * Absolute offsets make a window rewind idempotent. A later in-window ACK
+     * before the oldest means the oldest write/ACK was lost: discard the
+     * logical window and resend from the last contiguous ACK. Unrelated stale
+     * cleanup/input responses are ignored, not mistaken for upload progress. */
+#define RFID_UPLOAD_CHUNK  480u
+#define RFID_UPLOAD_WINDOW 2
+#define RFID_UPLOAD_RETRIES 30
+    int window = RFID_UPLOAD_WINDOW;
+#ifdef HAS_USB_VENDOR
+    if (use_usb) window = 1;
+#endif
+    uint32_t chunks = total ? (total + RFID_UPLOAD_CHUNK - 1) / RFID_UPLOAD_CHUNK : 1;
+    uint32_t acked = 0, sent = 0;
+    uint32_t inflight[RFID_UPLOAD_WINDOW];
+    int inf_head = 0, inf_count = 0, retries = 0, error = 0;
+
+    while (acked < chunks && !error) {
+        while (sent < chunks && inf_count < window) {
+            uint32_t off = sent * RFID_UPLOAD_CHUNK;
+            uint32_t left = total > off ? total - off : 0;
+            size_t n = left < RFID_UPLOAD_CHUNK ? left : RFID_UPLOAD_CHUNK;
+            CliRequest req = CliRequest_init_zero;
+            req.id = ++rq_id;
+            req.which_payload = CliRequest_file_write_tag;
+            FileWriteChunk *fw = &req.payload.file_write;
+            memcpy(fw->path, staged, strlen(staged) + 1);
+            fw->offset = off;
+            memset(fw->data.bytes, 0, n);
+            if (off < (uint32_t)sz) {
+                size_t from_file = (uint32_t)sz - off;
+                if (from_file > n) from_file = n;
+                if (fseek(f, (long)off, SEEK_SET) != 0 ||
+                    fread(fw->data.bytes, 1, from_file, f) != from_file) {
+                    error = 1;
+                    break;
+                }
             }
+            fw->data.size = (pb_size_t)n;
+            fw->last = sent + 1 == chunks;
+            fw->has_total = true;
+            fw->total = total;
+
+            if (send_req(&req) < 0) {
+                if (++retries > RFID_UPLOAD_RETRIES) error = 1;
+                usleep(1000);
+                break;
+            }
+            inflight[(inf_head + inf_count) % RFID_UPLOAD_WINDOW] = req.id;
+            inf_count++;
+            sent++;
         }
-        if (!got) { fclose(f); return -1; }
-        off += n;
-        if (fw->last) break;
+        if (error) break;
+        if (inf_count == 0) continue;
+
+        int advanced = 0, rewind = 0;
+        for (int spin = 0; spin < 100 && !advanced && !rewind; spin++) {
+            CliResponse r;
+            int rc = recv_resp(&r);
+            if (rc < 0) { error = 1; break; }
+            if (rc == 0) { usleep(1000); continue; }
+
+            int pos = -1;
+            for (int i = 0; i < inf_count; i++)
+                if (r.id == inflight[(inf_head + i) % RFID_UPLOAD_WINDOW]) {
+                    pos = i;
+                    break;
+                }
+            if (pos < 0) continue;                         /* unrelated stale response */
+            if (r.which_payload == CliResponse_error_tag) { error = 1; break; }
+            if (pos > 0) { rewind = 1; break; }            /* hole before a later ACK */
+
+            inf_head = (inf_head + 1) % RFID_UPLOAD_WINDOW;
+            inf_count--;
+            acked++;
+            retries = 0;
+            advanced = 1;
+        }
+        if (error) break;
+        if (!advanced) rewind = 1;                         /* bounded ACK timeout */
+        if (rewind) {
+            if (++retries > RFID_UPLOAD_RETRIES) { error = 1; break; }
+            sent = acked;
+            inf_head = inf_count = 0;
+        }
     }
     fclose(f);
+    if (error) return -1;
     return publish_file(staged, ram);
+}
+
+static int upload_ram(const char *ram, const char *local, int drain_acks)
+{
+    return upload_ram_ex(ram, local, drain_acks, 0);
 }
 
 static void serve_module(const char *name)
@@ -233,7 +430,7 @@ static void serve_module(const char *name)
     }
     for (int i = 0; i < NMODS; i++)
         if (strcmp(RFID_MODS[i].name, name) == 0) {
-            upload_ram(RFID_MODS[i].ram, elf_path(name), 0);
+            upload_ram_ex(RFID_MODS[i].ram, elf_path(name), 0, 1);
             return;
         }
     fprintf(stderr, "\nrfid: host has no module '%s'\n", name);
@@ -244,16 +441,33 @@ static void delete_ram(const char *ram)
     CliRequest req = CliRequest_init_zero;
     req.id = ++rq_id; req.which_payload = CliRequest_file_delete_tag;
     strncpy(req.payload.file_delete.path, ram, sizeof req.payload.file_delete.path - 1);
-    send_req(&req);
+    /* Consume each terminal response before queuing another cleanup request.
+     * Missing files remain a best-effort terminal result. */
+    if (send_req(&req) < 0) return;
+    for (int spin = 0; spin < 200; spin++) {
+        CliResponse r;
+        int rc = recv_resp(&r);
+        if (rc < 0) return;
+        if (rc == 1 && r.id == req.id) return;
+        if (rc == 0) usleep(1000);
+    }
 }
 
 static void send_input(const uint8_t *d, size_t n)
 {
-    CliRequest req = CliRequest_init_zero;
-    req.id = ++rq_id; req.which_payload = CliRequest_app_input_tag;
-    if (n > sizeof req.payload.app_input.bytes) n = sizeof req.payload.app_input.bytes;
-    memcpy(req.payload.app_input.bytes, d, n); req.payload.app_input.size = (pb_size_t)n;
-    send_req(&req);
+    while (n) {
+        CliRequest req = CliRequest_init_zero;
+        size_t chunk = n;
+        if (chunk > sizeof req.payload.app_input.bytes)
+            chunk = sizeof req.payload.app_input.bytes;
+        req.id = ++rq_id;
+        req.which_payload = CliRequest_app_input_tag;
+        memcpy(req.payload.app_input.bytes, d, chunk);
+        req.payload.app_input.size = (pb_size_t)chunk;
+        if (send_req(&req) < 0) return;
+        d += chunk;
+        n -= chunk;
+    }
 }
 
 /* Pick the ELF arch for the connected device: run `version` and look for the
@@ -267,9 +481,26 @@ static void detect_arch(void)
     /* Drain any stale frames the transport buffered before correlating. */
     uint8_t junk[512];
     for (int i = 0; i < 50; i++) { if (tp_read(junk, sizeof junk) <= 0) break; }
+    /* A discarded WebUSB frame leaves the stateless transport offset at its
+     * end.  Release it idempotently and rewind before the version response. */
+    tp_frame_consumed();
     rx_len = 0;
 
-    if (send_req(&req) < 0) return;
+    /* A preceding RFID run queues best-effort delete replies. If that bounded
+     * device queue is still full, consume one stale response and retry until
+     * the architecture probe itself has definitely entered the session. */
+    bool submitted = false;
+    for (int attempt = 0; attempt < 64 && !submitted; attempt++) {
+        if (send_req(&req) == 0) {
+            submitted = true;
+            break;
+        }
+        CliResponse stale;
+        int rc = recv_resp(&stale);
+        if (rc < 0) break;
+        if (rc == 0) usleep(1000);
+    }
+    if (!submitted) return;
 
     char out[512]; size_t olen = 0;
     for (int spin = 0; spin < 5000; spin++) {
@@ -277,6 +508,7 @@ static void detect_arch(void)
         int rc = recv_resp(&r);
         if (rc < 0) break;
         if (rc == 0) { usleep(1000); continue; }
+        if (r.id != req.id) continue;       /* stale cleanup/heartbeat reply */
         if (r.which_payload == CliResponse_output_tag) {
             size_t l = strlen(r.payload.output);
             if (olen + l < sizeof out) { memcpy(out + olen, r.payload.output, l); olen += l; }
@@ -485,6 +717,13 @@ static void ann_begin(void) { if (g_ann->begin) g_ann->begin(g_ann_ctx); }
 static int hexnib(char c)
 { return (c>='0'&&c<='9')?c-'0':(c>='A'&&c<='F')?c-'A'+10:(c>='a'&&c<='f')?c-'a'+10:-1; }
 
+static int fixed_hex(const char *s, size_t n)
+{
+    if (strlen(s) != n) return 0;
+    for (size_t i = 0; i < n; i++) if (hexnib(s[i]) < 0) return 0;
+    return 1;
+}
+
 static int s_tbl_hdr;         /* 0 = (re)print the column header before the next frame row */
 static int s_raw;             /* 1 = raw-trace mode (no timing columns), set by a `T` header */
 static int g_rfid_ready;      /* set when the device app printed its "rfid> " prompt = ready for a line */
@@ -499,7 +738,7 @@ static unsigned long samp_us(unsigned long s) { return (unsigned long)((unsigned
 /* ---- collect mfc sniff: recover keys from sniffed reader<->card auths via mfkey64 ------------------- */
 static int g_mfc_sniff;                          /* 1 while `collect mfc sniff` is capturing */
 static uint32_t g_ms_uid, g_ms_nt, g_ms_nr, g_ms_ar;
-static int g_ms_state, g_ms_blk, g_ms_kt;        /* auth-sequence parser state (0..3) + target block/keytype */
+static int g_ms_state, g_ms_blk, g_ms_kt, g_ms_have_uid; /* auth parser state + selected card */
 static uint64_t g_ms_keys[256]; static int g_ms_nkeys;
 
 static uint32_t ms_be32(const uint8_t *b) { return (uint32_t)b[0] << 24 | (uint32_t)b[1] << 16 | (uint32_t)b[2] << 8 | b[3]; }
@@ -508,13 +747,27 @@ static uint32_t ms_be32(const uint8_t *b) { return (uint32_t)b[0] << 24 | (uint3
  * On a complete auth, run mfkey64 and remember the recovered key (deduped). */
 static void mfc_sniff_frame(char dir, const uint8_t *b, int n)
 {
-    if (dir == 'C' && n == 5) g_ms_uid = ms_be32(b);            /* anticollision reply: UID + BCC -> cuid */
+    if (dir == 'R' && n == 1 && (b[0] == 0x52 || b[0] == 0x26)) {
+        g_ms_state = 0; g_ms_have_uid = 0;                       /* a newly activated card needs a new CUID */
+    }
+    if (dir == 'C' && n == 5 && (b[0] ^ b[1] ^ b[2] ^ b[3]) == b[4]) {
+        g_ms_state = 0; g_ms_have_uid = b[0] != 0x88;            /* UID+BCC; 0x88 is an incomplete cascade */
+        if (g_ms_have_uid) g_ms_uid = ms_be32(b);
+    }
+    if (dir == 'R' && n == 9 && (b[0] == 0x93 || b[0] == 0x95 || b[0] == 0x97) && b[1] == 0x70 &&
+        (b[2] ^ b[3] ^ b[4] ^ b[5]) == b[6]) {
+        uint16_t crc = crc16_a(b, 7);
+        if ((uint8_t)crc == b[7] && (uint8_t)(crc >> 8) == b[8]) {
+            g_ms_state = 0; g_ms_have_uid = b[2] != 0x88;        /* full SELECT also carries the CUID */
+            if (g_ms_have_uid) g_ms_uid = ms_be32(b + 2);
+        }
+    }
     switch (g_ms_state) {
         case 0: if (dir == 'R' && n == 4 && (b[0] == 0x60 || b[0] == 0x61)) { g_ms_blk = b[1]; g_ms_kt = b[0] & 1; g_ms_state = 1; } break;
         case 1: if (dir == 'C' && n == 4) { g_ms_nt = ms_be32(b); g_ms_state = 2; } else g_ms_state = 0; break;
         case 2: if (dir == 'R' && n == 8) { g_ms_nr = ms_be32(b); g_ms_ar = ms_be32(b + 4); g_ms_state = 3; } else g_ms_state = 0; break;
         case 3:
-            if (dir == 'C' && n == 4) {
+            if (g_ms_have_uid && dir == 'C' && n == 4) {
                 uint64_t key;
                 if (mc_mfkey64(g_ms_uid, g_ms_nt, g_ms_nr, g_ms_ar, ms_be32(b), &key) == 0) {
                     int dup = 0; for (int i = 0; i < g_ms_nkeys; i++) if (g_ms_keys[i] == key) dup = 1;
@@ -536,7 +789,7 @@ static void mfc_sniff_frame(char dir, const uint8_t *b, int n)
  * \r\n - the terminal is in raw mode during the sniff stream. */
 static void mfc_sniff_finalize(void)
 {
-    g_mfc_sniff = 0; g_ms_state = 0;
+    g_mfc_sniff = 0; g_ms_state = 0; g_ms_have_uid = 0;
     if (g_ms_nkeys == 0) { printf("collect: no keys recovered (no complete auth sniffed)\r\n"); return; }
 
     char tmp[] = "/tmp/fantasi-mfcdict-XXXXXX";
@@ -713,9 +966,13 @@ static const struct { const char *tok, *name; int band; } SUB[] = {
 };
 #define NSUB ((int)(sizeof SUB / sizeof SUB[0]))
 
-enum { OP_READ = 1, OP_SNIFF = 2, OP_RAW = 4, OP_EMU = 8, OP_WRITE = 16 };
+enum {
+    OP_READ = 1, OP_SNIFF = 2, OP_RAW = 4, OP_EMU = 8,
+    OP_WRITE = 16, OP_COLLECT = 32,
+};
 static const struct { uint32_t bit; const char *name; } OPS[] = {
-    { OP_READ, "read" }, { OP_SNIFF, "sniff" }, { OP_RAW, "raw" }, { OP_WRITE, "write" }, { OP_EMU, "emulate" },
+    { OP_READ, "read" }, { OP_SNIFF, "sniff" }, { OP_RAW, "raw" },
+    { OP_WRITE, "write" }, { OP_EMU, "emulate" }, { OP_COLLECT, "collect" },
 };
 #define NOPS ((int)(sizeof OPS / sizeof OPS[0]))
 
@@ -729,13 +986,14 @@ static const struct {
     const annotator_t *ann;
 } RFID_REG[] = {
     { "nfca",  "generic",             SC_NFCA,  OP_SNIFF | OP_RAW,           CAP_HF_READ, &ann_nfca  },
-    { "mfc",   "MIFARE Classic",      SC_NFCA,  OP_SNIFF | OP_RAW | OP_READ, CAP_HF_READ, &ann_mfc   },
+    { "mfc",   "MIFARE Classic",      SC_NFCA,  OP_SNIFF | OP_RAW | OP_READ | OP_EMU | OP_COLLECT,
+                                                                           CAP_HF_READ, &ann_mfc   },
     { "mfp",   "MIFARE Plus",         SC_NFCA,  OP_SNIFF | OP_RAW,           CAP_HF_READ, &ann_mfp   },
     { "ul",    "Ultralight",          SC_NFCA,  OP_SNIFF | OP_RAW | OP_READ, CAP_HF_READ, &ann_ul    },
     { "ulc",   "Ultralight C",        SC_NFCA,  OP_SNIFF | OP_RAW | OP_READ, CAP_HF_READ, &ann_ulc   },
     { "ulaes", "Ultralight AES",      SC_NFCA,  OP_SNIFF | OP_RAW,           CAP_HF_READ, &ann_ulaes },
     { "mfdes", "DESFire",             SC_NFCA,  OP_SNIFF | OP_RAW,           CAP_HF_READ, &ann_mfdes },
-    { "t5577", "T5577",               SC_LF,    OP_READ | OP_RAW | OP_WRITE, CAP_LF_READ, &ann_nfca  },
+    { "t5577", "T5577",               SC_LF,    OP_READ | OP_WRITE,          CAP_LF_READ, &ann_nfca  },
 };
 #define NREG ((int)(sizeof RFID_REG / sizeof RFID_REG[0]))
 
@@ -750,11 +1008,12 @@ static const char *const EX_search[] = { "search", "search hf", "search lf", NUL
 static const rfid_hopt HO_read[] = {
     { "<protocol>", "tag type to read (see `list`)" },
     { "-b <block>", "read just this block; omit to dump every block" },
-    { "-k <key>",   "key / password (e.g. a T5577 password)" },
+    { "-k <key>",   "authentication key or password" },
     { "-s [file]",  "save the dump as JSON (auto-named if no file given)" },
     { NULL, NULL } };
 static const char *const EX_read[] = {
     "read mfc                 dump a MIFARE Classic",
+    "read mfc -b 4 -k FFFFFFFFFFFF",
     "read t5577 -b 4          read block 4 of an LF T5577",
     "read mfc -s dump.json    dump and save as JSON",
     NULL };
@@ -779,7 +1038,7 @@ static const rfid_hopt HO_trace[] = { { "clear", "clear the trace instead of sho
 static const char *const EX_trace[] = { "trace", "trace clear", NULL };
 
 static const rfid_hopt HO_collect[] = {
-    { "<protocol>", "only `mfc` today" },
+    { "<protocol>", "tag type to collect from (see `list`)" },
     { "card",       "collect nonces from a presented card (Hardnested)" },
     { "sniff",      "recover keys from a live auth (mfkey64)" },
     { "reader",     "impersonate a card to a reader (not implemented yet)" },
@@ -912,20 +1171,30 @@ static const char *bare_verb_needs_arg(const char *t)
 
 /* Transitional: map a sub-category + op to today's module ELF key. Folds away once the
  * modules are renamed to the <sub>_<op> convention (nfca_sniff, lf_read, ...). */
-static const char *sub_module(int sub, uint32_t op)
+static const char *shared_op_module(int ri, uint32_t op)
 {
-    if (SUB[sub].band == BAND_HF) return op == OP_SNIFF ? "sniff" : op == OP_RAW ? "raw" : "hf";
-    if (SUB[sub].band == BAND_LF) return (op == OP_RAW || op == OP_WRITE) ? "t5577" : "lf";
-    return NULL;                                           /* UHF (+ HF techs w/o a module yet) */
+    int sub = RFID_REG[ri].sub;
+    if (SUB[sub].band == BAND_HF)
+        return op == OP_SNIFF ? "sniff" : op == OP_RAW ? "raw" : NULL;
+    if (SUB[sub].band == BAND_LF && !strcmp(RFID_REG[ri].token, "t5577") &&
+        (op == OP_READ || op == OP_WRITE)) return "t5577";
+    return NULL;
 }
-static int reg_built(int i)                                /* is any op-module for this protocol built for the arch? */
+static int op_built(int i, uint32_t op)
 {
-    for (int o = 0; o < NOPS; o++)
-        if (RFID_REG[i].ops & OPS[o].bit) {
-            const char *m = sub_module(RFID_REG[i].sub, OPS[o].bit);
-            if (m && access(elf_path(m), F_OK) == 0) return 1;
-        }
-    return 0;
+    const char *m = shared_op_module(i, op);
+    if (m) return access(elf_path(m), F_OK) == 0;
+
+    /* Independent operations follow the feature-module naming convention.
+     * A future ul_read/UHF module therefore becomes available without another
+     * protocol-specific branch in this general list renderer. */
+    const char *suffix = op == OP_READ ? "read" : op == OP_WRITE ? "write" :
+                         op == OP_EMU ? "emu" : op == OP_COLLECT ? "collect" :
+                         op == OP_SNIFF ? "sniff" : op == OP_RAW ? "raw" : NULL;
+    if (!suffix) return 0;
+    char derived[96];
+    snprintf(derived, sizeof derived, "%s_%s", RFID_REG[i].token, suffix);
+    return access(elf_path(derived), F_OK) == 0;
 }
 
 /* `list [band|sub-category]` - host-rendered from the registry as a band > sub-category >
@@ -950,19 +1219,24 @@ static void rfid_list(const char *filter)
             int shown = 0;
             for (int i = 0; i < NREG; i++) {
                 if (RFID_REG[i].sub != s) continue;
-                char ops[48] = "";
+                char ops[256] = "";
                 for (int o = 0; o < NOPS; o++)
                     if (RFID_REG[i].ops & OPS[o].bit) {
-                        strncat(ops, OPS[o].name, sizeof ops - strlen(ops) - 2);
+                        int built = op_built(i, OPS[o].bit);
+                        strncat(ops, built ? "\033[32m" : "\033[90m",
+                                sizeof ops - strlen(ops) - 1);
+                        strncat(ops, OPS[o].name, sizeof ops - strlen(ops) - 1);
+                        if (!built) strncat(ops, "*", sizeof ops - strlen(ops) - 1);
+                        strncat(ops, "\033[0m", sizeof ops - strlen(ops) - 1);
                         strncat(ops, " ", sizeof ops - strlen(ops) - 1);
                     }
-                printf("    %-6s %-24s %-18s %s\n", RFID_REG[i].token, RFID_REG[i].label, ops,
-                       reg_built(i) ? "\033[32mavailable\033[0m" : "\033[90mnot built\033[0m");
+                printf("    %-6s %-24s %s\n", RFID_REG[i].token, RFID_REG[i].label, ops);
                 shown = 1;
             }
             if (!shown) printf("    \033[90m(none yet)\033[0m\n");
         }
     }
+    printf("  \033[90m* not built for this target architecture\033[0m\n");
 }
 
 static const char *RFID_FIELD[] = { "on", "off", "status" };
@@ -997,7 +1271,14 @@ static char **rfid_completion(const char *text, int start, int end)
         }
         init = 1;
     }
-    rl_attempted_completion_over = 1;                       /* command list only, no host-file fallback */
+    /* `emulate` consumes a local host path, so let readline's normal filename
+     * completer handle its arguments. Every other branch is vocabulary owned
+     * by this sub-CLI and must not fall through to unrelated host filenames. */
+    if (start > 0 && !strncmp(rl_line_buffer, "emulate ", 8)) {
+        rl_attempted_completion_over = 0;
+        return NULL;
+    }
+    rl_attempted_completion_over = 1;
     if (start == 0)                                  { g_cand = verbs;      g_nc = NVERBS; }
     else if (!strncmp(rl_line_buffer, "field ",  6)) { g_cand = RFID_FIELD; g_nc = 3; }
     else if (!strncmp(rl_line_buffer, "trace ",  6)) { g_cand = RFID_TRACE; g_nc = 1; }
@@ -1059,7 +1340,8 @@ static void send_dev_line(const char *snd)
 /* Parsed read/write arguments: a required protocol token followed by flags (order-free):
  *   -b <block>   block number (absent on read => dump all blocks)
  *   -d <hex>     data word to write (write only)
- *   -k <key>     optional key (a T5577 password; "key" in fantasi terms) */
+ *   -k <key>     optional MFC key or T5577 password
+ *   -s [path]    save a read as JSON (read only) */
 typedef struct {
     int  ri;                     /* registry index of the protocol */
     int  block;                  /* -1 if -b absent */
@@ -1112,78 +1394,157 @@ static int parse_rw(const char *rest, rw_args_t *a, const char *verb, uint32_t n
         switch (flag[1]) {
             case 'b': {
                 char *end; long b = strtol(val, &end, 0);
-                if (*end || b < 0 || b > 7) { printf("%s: block must be 0-7\n", verb); return -1; }
+                if (*end || b < 0 || b > 255) { printf("%s: invalid block number\n", verb); return -1; }
                 a->block = (int)b; break;
             }
             case 'd': snprintf(a->data, sizeof a->data, "%s", val); a->have_data = 1; break;
             case 'k': snprintf(a->key,  sizeof a->key,  "%s", val); a->have_key  = 1; break;
-            default:  printf("%s: unknown flag -%c (use -b/-d/-k)\n", verb, flag[1]); return -1;
+            default:  printf("%s: unknown flag -%c\n", verb, flag[1]); return -1;
         }
     }
     return 0;
 }
 
-/* `write <protocol> -b <block> -d <hex> [-k <key>]` - HOST abstraction (no device `write` op): rewrite to
- * the device block-write primitive `raw <devcat> <block> <hex>`. Writes the device line to `out`, returns
- * 1, or prints why and returns 0. */
+/* `write <protocol> -b <block> -d <hex> [-k <key>]`: normalize flags into the device app's corresponding
+ * write verb. Writes the device line to `out`, returns 1, or prints why and returns 0. */
 static int rfid_write(const char *rest, char *out, size_t outsz)
 {
     rw_args_t a;
     if (parse_rw(rest, &a, "write", OP_WRITE, WRITE_USAGE) != 0) return 0;
+    if (a.have_save) { printf("write: -s is only valid with read\n"); return 0; }
     if (a.block < 0 || !a.have_data) { printf("%s\n", WRITE_USAGE); return 0; }
-    /* LF protocols keep their own token (their module routes it); HF techs share the nfca module. */
-    const char *devcat = (SUB[RFID_REG[a.ri].sub].band == BAND_HF) ? "nfca" : RFID_REG[a.ri].token;
-    if (a.have_key) printf("write: note - keys aren't wired to the device downlink yet; writing without it\n");
-    snprintf(out, outsz, "raw %s %d %s", devcat, a.block, a.data);
+    if (!strcmp(RFID_REG[a.ri].token, "t5577")) {
+        if (a.block > 7) { printf("write: T5577 block must be 0-7\n"); return 0; }
+        size_t n = strlen(a.data);
+        int valid = n == 8;
+        for (size_t i = 0; valid && i < n; i++) valid = hexnib(a.data[i]) >= 0;
+        if (!valid) {
+            printf("write: T5577 data must be exactly 8 hex digits\n");
+            return 0;
+        }
+        if (a.have_key && !fixed_hex(a.key, 8)) {
+            printf("write: T5577 password must be exactly 8 hex digits\n");
+            return 0;
+        }
+    }
+    /* T5577 passwords are accepted today so scripts do not need to change when
+     * password-mode downlink lands. The device currently performs the same
+     * unpassworded write and intentionally receives no key field. */
+    snprintf(out, outsz, "write %s %d %s", RFID_REG[a.ri].token, a.block, a.data);
     return 1;
 }
 
-/* `read <protocol> [-b <block>] [-k <key>]` - RX mirror of write, HOST abstraction over `raw`. With -b:
- * rewrite to `raw <token> <block>` (no data = read) into `out`, return 1. without -b: return 2 (the
- * caller dumps every block). Scoped to LF block-read protocols (t5577). Returns 0 on error. */
+/* `read <protocol> [-b <block>] [-k <key>]`: with -b, normalize flags into the device app's read verb.
+ * Without -b return 2 so the caller can render a whole-tag dump. Scoped to LF block-read protocols
+ * (currently T5577). Returns 0 on error. */
 static int rfid_read(const char *rest, char *out, size_t outsz, rw_args_t *a_out)
 {
     rw_args_t a;
     if (parse_rw(rest, &a, "read", OP_READ, READ_USAGE) != 0) return 0;
-    if (!strcmp(RFID_REG[a.ri].token, "mfc")) {                /* HF: MIFARE Classic whole-card crypto read */
+    if (a.have_data) { printf("read: -d is only valid with write\n"); return 0; }
+    if (!strcmp(RFID_REG[a.ri].token, "mfc")) {
+        if (a.block > 63) { printf("read: MIFARE Classic 1K block must be 0-63\n"); return 0; }
+        if (a.have_key && !fixed_hex(a.key, 12)) {
+            printf("read: MIFARE Classic key must be exactly 12 hex digits\n");
+            return 0;
+        }
         if (a_out) *a_out = a;
         return 3;
     }
-    if (!((RFID_REG[a.ri].ops & OP_RAW) && SUB[RFID_REG[a.ri].sub].band == BAND_LF)) {
+    if (SUB[RFID_REG[a.ri].sub].band != BAND_LF) {
         printf("read: %s has no block read (see `list`)\n", RFID_REG[a.ri].token); return 0;
+    }
+    if (a.block > 7) { printf("read: T5577 block must be 0-7\n"); return 0; }
+    if (a.have_key && !fixed_hex(a.key, 8)) {
+        printf("read: T5577 password must be exactly 8 hex digits\n");
+        return 0;
     }
     if (a_out) *a_out = a;
     if (a.block < 0) { if (a_out) a_out->have_key = a.have_key; return 2; }   /* bare read -> dump all blocks */
-    if (a.have_key) printf("read: note - keys aren't wired to the device downlink yet; reading without it\n");
-    snprintf(out, outsz, "raw %s %d", RFID_REG[a.ri].token, a.block);
+    /* See rfid_write(): accept but intentionally omit the not-yet-wired T5577
+     * password. No warning is emitted because -k is a supported future field,
+     * not an accidental/unknown option. */
+    snprintf(out, outsz, "read %s %d", RFID_REG[a.ri].token, a.block);
     return 1;
 }
 
 /* ============================ themed bare-read dump ============================ */
 
+#define CAPTURE_SILENT        0
+#define CAPTURE_LIVE          1
+#define CAPTURE_READ_PROGRESS 2
+
+static int s_read_progress_active;
+static int s_read_progress_tty;
+
+/* Rich read commands buffer the module's machine-readable dump until the final
+ * table can be rendered. Keep the user informed without echoing that raw dump:
+ * a terminal gets one carriage-return-updated line; redirected output gets one
+ * stable "reading..." line instead of a stream of progress records. */
+static void read_progress_begin(const char *detail)
+{
+    s_read_progress_active = 1;
+    s_read_progress_tty = isatty(STDOUT_FILENO);
+    if (s_read_progress_tty)
+        printf("\rreading: %s\033[K", detail ? detail : "card");
+    else
+        printf("reading...\n");
+    fflush(stdout);
+}
+
+static void read_progress_update(const char *line, size_t len)
+{
+    static const char prefix[] = "reading:";
+    while (len && (line[len - 1] == '\r' || line[len - 1] == '\n')) len--;
+    if (!s_read_progress_active || !s_read_progress_tty ||
+        len < sizeof prefix - 1 || memcmp(line, prefix, sizeof prefix - 1) != 0)
+        return;
+    printf("\r%.*s\033[K", (int)len, line);
+    fflush(stdout);
+}
+
+static void read_progress_end(void)
+{
+    if (s_read_progress_active && s_read_progress_tty) {
+        printf("\r\033[K");
+        fflush(stdout);
+    }
+    s_read_progress_active = 0;
+}
+
 /* Send `cmd` to the app session and CAPTURE its output into `buf` (up to `sz`), serving module fetches
- * inline and stopping at the trailing "rfid> " prompt (stripped). Returns 0, or -1 on link loss. */
+ * inline and stopping at the trailing "rfid> " prompt (stripped). Returns 0, -1 on link loss, or -2 when
+ * SIGINT/SIGTERM asks the outer app loop to stop this blocking command. */
 static int app_capture(uint32_t sid, const char *cmd, char *buf, size_t sz, int live)
 {
     send_dev_line(cmd);
     size_t len = 0, shown = 0; if (sz) buf[0] = 0;
     for (;;) {
+        if (g_rfid_sigstop) return -2;
         CliResponse resp;
         int r = recv_resp(&resp);
         if (r < 0) return -1;
+        if (g_rfid_sigstop) return -2;
         if (r == 0) continue;                              /* partial frame - keep reading */
         if (resp.id != sid) continue;
         if (resp.which_payload == CliResponse_output_tag && resp.payload.output[0]) {
             for (const char *o = resp.payload.output; *o && len + 1 < sz; o++) buf[len++] = *o;
             buf[len] = 0;
-            /* Live-echo progress for slow modules (collect) so a minutes-long run isn't a silent black box.
-             * Flush COMPLETE lines only and hold any partial trailing line: it may be the "rfid> " prompt,
-             * and the old fixed 6-byte holdback left the newest line truncated mid-word ("...colle") until the
-             * next line arrived. Flushing on newline boundaries shows each line whole the instant it lands. */
-            if (live) {
+            /* Echo complete progress lines and retain a partial trailing line,
+             * which may be the prompt. */
+            if (live == CAPTURE_LIVE) {
                 size_t end = len;
                 while (end > shown && buf[end - 1] != '\n') end--;   /* end = just past the last '\n' */
                 if (end > shown) { fwrite(buf + shown, 1, end - shown, stdout); fflush(stdout); shown = end; }
+            } else if (live == CAPTURE_READ_PROGRESS) {
+                size_t end = len;
+                while (end > shown && buf[end - 1] != '\n') end--;
+                while (shown < end) {
+                    size_t eol = shown;
+                    while (eol < end && buf[eol] != '\n') eol++;
+                    read_progress_update(buf + shown, eol - shown);
+                    shown = eol + (eol < end);
+                }
             }
         } else if (resp.which_payload == CliResponse_module_request_tag) {
             serve_module(resp.payload.module_request);
@@ -1192,7 +1553,10 @@ static int app_capture(uint32_t sid, const char *cmd, char *buf, size_t sz, int 
         }
         if (len >= 6 && !memcmp(buf + len - 6, "rfid> ", 6)) {
             len -= 6; buf[len] = 0;
-            if (live && len > shown) { fwrite(buf + shown, 1, len - shown, stdout); fflush(stdout); }
+            if (live == CAPTURE_LIVE && len > shown) {
+                fwrite(buf + shown, 1, len - shown, stdout);
+                fflush(stdout);
+            }
             return 0;
         }
     }
@@ -1347,13 +1711,20 @@ static void rfid_read_all(uint32_t sid, const rw_args_t *a)
      * default read, not how many exist, so a dump reads every physical block. Layout: blk[0..7] = page 0
      * blocks 0-7; blk[8..10] = page 1 blocks 1,2,3.
      *
-     * Cne device command: the t5577_dump module calibrates once and reads every block in a single module
+     * One device command: the t5577_dump module calibrates once and reads every block in a single module
      * invocation, so the whole tag comes back in one round-trip instead of 11 (each of which re-fetched the
      * module and intermittently stalled on the USB transport). It prints one line per block, which we parse:
      *   t5577: p0 b0 = 00148040   (or "= --------" when a block didn't decode). */
     uint32_t blk[11] = {0}; int ok[11] = {0};
     char cap[1024];
-    if (app_capture(sid, "raw t5577dump", cap, sizeof cap, 0) != 0) { printf("\nread: link lost\n"); return; }
+    read_progress_begin("preparing T5577 reader");
+    int cr = app_capture(sid, "read t5577", cap, sizeof cap, CAPTURE_READ_PROGRESS);
+    if (cr != 0) {
+        read_progress_end();
+        printf("\nread: %s\n", cr == -2 ? "cancelled" : "link lost");
+        return;
+    }
+    read_progress_end();
 
     for (const char *p = cap; (p = strstr(p, "t5577: p")) != NULL; p++) {
         int page = p[8] - '0';                             /* "p<page> b<block> = <hex>" */
@@ -1383,8 +1754,8 @@ static void rfid_read_all(uint32_t sid, const rw_args_t *a)
 }
 
 /* ---- MIFARE Classic whole-card dump (mirrors tools/mfc_output.py) ---- */
-#define MFC_BLOCKS  72                             /* 1K EV1: 18 sectors x 4 blocks (plain 1K uses first 64) */
-#define MFC_SECTORS 18
+#define MFC_BLOCKS  64                             /* MIFARE Classic 1K: 16 sectors x 4 blocks */
+#define MFC_SECTORS 16
 
 /* One block row: "▸ NN  hh hh .. hh  |ascii|", colored by role. The sector trailer (b==3) is field-split
  * into Key A / access bits / Key B; the manufacturer block (0) and trailers get an alert ▸ mark. */
@@ -1418,24 +1789,22 @@ static void mfc_block_row(int gb, const uint8_t *d, int ok)
     box_row(s);
 }
 
-/* Render a full MIFARE Classic dump as a themed box. blk[64]/ok[64] hold each block; keychar[16]/keyhex[16]
- * describe the key that opened each sector ('-' = not recovered). */
+/* Render a full MIFARE Classic 1K dump as a themed box. blk[64]/ok[64]
+ * hold each block and keyA/keyB hold all 32 recovered sector keys. */
 static void render_mfc(const uint8_t uid[4], uint8_t sak, const uint8_t atqa[2],
                        const uint8_t blk[][16], const int *ok, char keyA[][16], char keyB[][16],
                        const char *prng)
 {
     const theme_t *t = g_theme;
     char s[512];
-    /* EV1 has 2 signature sectors (16-17); detect it from any block in 64..71 having been read. */
-    int nsec = 16; for (int b = 64; b < MFC_BLOCKS; b++) if (ok[b]) { nsec = 18; break; }
-    int nblk = nsec * 4;
+    const int nsec = MFC_SECTORS, nblk = MFC_BLOCKS;
     int total = 0; for (int i = 0; i < nblk; i++) if (ok[i]) total++;
 
     box_inner = 74;
     printf("\n");
     box_top();
     snprintf(s, sizeof s, "%s%sMIFARE Classic%s  %s13.56 MHz · ISO14443-A · %s%s", t->accent, A_BOLD, A_RST,
-             A_DIM, nsec == 18 ? "1K EV1" : "1K", A_RST);
+             A_DIM, "1K", A_RST);
     box_row(s);
     box_sep();
     snprintf(s, sizeof s, "%-5s %s%s%02X:%02X:%02X:%02X%s   %sSAK %02X · ATQA %02X%02X · PRNG %s%s", "UID",
@@ -1448,10 +1817,10 @@ static void render_mfc(const uint8_t uid[4], uint8_t sak, const uint8_t atqa[2],
     for (int sec = 0; sec < nsec; sec++) {
         const char *ka = keyA[sec][0] ? keyA[sec] : NULL, *kb = keyB[sec][0] ? keyB[sec] : NULL;
         if (ka && kb)
-            snprintf(s, sizeof s, "%s%sSECTOR %02d%s   %skey A %s · key B %s%s", t->alert, A_BOLD, sec, A_RST,
+            snprintf(s, sizeof s, "%s%sSECTOR %02d%s   %skey A %.12s · key B %.12s%s", t->alert, A_BOLD, sec, A_RST,
                      A_DIM, ka, kb, A_RST);
         else if (ka || kb)
-            snprintf(s, sizeof s, "%s%sSECTOR %02d%s   %skey %c %s%s", t->alert, A_BOLD, sec, A_RST,
+            snprintf(s, sizeof s, "%s%sSECTOR %02d%s   %skey %c %.12s%s", t->alert, A_BOLD, sec, A_RST,
                      A_DIM, ka ? 'A' : 'B', ka ? ka : kb, A_RST);
         else
             snprintf(s, sizeof s, "%s%sSECTOR %02d%s   %sno key found%s", t->alert, A_BOLD, sec, A_RST, A_DIM, A_RST);
@@ -1477,9 +1846,49 @@ static void render_mfc(const uint8_t uid[4], uint8_t sak, const uint8_t atqa[2],
     box_inner = BOX_INNER;
 }
 
-/* `collect <proto> <card|reader|sniff> [-u UID] [-k key]`: gather key material to files. `mfc card` runs the
- * on-device Hardnested nonce collector (writes /nfc/mfc.log). reader (tag emulation) and sniff (host mfkey64
- * -> /nfc/mfc.dict) are not implemented yet. The module writes the log itself; the host just relays status. */
+static void render_mfc_block(const uint8_t uid[4], uint8_t sak, const uint8_t atqa[2],
+                             int block, const uint8_t data[16], char keytype,
+                             const char *key, const char *prng)
+{
+    const theme_t *t = g_theme;
+    char s[512]; uint8_t row[16]; memcpy(row, data, sizeof row);
+    if ((block & 3) == 3 && key && fixed_hex(key, 12)) {
+        int off = keytype == 'B' ? 10 : 0;
+        for (int i = 0; i < 6; i++) {
+            unsigned v = 0; sscanf(key + i * 2, "%2x", &v); row[off + i] = (uint8_t)v;
+        }
+    }
+
+    box_inner = 74;
+    printf("\n");
+    box_top();
+    snprintf(s, sizeof s, "%s%sMIFARE Classic%s  %s13.56 MHz · ISO14443-A · 1K%s",
+             t->accent, A_BOLD, A_RST, A_DIM, A_RST);
+    box_row(s);
+    box_sep();
+    snprintf(s, sizeof s, "%-5s %s%s%02X:%02X:%02X:%02X%s   %sSAK %02X · ATQA %02X%02X · PRNG %s%s",
+             "UID", t->alert, A_BOLD, uid[0], uid[1], uid[2], uid[3], A_RST,
+             A_DIM, sak, atqa[1], atqa[0], (prng && prng[0]) ? prng : "?", A_RST);
+    box_row(s);
+    snprintf(s, sizeof s, "%sSECTOR %02d%s   key %c %.12s", A_DIM, block / 4, A_RST,
+             keytype, key ? key : "????????????");
+    box_row(s);
+    box_sep();
+    snprintf(s, sizeof s, "%sblk   hex bytes%*sascii%s", A_DIM, 41, "", A_RST);
+    box_row(s);
+    mfc_block_row(block, row, 1);
+    box_sep();
+    snprintf(s, sizeof s, "%s%s✓ read complete%s   %sblock %d%s",
+             t->accent, A_BOLD, A_RST, A_DIM, block, A_RST);
+    box_row(s);
+    box_bottom();
+    printf("\n");
+    box_inner = BOX_INNER;
+}
+
+/* `collect <proto> <card|reader|sniff> [-u UID] [-k key]`: gather key material to files. `mfc card` streams
+ * the on-device Hardnested nonce cloud into host-side mfc.log; sniff runs host mfkey64 and writes the recovered
+ * keys to /nfc/mfc.dict. Reader-mode collection is not implemented yet. */
 /* Returns 1 if it launched a streaming device command (the caller must not re-arm the prompt - the REPL
  * streams the sniff), or 0 if fully handled synchronously. */
 static int rfid_collect(uint32_t sid, const char *args)
@@ -1499,7 +1908,7 @@ static int rfid_collect(uint32_t sid, const char *args)
     if (!strcmp(mode, "sniff")) {
         /* Sniff reader<->card auths; the frame parser (mfc_sniff_frame) mfkey64s each and, on stop, writes
          * /nfc/mfc.dict (mfc_sniff_finalize). Reuses the normal sniff streaming path. Press a key to stop. */
-        g_mfc_sniff = 1; g_ms_state = 0; g_ms_nkeys = 0; g_ms_uid = 0;
+        g_mfc_sniff = 1; g_ms_state = 0; g_ms_nkeys = 0; g_ms_uid = 0; g_ms_have_uid = 0;
         printf("collect: sniffing auths - press a key to stop and recover keys via mfkey64\n");
         send_dev_line("sniff nfca");
         return 1;
@@ -1518,21 +1927,25 @@ static int rfid_collect(uint32_t sid, const char *args)
     if (cfd < 0) { printf("collect: mkstemp failed\n"); return 0; }
     FILE *cf = fdopen(cfd, "wb");
     if (cf) { fwrite(cfg, 1, sizeof cfg, cf); fclose(cf); } else close(cfd);
-    upload_ram("/ramfs/mfc_cfg", cfgtmp, 1);
+    if (upload_ram(MFC_CFG_RAM, cfgtmp, 1) < 0) {
+        unlink(cfgtmp);
+        printf("collect: config upload failed\n");
+        return 0;
+    }
     unlink(cfgtmp);
-    upload_ram("/rfid_mfcc", elf_path("mfc_collect"), 1);   /* LittleFS: large Hardnested collector */
-
     /* Stream the device output line-by-line (the nonce cloud is ~1500 lines/target, far past any fixed
      * buffer). The module frames each target's nonces with NONCE-BEGIN/END; route those into a local nonce
      * file for the offline solver (hardnested_main) and print only the human `collect:` status lines. */
     const char *noncepath = "mfc.log";
-    FILE *nf = NULL; long nonce_count = 0; int in_nonce = 0, link_ok = 1, done = 0;
+    FILE *nf = NULL; long nonce_count = 0; int in_nonce = 0, link_ok = 1, done = 0, cancelled = 0;
     char line[256]; size_t ll = 0;
-    send_dev_line("raw mfccollect");
+    send_dev_line("collect mfc card");
     while (!done) {
+        if (g_rfid_sigstop) { cancelled = 1; break; }
         CliResponse resp;
         int r = recv_resp(&resp);
         if (r < 0) { link_ok = 0; break; }
+        if (g_rfid_sigstop) { cancelled = 1; break; }
         if (r == 0) continue;
         if (resp.id != sid) continue;
         if (resp.which_payload == CliResponse_module_request_tag) { serve_module(resp.payload.module_request); continue; }
@@ -1553,6 +1966,7 @@ static int rfid_collect(uint32_t sid, const char *args)
         if (ll >= 6 && !memcmp(line + ll - 6, "rfid> ", 6)) done = 1;   /* trailing prompt (no newline) */
     }
     if (nf) fclose(nf);
+    if (cancelled) { printf("collect: cancelled\n"); return 0; }
     if (!link_ok) { printf("collect: link lost\n"); return 0; }
     if (nonce_count) printf("collect: captured %ld nonces -> %s  (crack: hardnested_main %s)\n",
                             nonce_count, noncepath, noncepath);
@@ -1610,14 +2024,11 @@ static int rfid_emulate(uint32_t sid, const char *args)
     if (fd < 0) { printf("emulate: mkstemp failed\n"); return 0; }
     FILE *tf = fdopen(fd, "wb");
     if (tf) { fwrite(img, 1, sizeof img, tf); fclose(tf); } else close(fd);
-    if (upload_ram("/ramfs/mfc_emu.bin", tmp, 1) < 0) { unlink(tmp); printf("emulate: image upload failed\n"); return 0; }
+    if (upload_ram(MFC_EMU_RAM, tmp, 1) < 0) { unlink(tmp); printf("emulate: image upload failed\n"); return 0; }
     unlink(tmp);
-    upload_ram("/ramfs/rfid_mfce", elf_path("mfc_emu"), 1);        /* pre-stage the module (streaming fetch
-                                                                    * isn't served after the image upload) */
-
     printf("emulate: MIFARE Classic 1K, uid=%02X%02X%02X%02X, %d/64 blocks, prng=%s - press a key to stop\n",
            img[0], img[1], img[2], img[3], got, prng);
-    send_dev_line("raw mfcemu");
+    send_dev_line("emulate mfc");
     return 1;
 }
 
@@ -1628,20 +2039,40 @@ static void rfid_read_mfc(uint32_t sid, const rw_args_t *a)
 {
     static char cap[16384];
     /* The dictionaries already live on the device: /nfc/mfc_dict.dic (general, flashed by `make flash`) and
-     * /nfc/mfc.dict (card-specific, written by `collect mfc sniff`). The module reads them directly.
-     * Pre-stage the module ELF here (like emulate does): do_mfc's in-command streaming fetch (obtain_named)
-     * hangs - the host gets stuck in upload_ram mid-app_capture and never resumes reading device output. With
-     * the ELF already resident, obtain_named sees it and skips the fetch entirely. The old OOM worry (that the
-     * resident ELF starved the bitstream decompress window) no longer holds: idle heap is ~28 KB, and the
-     * module frees the /ramfs ELF via fantasi_run_module *before* its own set_mode() opens that window. */
-    upload_ram("/rfid_mfcr", elf_path("mfc_read"), 1);       /* LittleFS (flash), not /ramfs: keeps the ~7 KB ELF off the heap during the nested load */
-    /* live=0: buffer the module's raw `mfc: ...` protocol lines silently; the parsed result is drawn as the
-     * themed table below. (Live echo was only a diagnostic while the load path was hanging.) */
-    if (app_capture(sid, "raw mfcread", cap, sizeof cap, 0) != 0) { printf("\nread: link lost\n"); return; }
+     * /nfc/mfc.dict (card-specific, written by `collect mfc sniff`). The module reads them directly. The RFID
+     * driver requests mfc_read only when this command reaches it; serve_module() streams the ELF to /ramfs,
+     * and fantasi_run_module(..., true) deletes that source as soon as it has been loaded. */
+    char devcmd[96];
+    if (a->block >= 0)
+        snprintf(devcmd, sizeof devcmd, "read mfc %d%s%s", a->block,
+                 a->have_key ? " " : "", a->have_key ? a->key : "");
+    else if (a->have_key)
+        snprintf(devcmd, sizeof devcmd, "read mfc all %s", a->key);
+    else
+        snprintf(devcmd, sizeof devcmd, "read mfc");
 
-    uint8_t uid[4] = {0}, atqa[2] = {0}, sak = 0, blk[MFC_BLOCKS][16]; int ok[MFC_BLOCKS] = {0};
+    read_progress_begin(a->block >= 0 ? "preparing MIFARE Classic block read" :
+                                        "preparing MIFARE Classic reader");
+    /* Buffer raw MFC records for the themed table while showing only the
+     * module's reading-status records on the in-place progress line. */
+    int cr = app_capture(sid, devcmd, cap, sizeof cap, CAPTURE_READ_PROGRESS);
+    if (cr != 0) {
+        read_progress_end();
+        /* The resident driver self-cleans on every normal return. A forced
+         * app_stop can bypass that epilogue, so remove only here rather than
+         * charging every RFID launch two remote filesystem round trips. */
+        if (cr == -2) { delete_ram(MFC_REQ_RAM); delete_ram(MFC_KEY_RAM); }
+        printf("\nread: %s\n", cr == -2 ? "cancelled" : "link lost");
+        return;
+    }
+    read_progress_end();
+
+    uint8_t uid[4] = {0}, atqa[2] = {0}, sak = 0, blk[MFC_BLOCKS][16];
+    int ok[MFC_BLOCKS] = {0}, seen_blk[MFC_BLOCKS] = {0};
     char keyA[MFC_SECTORS][16], keyB[MFC_SECTORS][16]; int got_uid = 0;
     char prng[8] = "weak";                                 /* PRNG class profiled by the module (mfc: prng=...) */
+    char failure[256] = "";
+    int fatal = 0, done_sectors = -1, done_block = -1;      /* retain diagnostics while cap is tokenized */
     for (int i = 0; i < MFC_SECTORS; i++) { keyA[i][0] = 0; keyB[i][0] = 0; }
     memset(blk, 0, sizeof blk);
     for (char *line = cap; line && *line; ) {
@@ -1655,20 +2086,83 @@ static void rfid_read_mfc(uint32_t sid, const rw_args_t *a)
             }
         } else if ((p = strstr(line, "sec ")) != NULL) {
             unsigned sc; char kc; char kh[16];
-            if (sscanf(p, "sec %u key%c=%12s", &sc, &kc, kh) == 3 && sc < MFC_SECTORS)
+            if (sscanf(p, "sec %u key%c=%12s", &sc, &kc, kh) == 3 &&
+                sc < MFC_SECTORS && (kc == 'A' || kc == 'B') && fixed_hex(kh, 12))
                 snprintf(kc == 'B' ? keyB[sc] : keyA[sc], 16, "%s", kh);
         } else if ((p = strstr(line, "blk ")) != NULL) {
             unsigned bn; char hx[40];
-            if (sscanf(p, "blk %u = %32s", &bn, hx) == 2 && bn < MFC_BLOCKS && strncmp(hx, "locked", 6)) {
-                for (int i = 0; i < 16; i++) { unsigned v; sscanf(hx + i * 2, "%2x", &v); blk[bn][i] = (uint8_t)v; }
-                ok[bn] = 1;
+            if (sscanf(p, "blk %u = %32s", &bn, hx) == 2 && bn < MFC_BLOCKS) {
+                if (!strcmp(hx, "locked")) {
+                    seen_blk[bn] = 1;
+                } else if (fixed_hex(hx, 32)) {
+                    seen_blk[bn] = 1;
+                    for (int i = 0; i < 16; i++) { unsigned v; sscanf(hx + i * 2, "%2x", &v); blk[bn][i] = (uint8_t)v; }
+                    ok[bn] = 1;
+                }
             }
         } else if ((p = strstr(line, "prng=")) != NULL) {
             sscanf(p, "prng=%7s", prng);                   /* "weak" | "hard" from the device profiler */
+        } else if (sscanf(line, "mfc: done %d sectors", &done_sectors) == 1) {
+            /* The module emits this only after all key searches and all sector
+             * status records. Validate the record counts below before rendering. */
+        } else if (sscanf(line, "mfc: done block %d", &done_block) == 1) {
+            /* Single-block completion marker; validated against -b below. */
+        } else {
+            size_t ll = strlen(line);
+            while (ll && (line[ll - 1] == '\r' || line[ll - 1] == '\n')) line[--ll] = 0;
+            if (ll && strncmp(line, "reading:", 8) != 0) {
+                snprintf(failure, sizeof failure, "%s", line);
+                /* UID, progress, and data records were consumed above. Any
+                 * other MFC diagnostic except the final count is fatal. */
+                if (!strncmp(line, "mfc:", 4) && strncmp(line, "mfc: done ", 10)) fatal = 1;
+            }
         }
         line = nl ? nl + 1 : NULL;
     }
-    if (!got_uid) { printf("\n%s\n", cap[0] ? cap : "read: no card"); return; }
+    int nkeys = 0, nblocks = 0;
+    for (int s = 0; s < MFC_SECTORS; s++)
+        nkeys += !!keyA[s][0] + !!keyB[s][0];
+    for (int b = 0; b < MFC_BLOCKS; b++) nblocks += !!seen_blk[b];
+    if (!got_uid || fatal) { printf("\n%s\n", failure[0] ? failure : "read: no card"); return; }
+
+    if (a->block >= 0) {
+        int sector = a->block / 4;
+        int have_a = keyA[sector][0] != 0, have_b = keyB[sector][0] != 0;
+        if (done_block != a->block || nblocks != 1 || !seen_blk[a->block] ||
+            !ok[a->block] || have_a + have_b != 1) {
+            printf("\nread: incomplete MIFARE Classic block result\n");
+            return;
+        }
+        char keytype = have_b ? 'B' : 'A';
+        const char *used_key = have_b ? keyB[sector] : keyA[sector];
+        render_mfc_block(uid, sak, atqa, a->block, blk[a->block],
+                         keytype, used_key, prng);
+
+        if (a->have_save) {
+            char bh[MFC_BLOCKS][40];
+            for (int b = 0; b < MFC_BLOCKS; b++) bh[b][0] = 0;
+            uint8_t row[16]; memcpy(row, blk[a->block], sizeof row);
+            if ((a->block & 3) == 3) {
+                int off = keytype == 'B' ? 10 : 0;
+                for (int i = 0; i < 6; i++) {
+                    unsigned v = 0; sscanf(used_key + i * 2, "%2x", &v); row[off + i] = (uint8_t)v;
+                }
+            }
+            for (int i = 0; i < 16; i++) sprintf(bh[a->block] + i * 2, "%02X", row[i]);
+            char path[300];
+            if (a->save[0]) snprintf(path, sizeof path, "%s", a->save);
+            else snprintf(path, sizeof path, "hf-mfc-%02X%02X%02X%02X-block-%d.json",
+                          uid[0], uid[1], uid[2], uid[3], a->block);
+            write_dump_json(RFID_REG[a->ri].token, bh, MFC_BLOCKS, path, prng);
+        }
+        return;
+    }
+
+    if (done_sectors != MFC_SECTORS || nkeys != MFC_SECTORS * 2 || nblocks != MFC_BLOCKS) {
+        printf("\nread: incomplete MIFARE Classic result (%d/32 keys, %d/64 block statuses)\n",
+               nkeys, nblocks);
+        return;
+    }
     render_mfc(uid, sak, atqa, blk, ok, keyA, keyB, prng);
 
     if (a->have_save) {                                    /* JSON: 16-byte blocks; splice recovered keys into
@@ -1690,12 +2184,6 @@ static void rfid_read_mfc(uint32_t sid, const rw_args_t *a)
         write_dump_json(RFID_REG[a->ri].token, bh, MFC_BLOCKS, path, prng);  /* PRNG class profiled during the read */
     }
 }
-
-/* SIGINT/SIGTERM during a `-c "rfid ..."` one-shot: request a clean app stop (app_stop -> device runs the
- * module's teardown) instead of dying and leaving the app running (which strands emulate + stalls the device).
- * `kill -TERM <fantasi>` or ^C thus stops emulate cleanly - the missing non-interactive stop. */
-static volatile sig_atomic_t g_rfid_sigstop;
-static void rfid_on_sigstop(int s) { (void)s; g_rfid_sigstop = 1; }
 
 /* Dispatch one rfid> command line: host abstractions (read/write/emulate/collect/list) -> device raw, or
  * host-rendered (help/list). Shared by the interactive prompt AND the non-interactive `-c "rfid <cmd>"`
@@ -1767,16 +2255,29 @@ void proto_cmd_rfid(const char *arg)
      * cmd runs until stopped via a second channel's `kill`/^C; a host-answered cmd exits right after). */
     char *oneshot = (arg && *arg) ? strdup(arg) : NULL;
     int oneshot_sent = 0;
-    if (oneshot) { g_rfid_sigstop = 0; signal(SIGINT, rfid_on_sigstop); signal(SIGTERM, rfid_on_sigstop); }
+    g_rfid_sigstop = 0;
+    void (*old_sigint)(int) = signal(SIGINT, rfid_on_sigstop);
+    void (*old_sigterm)(int) = signal(SIGTERM, rfid_on_sigstop);
     rx_len = 0;
     detect_arch();
-    if (upload_ram(driver_path(), elf_path("rfid"), 1) < 0) { fprintf(stderr, "rfid: driver upload failed\n"); return; }
+    if (upload_ram(DRIVER_RAM, elf_path("rfid"), 1) < 0) {
+        fprintf(stderr, "rfid: driver upload failed\n");
+        delete_ram(MFC_CFG_RAM); delete_ram(MFC_EMU_RAM);
+        signal(SIGINT, old_sigint); signal(SIGTERM, old_sigterm); free(oneshot);
+        return;
+    }
 
     CliRequest req = CliRequest_init_zero;
     req.id = ++rq_id; req.which_payload = CliRequest_app_launch_tag;
-    strncpy(req.payload.app_launch, driver_path(), sizeof req.payload.app_launch - 1);
+    strncpy(req.payload.app_launch, DRIVER_RAM, sizeof req.payload.app_launch - 1);
     uint32_t sid = req.id;
-    if (send_req(&req) < 0) { fprintf(stderr, "rfid: launch failed\n"); return; }
+    if (send_req(&req) < 0) {
+        fprintf(stderr, "rfid: launch failed\n");
+        delete_ram(DRIVER_RAM);
+        delete_ram(MFC_CFG_RAM); delete_ram(MFC_EMU_RAM);
+        signal(SIGINT, old_sigint); signal(SIGTERM, old_sigterm); free(oneshot);
+        return;
+    }
 
     /* The device app does NO line editing or echo - the HOST owns the rfid> line with readline (left/
      * right, history, TAB completion, ^D), just like the main prompt. The app prints "rfid> " when it
@@ -1799,8 +2300,10 @@ void proto_cmd_rfid(const char *arg)
     char rfid_hist[512] = "";                          /* the rfid> app's own persistent history file */
     if (interactive) {
         save_comp = rl_attempted_completion_function; rl_attempted_completion_function = rfid_completion;
-        save_hook = rl_event_hook;                    rl_event_hook = NULL;   /* the main CLI's serial-poll
-                                                       * hook must not run against the app session */
+        save_hook = rl_event_hook;                    /* The main CLI's transport hook must not run against
+                                                       * this app loop, but the session still needs a lease
+                                                       * heartbeat while readline waits indefinitely. */
+        rl_event_hook = rfid_readline_heartbeat;
         save_hist = history_get_history_state();       /* the rfid> history is its own, restored on exit */
         HISTORY_STATE empty = {0};
         history_set_history_state(&empty);
@@ -1821,7 +2324,8 @@ void proto_cmd_rfid(const char *arg)
             if (r < 0) { done = 1; break; }
             if (r == 0) break;
             if (r == 1 && resp.id == sid) {
-                if (resp.which_payload == CliResponse_output_tag && resp.payload.output[0]) sniff_emit(resp.payload.output);
+                if (resp.which_payload == CliResponse_output_tag && resp.payload.output[0] && !g_rfid_sigstop)
+                    sniff_emit(resp.payload.output);
                 else if (resp.which_payload == CliResponse_module_request_tag) serve_module(resp.payload.module_request);
                 else if (resp.which_payload == CliResponse_error_tag) { fprintf(stderr, "\nrfid: %s\n", resp.payload.error.message); done = 1; }
                 if (!resp.has_next) done = 1;
@@ -1840,8 +2344,21 @@ void proto_cmd_rfid(const char *arg)
             g_rfid_ready = 0;
             rfid_dispatch_line(sid, oneshot);
             oneshot_sent = 1;
-            if (g_rfid_ready) {                            /* host-answered (read/list/help): app idle now -> exit */
-                send_input((const uint8_t *)"exit\r", 5);
+            if (g_rfid_ready) {
+                /* A normal host-answered command leaves the driver idle at its
+                 * prompt, so `exit` lets it unwind cooperatively. A signal can
+                 * instead break app_capture() while its device module is still
+                 * running; an input line would sit unread behind that module.
+                 * Send the asynchronous stop request in that case so RFID and
+                 * module memory are released deterministically. */
+                if (g_rfid_sigstop) {
+                    CliRequest s = CliRequest_init_zero;
+                    s.id = ++rq_id; s.which_payload = CliRequest_app_stop_tag;
+                    s.payload.app_stop = true;
+                    send_req(&s);
+                } else {
+                    send_input((const uint8_t *)"exit\r", 5);
+                }
                 stop_sent = 1; stdin_done = 1;             /* don't let the check below app_stop it again */
             }
             continue;                                      /* streaming cmd (emulate/sniff): drain until it ends */
@@ -1910,9 +2427,13 @@ void proto_cmd_rfid(const char *arg)
         if (save_hist) { clear_history(); history_set_history_state(save_hist); free(save_hist); }
     }
     if (have_tio) tcsetattr(0, TCSANOW, &cook_tio);
+    signal(SIGINT, old_sigint);
+    signal(SIGTERM, old_sigterm);
     free(oneshot);
-    delete_ram(driver_path());                               /* nothing persists */
+    delete_ram(DRIVER_RAM);                                  /* nothing persists */
     for (int i = 0; i < NMODS; i++) delete_ram(RFID_MODS[i].ram);
+    delete_ram(MFC_CFG_RAM);
+    delete_ram(MFC_EMU_RAM);
     printf("\n");
 }
 #endif /* HAS_PROTO */

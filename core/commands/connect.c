@@ -28,6 +28,7 @@ static int cmd_connect(int argc, char **argv)
 
     cli_printf("connecting to %02X:%02X:%02X:%02X:%02X:%02X...\r\n",
                addr[5], addr[4], addr[3], addr[2], addr[1], addr[0]);
+    cli_flush();
 
     if (hal_ble_pair_connect(addr, addr_type) != 0) {
         cli_write("connect failed\r\n");

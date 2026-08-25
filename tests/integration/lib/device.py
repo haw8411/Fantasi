@@ -130,6 +130,29 @@ def ensure_cdc(timeout=25):
         return find_cdc_port() not in (None, CLI_WEBUSB_SENTINEL)
     if on_cdc():
         return True
+
+    # Current firmware multiplexes WebUSB and requires each host process to
+    # negotiate its own session before sending protobuf commands. Use the
+    # production client for that path; the raw frame below remains as a
+    # compatibility fallback for older, pre-mux firmware.
+    import subprocess
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
+    cli_bin = os.path.join(repo_root, "build", "cli", "fantasi")
+    if os.path.isfile(cli_bin):
+        try:
+            subprocess.run(
+                [cli_bin, "--usb", "-c", "cdc"],
+                capture_output=True, timeout=min(12, timeout), check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if on_cdc():
+                return True
+            time.sleep(0.25)
+        return False
+
     try:
         import usb.core
         import usb.util
@@ -174,49 +197,25 @@ def ensure_cdc(timeout=25):
 
 
 def webusb_send(cmd, read_secs=1.5):
-    """Send one CLI command over the WebUSB vendor pipe (pyusb, framed protobuf)
-    and return the raw response bytes read for read_secs. This is a second channel
-    that does NOT touch CDC, so it can drive a device while a serial session runs
-    an app - used to test cross-channel `kill`. Returns b'' if pyusb or the vendor
-    interface is unavailable. cmd must be < 128 bytes.
+    """Run one command through an independent WebUSB host CLI process.
+
+    `--usb` pins this second channel to WebUSB, so it never touches CDC.  Using
+    the production client matters here: current firmware gives every process an
+    EP0 OPEN/CLOSE session, while its compatibility path covers legacy bulk
+    firmware.
     """
-    try:
-        import usb.core
-        import usb.util
-        import struct
-    except ImportError:
-        return b''
-    d = usb.core.find(idVendor=int(USB_VID, 16), idProduct=int(USB_PID, 16))
-    if d is None:
-        return b''
-    itf = next((i for i in d.get_active_configuration()
-                if i.bInterfaceClass == 0xFF), None)
-    if itf is None:
+    import subprocess
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
+    cli_bin = os.path.join(repo_root, "build", "cli", "fantasi")
+    if not os.path.isfile(cli_bin):
         return b''
     try:
-        usb.util.claim_interface(d, itf.bInterfaceNumber)
-        epo = usb.util.find_descriptor(itf, custom_match=lambda e:
-            usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_OUT)
-        epi = usb.util.find_descriptor(itf, custom_match=lambda e:
-            usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_IN)
-        # CliRequest{ id=1, command=cmd } + 2-byte LE length prefix.
-        body = bytes([0x08, 0x01, 0x12, len(cmd)]) + cmd.encode()
-        epo.write(struct.pack("<H", len(body)) + body)
-        data = b""
-        t0 = time.time()
-        while time.time() - t0 < read_secs:
-            try:
-                data += bytes(epi.read(256, timeout=200))
-            except Exception:
-                pass
-        return data
-    except Exception:
+        result = subprocess.run(
+            [cli_bin, "--usb", "-c", cmd], capture_output=True,
+            timeout=max(10.0, read_secs + 5.0))
+        return result.stdout + result.stderr
+    except (OSError, subprocess.SubprocessError):
         return b''
-    finally:
-        try:
-            usb.util.dispose_resources(d)
-        except Exception:
-            pass
 
 
 def send_serial_cmd(port, cmd, timeout=2):
@@ -238,4 +237,3 @@ def send_serial_cmd(port, cmd, timeout=2):
         and "CLI ready" not in l
     ]
     return "\n".join(lines)
-

@@ -31,12 +31,10 @@ DEFS := -DNRF52840_XXAA \
         -DFANTASI_GIT_HASH=\"$(GIT_HASH)\" \
         -DCLI_TASK_STACK=1024 \
         -DUSB_TASK_STACK=2048 \
-        -DWEBUSB_PROTO_STACK=4096 \
-        -DPROTO_STACK=4096
-# Subject to scaling.
-# Reducing proto further may introduce issues (LittleFS flash write
-# nested under the SoftDevice, overflowed at 8KB). usb 8KB for the
-# MSC host-write path.
+        -DWEBUSB_PROTO_STACK=512 \
+        -DPROTO_STACK=1024
+# Protobuf RX tasks handle framing and routing. Session workers run commands
+# and storage operations; the USB task covers the MSC write path.
 
 INCLUDES := \
     -I$(ROOT)/core \
@@ -149,11 +147,8 @@ $(BUILD)/%.o: $(ROOT)/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
-# Header dependencies. Without these a header-only edit rebuilds nothing, so an object
-# silently keeps a stale view of any struct/macro declared in that header - e.g. a change
-# to app_image_t in core/elf_loader.h would leave core/app_run.o (which owns a static
-# app_image_t) laid out to the old struct while the loader wrote the new fields. -MMD -MP
-# emits a .d per object; -MP adds phony targets so a deleted header doesn't stall make.
+# Track included headers so interface changes rebuild dependent objects.
+# -MP keeps dependency files valid when a header is removed.
 -include $(OBJS:.o=.d)
 
 $(BUILD)/$(TARGET).elf: $(OBJS) $(LDSCRIPT)

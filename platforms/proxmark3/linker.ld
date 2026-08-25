@@ -45,21 +45,20 @@ SECTIONS {
         KEEP(*(.startos))
     } >osimage :text
 
-    /* Flash-plane ordering: the AT91SAM7S has two 256 KB planes and reads from the
-     * second (>=0x140000) are slower. During enumeration the host must get the USB
-     * descriptors back within the ~170us xhci SETUP window, so they have to stay in
-     * the fast first plane. Once Berry is linked (~90 KB of const tables) the image
-     * exceeds 256 KB, so force usb_descriptors' code+rodata to the very front to
-     * keep it in plane 0 - otherwise it exceeds 0x140000 and enumeration fails with
-     * EPROTO. Everything after it may land in plane 1, which is fine for Berry (only
-     * touched at script runtime). */
+    /* Keep USB descriptors in the first 256 KB flash plane for enumeration.
+     * Berry code and tables may occupy the second plane. */
     .text : {
         *usb_descriptors.o(.rodata .rodata.* .text .text.*)
         . = ALIGN(4);
-        *(.text .text.*)
+        *(EXCLUDE_FILE(*be_*.o) .text EXCLUDE_FILE(*be_*.o) .text.*)
         *(.glue_7) *(.glue_7t)
         *(.eh_frame)
-        *(.rodata .rodata.*)
+        *(EXCLUDE_FILE(*be_*.o) .rodata EXCLUDE_FILE(*be_*.o) .rodata.*)
+        . = ALIGN(4);
+        __plane0_hot_end = .;
+        /* EFC1 programming makes plane 1 unreadable. Keep non-Berry code and
+         * constants in plane 0 so storage writes cannot stall system tasks. */
+        *be_*.o(.text .text.* .rodata .rodata.*)
         . = ALIGN(4);
     } >osimage :text
 
@@ -150,3 +149,9 @@ SECTIONS {
  * (above), so SIZEOF resolves even when the toolchain emits no .tdata/.tbss. */
 ASSERT(SIZEOF(.tls_sizecheck) <= 120,
        "picolibc TLS exceeds fantasi_tls_block (core/libc_glue.c)")
+
+/* Everything except Berry must stay in flash plane 0 (below 0x140000): plane 1
+ * is unreadable while EFC1 programs LittleFS pages, and a stalled fetch there
+ * freezes the core with interrupts masked. */
+ASSERT(__plane0_hot_end <= 0x140000,
+       "non-Berry code/rodata spilled into flash plane 1 (see linker.ld)")

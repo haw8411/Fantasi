@@ -14,7 +14,7 @@
 #include "hal_storage.h"
 #include "FreeRTOS.h"
 #include "task.h"
-#include "stream_buffer.h"
+#include "message_buffer.h"
 #include "queue.h"
 #include <string.h>
 #include <stdlib.h>
@@ -313,13 +313,12 @@ static void bond_save(void)
     hal_storage_write_file(BLE_BOND_PATH, &s_bond, sizeof(s_bond));
 }
 
-/* Must hold one full framed CliRequest (max ~599 B): with MTU 247 +
- * write-without-response the host bursts a whole FileWriteChunk as several
- * back-to-back write commands, which ble_serial_poll drains into this
- * buffer in one pass before the proto task reads it; a smaller buffer
- * overflows and drops uploads. Heap-allocated, so this costs heap not BSS. */
+/* Preserve ATT-write boundaries. New multiplexed clients put an independently
+ * routable fragment in each write; legacy framed clients still work because the
+ * endpoint parser accepts one packet at a time. The buffer must also absorb the
+ * host upload window. Heap-allocated, so this costs heap rather than BSS. */
 #define RX_BUF_SIZE 4096
-static StreamBufferHandle_t rx_stream;
+static MessageBufferHandle_t rx_stream;
 static volatile int tx_credits = 4;
 static uint16_t att_mtu = 23;
 
@@ -429,7 +428,7 @@ int ble_serial_init(void)
 {
     if (!cu_ble_sd_init()) return -1;
 
-    rx_stream = xStreamBufferCreate(RX_BUF_SIZE, 1);
+    rx_stream = xMessageBufferCreate(RX_BUF_SIZE);
     if (!rx_stream) return -2;
     pair_queue = xQueueCreate(PAIR_QUEUE_LEN, sizeof(hal_ble_evt_t));
 
@@ -456,6 +455,7 @@ int ble_serial_init(void)
     memset(&rx_attr_md, 0, sizeof(rx_attr_md));
     rx_attr_md.read_perm = (ble_gap_conn_sec_mode_t){ .sm = 1, .lv = 3 };
     rx_attr_md.write_perm = (ble_gap_conn_sec_mode_t){ .sm = 1, .lv = 3 };
+    rx_attr_md.vlen = 1;
     rx_attr_md.vloc = BLE_GATTS_VLOC_STACK;
 
     ble_uuid_t rx_uuid = { .uuid = NUS_RX_UUID16, .type = uuid_type };
@@ -483,6 +483,7 @@ int ble_serial_init(void)
     ble_gatts_attr_md_t tx_attr_md;
     memset(&tx_attr_md, 0, sizeof(tx_attr_md));
     tx_attr_md.read_perm = (ble_gap_conn_sec_mode_t){ .sm = 1, .lv = 3 };
+    tx_attr_md.vlen = 1;
     tx_attr_md.vloc = BLE_GATTS_VLOC_STACK;
 
     ble_uuid_t tx_uuid = { .uuid = NUS_TX_UUID16, .type = uuid_type };
@@ -706,7 +707,7 @@ static void handle_event(const uint8_t *evt_buf, uint16_t evt_len)
             uint16_t dlen = *(const uint16_t *)&evt_buf[16];
             const uint8_t *data = &evt_buf[18];
             if (dlen > 0 && rx_stream)
-                xStreamBufferSend(rx_stream, data, dlen, 0);
+                xMessageBufferSend(rx_stream, data, dlen, 0);
         }
         break;
     }
@@ -778,7 +779,7 @@ void ble_serial_poll(void)
 size_t ble_serial_read(uint8_t *buf, size_t len, void *ctx)
 {
     (void)ctx;
-    return xStreamBufferReceive(rx_stream, buf, len, 0);
+    return xMessageBufferReceive(rx_stream, buf, len, 0);
 }
 
 size_t ble_serial_write(const uint8_t *buf, size_t len, void *ctx)
@@ -800,9 +801,8 @@ size_t ble_serial_write(const uint8_t *buf, size_t len, void *ctx)
     }
 
     static uint8_t hvx_buf[244];
-    memset(hvx_buf, 0, payload);
     memcpy(hvx_buf, buf, chunk);
-    uint16_t hvx_len = payload;
+    uint16_t hvx_len = chunk;
 
     ble_gatts_hvx_params_t hvx;
     memset(&hvx, 0, sizeof(hvx));
@@ -811,10 +811,12 @@ size_t ble_serial_write(const uint8_t *buf, size_t len, void *ctx)
     hvx.p_len = &hvx_len;
     hvx.p_data = hvx_buf;
 
-    tx_credits--;
     uint32_t rc = svc_gatts_hvx(conn_handle, &hvx);
     if (rc != NRF_SUCCESS)
         return 0;
+    /* Charge a credit only after SoftDevice accepts the notification. A client
+     * may disable its CCCD immediately after sending SESSION_CLOSE. */
+    tx_credits--;
     return chunk;
 }
 

@@ -3,6 +3,10 @@ import "nanopb.proto";
 
 message CliRequest {
   required uint32 id = 1;
+  // Logical session on a multiplexed protobuf transport. A client opens a
+  // session once, then includes the returned value on every request. Omitted
+  // means the legacy, connection-wide serial session.
+  optional uint32 session = 12;
   oneof payload {
     string command = 2 [(nanopb).max_size = 128];
     FileWriteChunk file_write = 3;
@@ -18,12 +22,22 @@ message CliRequest {
     bytes app_input = 9 [(nanopb).max_size = 64];
     bool app_stop = 10;
     FileRenameRequest file_rename = 11;
+    // Session lifecycle/control. session_open has no session value; the device
+    // allocates one and returns it in CliResponse.session. session_close uses
+    // the envelope session above. cancel may bypass a blocked request in the
+    // same session and targets that request's id.
+    bool session_open = 13;
+    bool session_close = 14;
+    CancelRequest cancel = 15;
+    bool session_ping = 16;
   }
 }
 
 message CliResponse {
   required uint32 id = 1;
   required bool has_next = 2;
+  // Echoes the logical session for multiplexing. Omitted for a legacy client.
+  optional uint32 session = 8;
   oneof payload {
     string output = 3 [(nanopb).max_size = 512];
     FileReadChunk file_data = 4;
@@ -33,6 +47,10 @@ message CliResponse {
     // host answers with FileWriteChunk(s) into /ramfs. id echoes the app_launch.
     string module_request = 7 [(nanopb).max_size = 32];
   }
+}
+
+message CancelRequest {
+  required uint32 request_id = 1;
 }
 
 message FileWriteChunk {

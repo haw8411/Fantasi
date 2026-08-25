@@ -55,7 +55,7 @@ int     vfs_fat_remove(int drv, const char *leaf);
 int     vfs_fat_mkdir(int drv, const char *leaf);
 int     vfs_fat_rename(int drv, const char *from, const char *to);
 int     vfs_fat_statfs(int drv, uint32_t *total, uint32_t *freeb);
-void    vfs_fat_list(int drv, const char *leaf, vfs_list_cb cb, void *ctx);
+int     vfs_fat_list(int drv, const char *leaf, vfs_list_cb cb, void *ctx);
 
 /* Longest-prefix match. Returns the owning mount and, in *leaf_out, the path
  * relative to that mount to hand the backend (a flat name for ramfs, an
@@ -90,23 +90,41 @@ const char *vfs_ramfs_leaf(const char *path);
 int  vfs_read_all(const char *path, const uint8_t **data, uint32_t *len, bool *owned);
 void vfs_free(const uint8_t *data);
 
+/* Atomically remove a RAMFS file and transfer its backing allocation to the
+ * caller. Returns -1 for a non-RAMFS path or missing file. */
+int  vfs_take_ramfs(const char *path, uint8_t **data, uint32_t *len);
+
 /* Whole-file helpers (any backend) for the app storage API. */
 int32_t vfs_pread(const char *path, uint32_t off, void *buf, uint32_t len); /* bytes, or -1 */
 int32_t vfs_read_file(const char *path, void *buf, uint32_t max);   /* bytes, or -1 */
 int     vfs_write_file(const char *path, const void *buf, uint32_t len); /* 0, or -1 */
+int     vfs_msc_write_file(const char *path, const void *buf, uint32_t len); /* MSC-originated */
 int     vfs_append(const char *path, const void *buf, uint32_t len);     /* append; 0, or -1 */
 int     vfs_pwrite(const char *path, uint32_t off, const void *buf, uint32_t len); /* positional; 0, or -1 */
+/* Write the suffix [off, size) from bounded caller-owned chunks and leave the
+ * file exactly `size` bytes long. The callback must return the next non-empty
+ * chunk (no larger than the requested remainder). LittleFS stays open for the
+ * entire stream, avoiding one metadata commit per small chunk. */
+typedef bool (*vfs_write_chunk_cb)(void *ctx, uint32_t off,
+                                   const void **data, uint32_t *len);
+int     vfs_msc_write_chunks(const char *path, uint32_t off, uint32_t size,
+                             vfs_write_chunk_cb next, void *ctx); /* 0, or -1 */
 int     vfs_truncate(const char *path, uint32_t size); /* set exact length; 0, or -1 */
 int32_t vfs_size(const char *path);                                 /* bytes, or -1 */
 int     vfs_remove(const char *path);                               /* 0, or -1 (also rmdir, empty) */
 int     vfs_mkdir(const char *path);                                /* 0 (or already-exists), or -1 */
+int     vfs_msc_remove(const char *path);                           /* same, without host-stale signal */
+int     vfs_msc_mkdir(const char *path);                            /* same, without host-stale signal */
 
 /* Rename/move within one backend. Returns 0, VFS_ERR_XDEV when src and dst are on
  * different mounts (caller must copy+delete), or -1 on other error. */
 int     vfs_rename(const char *src, const char *dst);
+int     vfs_msc_rename(const char *src, const char *dst);
 
 /* Enumerate a directory (ramfs root, a LittleFS dir, or the synthetic /mnt).
- * vfs_list_cb is declared near the top so the FAT hooks can use it. */
-void    vfs_list(const char *path, vfs_list_cb cb, void *ctx);
+ * Returns 0 after opening a real directory (including an empty one), or -1
+ * when the path is missing or is a regular file. vfs_list_cb is declared near
+ * the top so the FAT hooks can use it. */
+int     vfs_list(const char *path, vfs_list_cb cb, void *ctx);
 
 #endif /* CORE_VFS_H */

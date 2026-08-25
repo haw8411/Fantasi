@@ -29,10 +29,15 @@ DEFS := -DCFG_TUSB_MCU=OPT_MCU_AT91SAM7S \
         -DLFS_NO_DEBUG -DLFS_NO_WARN -DLFS_NO_ERROR \
         -DFANTASI_GIT_HASH=\"$(GIT_HASH)\" \
         -DCLI_TASK_STACK=1024 \
-        -DUSB_TASK_STACK=512 \
-        -DWEBUSB_PROTO_STACK=1024
-        # PM3 task stacks right-sized from measured high-water marks (usbproto/cli
-        # ~416/214 words peak, usb ~72) - was 2048 each; frees ~14 KB of the heap.
+        -DUSB_TASK_STACK=640 \
+        -DPROTO_SESSION_STACK=768 \
+        -DWEBUSB_PROTO_STACK=512 \
+        -DAPP_TASK_STACK_WORDS=832 \
+        -DAPP_PUMP_STACK_WORDS=320 \
+        -DAPP_KEEP_SESSION_WORKER
+        # Target-specific stack sizes leave contiguous heap for RFID modules.
+        # The session worker also runs Berry; the USB task covers MSC
+        # reconciliation.
 
 # platforms/proxmark3 comes first on the include path so our
 # platform-specific tusb_config.h wins over hal/tinyusb's.
@@ -149,6 +154,9 @@ FPGA_Z   := $(ROOT)/build/fpga/pm3_lf.bit.z $(ROOT)/build/fpga/pm3_hf.bit.z
 OBJS := $(patsubst $(ROOT)/%.c,$(BUILD)/%.o,$(SRCS_C)) \
         $(patsubst $(ROOT)/%.S,$(BUILD)/%.o,$(SRCS_S))
 
+# Berry parser inlining multiplies its recursive expression frames on ARM7.
+$(BUILD)/third_party/berry/src/be_parser.o: CFLAGS += -fno-inline
+
 .PHONY: all clean size
 all: $(BUILD)/$(TARGET).elf $(BUILD)/$(TARGET).bin $(FPGA_Z) size
 
@@ -160,11 +168,8 @@ $(BUILD)/%.o: $(ROOT)/%.S
 	@mkdir -p $(dir $@)
 	$(AS) $(ASFLAGS) -MMD -MP -c $< -o $@
 
-# Header dependencies. Without these a header-only edit rebuilds nothing, so objects
-# silently keep a stale view of any struct it declares - e.g. changing app_image_t in
-# core/elf_loader.h would leave core/app_run.o (which owns a static app_image_t) laid out to
-# the old struct while core/elf_loader.o wrote the new fields. -MMD -MP
-# emits a .d per object; -MP adds phony targets so a deleted header doesn't stall make.
+# Track included headers so interface changes rebuild dependent objects.
+# -MP keeps dependency files valid when a header is removed.
 -include $(OBJS:.o=.d)
 
 $(ROOT)/build/fpga/pm3_%.bit.z: $(FPGA_DIR)/fpga_pm3_%.bit

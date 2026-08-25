@@ -3,6 +3,9 @@
 #include "vfs.h"
 #include "cli.h"
 #include "app_api.h"
+#ifdef FANTASI_ENABLE_RFID
+#include "../hal/hal_rfid.h"
+#endif
 
 #include "FreeRTOS.h"
 #include "task.h"
@@ -15,6 +18,9 @@
 
 #ifndef APP_TASK_STACK_WORDS
 #define APP_TASK_STACK_WORDS 1024   /* 4 KB default; a platform may override in FreeRTOSConfig.h */
+#endif
+#ifndef APP_PUMP_STACK_WORDS
+#define APP_PUMP_STACK_WORDS 512    /* 2 KB default; platforms may override */
 #endif
 #define APP_OUT_BUF          1024
 #define APP_IN_BUF           128    /* console input queued for the app (keystrokes) */
@@ -35,6 +41,7 @@ typedef struct {
     volatile bool     done;
     volatile bool     kill_req;   /* set by the `kill` command (another channel) */
     volatile int      exit_code;
+    volatile bool     start;      /* async tasks wait until launch allocations/source cleanup finish */
 
     /* ---- async session (proto channels) ---- */
     bool                     async;    /* true: driven by a pump task, not a sync loop */
@@ -48,6 +55,10 @@ typedef struct {
 /* Launches are serialized (the streaming session owns the CLI), so one current
  * app context suffices and the API callbacks find it here. */
 static app_ctx_t *g_app;
+/* A feature module executes on the app task's stack. If that task is killed,
+ * app_run_module() cannot return through its normal unload path, so the
+ * launcher also owns this image as part of forced teardown. */
+static app_image_t s_module_img;
 
 /* Cross-channel kill: the `kill` command (running on a different CLI/proto task
  * than the one streaming the app) requests termination by setting a flag; the
@@ -71,18 +82,24 @@ bool app_is_running(void)
 }
 
 /* PID of the running app as `ps` shows it, or -1 if none. `ps` prints
- * TaskStatus_t.xTaskNumber (creation order), which is a different field from
- * uxTaskGetTaskNumber() - so look the app's handle up in the system state to
- * report the same number, letting `kill <pid>` match what the user sees. */
+ * TaskStatus_t.xTaskNumber, which differs from uxTaskGetTaskNumber(). Query
+ * the known handle directly. */
 int app_running_pid(void)
 {
-    app_ctx_t *a = g_app;
-    if (!a || !a->task) return -1;
-    TaskStatus_t st[16];
-    UBaseType_t n = uxTaskGetSystemState(st, sizeof(st) / sizeof(st[0]), NULL);
-    for (UBaseType_t i = 0; i < n; i++)
-        if (st[i].xHandle == a->task) return (int)st[i].xTaskNumber;
-    return -1;
+    int pid = -1;
+    taskENTER_CRITICAL();
+    {
+        app_ctx_t *a = g_app;
+        if (a && a->task) {
+            TaskStatus_t st;
+            /* Keep g_app and its task handle stable during the query.
+             * Synchronous teardown clears g_app after deleting the task. */
+            vTaskGetInfo(a->task, &st, pdFALSE, eInvalid);
+            pid = (int)st.xTaskNumber;
+        }
+    }
+    taskEXIT_CRITICAL();
+    return pid;
 }
 
 /* ---- Weak hardware hooks (platforms override what they support) ---- */
@@ -97,11 +114,25 @@ __attribute__((weak)) void hal_app_display_flush(void) {}
  * the normal screen. No-ops where unsupported; only invoked when has_display. */
 __attribute__((weak)) void hal_app_display_acquire(void) {}
 __attribute__((weak)) void hal_app_display_release(void) {}
+__attribute__((weak)) void hal_app_suspend_task(TaskHandle_t task) { vTaskSuspend(task); }
 /* USB HID keyboard: default to "unsupported" so devices/platforms without it
  * link cleanly and apps see -1 / 0 from the API. */
 __attribute__((weak)) int hal_hid_enable(int on) { (void)on; return -1; }
 __attribute__((weak)) int hal_hid_send(uint8_t modifiers, const uint8_t *keys, uint8_t n) { (void)modifiers; (void)keys; (void)n; return -1; }
 __attribute__((weak)) uint32_t hal_hid_host(void) { return 0; }
+
+/* A killed ELF cannot unwind its own C stack, so the launcher must return
+ * shared peripherals to a safe state after suspending it. Besides disabling a
+ * potentially stuck HID key, RFID_OFF tears down capture DMA/IRQs and frees
+ * platform-owned scratch that is not part of the app API allocation list. */
+static void app_cleanup_peripherals(void)
+{
+    app_unload(&s_module_img);
+    hal_hid_enable(0);
+#ifdef FANTASI_ENABLE_RFID
+    hal_rfid_set_mode(RFID_OFF);
+#endif
+}
 
 /* ---- API callbacks (run on the app task) ---- */
 
@@ -197,8 +228,7 @@ static int api_list_dir(const char *path, fantasi_dirent_fn cb, void *ctx)
 {
     if (!cb) return -1;
     dir_adapt_t a = { cb, ctx };
-    vfs_list(path, app_dir_adapt, &a);
-    return 0;
+    return vfs_list(path, app_dir_adapt, &a);
 }
 static int api_mkdir(const char *path) { return vfs_mkdir(path); }
 
@@ -235,6 +265,7 @@ static void fill_api(fantasi_api_t *api)
 static void app_task_entry(void *arg)
 {
     app_ctx_t *a = (app_ctx_t *)arg;
+    while (a->async && !a->start) vTaskDelay(pdMS_TO_TICKS(1));
     int (*entry)(const fantasi_api_t *) = (int (*)(const fantasi_api_t *))a->entry;
     a->exit_code = entry(a->api);
     a->done = true;
@@ -266,24 +297,46 @@ int app_run_module(const char *path, const fantasi_api_t *api, bool delete_sourc
 {
     if (!path || !api) return -1;
     int32_t total = vfs_size(path);
-    if (total < 0) return -1;
+    if (total < 0) { api->printf("module: source missing: %s\r\n", path); return -1; }
 
-    static app_image_t mod_img;
-    if (app_load(app_elf_read, (void *)path, (uint32_t)total, &mod_img) != 0)
+    int lr;
+    bool source_taken = false;
+    if (delete_source && vfs_is_ramfs(path)) {
+        uint8_t *elf = NULL;
+        uint32_t len = 0;
+        if (vfs_take_ramfs(path, &elf, &len) != 0) {
+            api->printf("module: RAMFS handoff failed: %s\r\n", path);
+            return -1;
+        }
+        if (len != (uint32_t)total) {
+            api->printf("module: size changed: %s\r\n", path);
+            vPortFree(elf);
+            return -1;
+        }
+        source_taken = true;
+        /* A transient RAMFS module is already one aligned, writable heap block.
+         * Transfer that block from the filesystem to the loader and relocate
+         * its sections in place. This is the request -> load/source-free step:
+         * there is never a second module-sized allocation to fragment PM3 RAM. */
+        lr = app_load_inplace(elf, len, &s_module_img);
+        if (lr != 0) vPortFree(elf);
+    } else {
+        lr = app_load(app_elf_read, (void *)path, (uint32_t)total, &s_module_img);
+    }
+    if (lr != 0) {
+        api->printf("module: load failed: %s\r\n", app_load_error());
         return -1;
+    }
 
-    /* Caller opted to drop the source file now that the image is fully resident. app_load streams
-     * every SHF_ALLOC section into its own RAM and applies all relocations before returning, through
-     * stateless path-based reads - nothing touches the file again for the rest of this run. On a
-     * RAM-backed VFS the file is heap (a module ELF is ~2 KB), so holding it for the module's
-     * lifetime just denies that memory to the module itself - heap the tight PM3 sniff capture
-     * path needs. Only reached on a successful load, so a failed load leaves the file alone. */
-    if (delete_source) vfs_remove(path);
+    /* A successful load no longer needs its source. Releasing a RAM-backed
+     * source returns that heap before the module runs. */
+    if (delete_source && !source_taken) vfs_remove(path);
 
-    int (*entry)(const fantasi_api_t *) = (int (*)(const fantasi_api_t *))mod_img.entry;
+    int (*entry)(const fantasi_api_t *) =
+        (int (*)(const fantasi_api_t *))s_module_img.entry;
     int rc = entry(api);
 
-    app_unload(&mod_img);
+    app_unload(&s_module_img);
     return rc;
 }
 
@@ -394,7 +447,7 @@ int app_run(const char *path)
          * buffer send). vTaskSuspend removes it from the ready/delayed list and
          * from any event list it's blocked on, so the delete and the stream
          * buffer / mutex teardown below can't dereference a still-queued task. */
-        vTaskSuspend(actx.task);
+        hal_app_suspend_task(actx.task);
         vTaskDelete(actx.task);
         drain_output(&actx);
     }
@@ -407,7 +460,7 @@ int app_run(const char *path)
      * switch mode, disarm the keyboard if the app didn't. A no-op when HID is
      * unsupported, idle, or already disarmed - so it never re-enumerates for a
      * plain (non-HID) app. */
-    hal_hid_enable(0);
+    app_cleanup_peripherals();
 
     /* Reclaim everything the app used - even if it leaked or was killed. */
     for (app_alloc_t *a = actx.allocs; a; ) { app_alloc_t *nx = a->next; vPortFree(a); a = nx; }
@@ -432,16 +485,15 @@ int app_run(const char *path)
  * output to the host, forwards its module requests, and on exit tears the session
  * down. g_app_lock serialises the lifecycle (pump teardown) against the RX-task
  * accessors (feed_input / stop), which run on a different task. */
-#define PUMP_STACK_WORDS 512
-
 static app_image_t       s_async_img;
-static SemaphoreHandle_t g_app_lock;
 
 static void app_pump_entry(void *arg)
 {
     app_ctx_t *a = (app_ctx_t *)arg;
     char buf[APP_DRAIN_CHUNK];
     size_t n;
+
+    while (!a->start) vTaskDelay(pdMS_TO_TICKS(1));
 
     for (;;) {
         while ((n = xStreamBufferReceive(a->out, buf, sizeof(buf), 0)) > 0)
@@ -451,21 +503,26 @@ static void app_pump_entry(void *arg)
         vTaskDelay(pdMS_TO_TICKS(2));
     }
 
-    vTaskSuspend(a->task);                                   /* stop the app writing */
+    hal_app_suspend_task(a->task);                           /* stop the app writing */
+    app_cleanup_peripherals();                               /* release hardware owned by a killed app */
     while ((n = xStreamBufferReceive(a->out, buf, sizeof(buf), 0)) > 0)
         a->cb->output(a->session, buf, n);                  /* flush the tail */
     int code = a->kill_req ? -1 : a->exit_code;
 
-    xSemaphoreTake(g_app_lock, portMAX_DELAY);
+    /* Make the context unreachable before deleting handles another proto task
+     * could use. launch_busy prevents reuse until teardown completes. */
+    taskENTER_CRITICAL();
+    if (g_app == a) g_app = NULL;
+    taskEXIT_CRITICAL();
     vTaskDelete(a->task);
     for (app_alloc_t *p = a->allocs; p; ) { app_alloc_t *nx = p->next; vPortFree(p); p = nx; }
     if (a->out) vStreamBufferDelete(a->out);
     if (a->in)  vStreamBufferDelete(a->in);
     if (a->alloc_lock) vSemaphoreDelete(a->alloc_lock);
     app_unload(&s_async_img);
-    g_app = NULL;
+    taskENTER_CRITICAL();
     launch_busy = false;
-    xSemaphoreGive(g_app_lock);
+    taskEXIT_CRITICAL();
 
     a->cb->done(a->session, code);
     vTaskDelete(NULL);
@@ -474,7 +531,6 @@ static void app_pump_entry(void *arg)
 int app_launch_async(const char *path, uint32_t session, const app_session_cb_t *cb)
 {
     if (!path || !cb) return -1;
-    if (!g_app_lock) g_app_lock = xSemaphoreCreateMutex();
 
     bool claimed = false;
     taskENTER_CRITICAL();
@@ -484,14 +540,8 @@ int app_launch_async(const char *path, uint32_t session, const app_session_cb_t 
 
     int32_t total = vfs_size(path);
     if (total < 0)                              { launch_busy = false; return -2; }   /* not found */
-    if (app_load(app_elf_read, (void *)path, (uint32_t)total, &s_async_img) != 0) {
-        launch_busy = false; return -3;                                               /* load error */
-    }
-    if (!strncmp(path, "/ramfs/", 7)) vfs_remove(path);   /* free transient ELF source (see app_run) */
-
     static app_ctx_t actx;
     memset(&actx, 0, sizeof(actx));
-    actx.entry = s_async_img.entry;
     actx.out = xStreamBufferCreate(APP_OUT_BUF, 1);
     actx.in  = xStreamBufferCreate(APP_IN_BUF, 1);
     actx.alloc_lock = xSemaphoreCreateMutex();
@@ -500,36 +550,73 @@ int app_launch_async(const char *path, uint32_t session, const app_session_cb_t 
     actx.session = session;
 
     static fantasi_api_t api;
-    if (!actx.out || !actx.in || !actx.alloc_lock) { app_unload(&s_async_img); launch_busy = false; return -3; }
+    if (!actx.out || !actx.in || !actx.alloc_lock) {
+        if (actx.out) vStreamBufferDelete(actx.out);
+        if (actx.in) vStreamBufferDelete(actx.in);
+        if (actx.alloc_lock) vSemaphoreDelete(actx.alloc_lock);
+        launch_busy = false;
+        return -3;
+    }
     fill_api(&api);
     actx.api = &api;
     g_app = &actx;
 
     UBaseType_t prio = tskIDLE_PRIORITY + 1;
     if (xTaskCreate(app_task_entry, "app", APP_TASK_STACK_WORDS, &actx, prio, &actx.task) != pdPASS ||
-        xTaskCreate(app_pump_entry, "apppump", PUMP_STACK_WORDS, &actx, prio, &actx.pump) != pdPASS) {
+        xTaskCreate(app_pump_entry, "apppump", APP_PUMP_STACK_WORDS, &actx, prio, &actx.pump) != pdPASS) {
         if (actx.task) vTaskDelete(actx.task);
         vStreamBufferDelete(actx.out); vStreamBufferDelete(actx.in); vSemaphoreDelete(actx.alloc_lock);
         app_unload(&s_async_img); g_app = NULL; launch_busy = false;
         return -3;
     }
+
+    /* Allocate the packed app image only after every long-lived session object.
+     * For a RAMFS source, use its headers/symbols/relocations directly so this
+     * load makes only the image allocation. The task start gate keeps both new
+     * tasks idle until the image and entry point are ready. */
+    int lr;
+    if (vfs_is_ramfs(path)) {
+        const uint8_t *elf = NULL;
+        uint32_t len = 0;
+        bool owned = false;
+        lr = (vfs_read_all(path, &elf, &len, &owned) == 0 && !owned &&
+              len == (uint32_t)total)
+           ? app_load_memory(elf, len, &s_async_img) : -1;
+    } else {
+        lr = app_load(app_elf_read, (void *)path, (uint32_t)total, &s_async_img);
+    }
+    if (lr != 0) {
+        vTaskDelete(actx.pump);
+        vTaskDelete(actx.task);
+        vStreamBufferDelete(actx.out);
+        vStreamBufferDelete(actx.in);
+        vSemaphoreDelete(actx.alloc_lock);
+        g_app = NULL;
+        launch_busy = false;
+        return -3;
+    }
+    actx.entry = s_async_img.entry;
+
+    /* Removing a transient RAMFS source leaves contiguous space for modules
+     * after the long-lived session objects have been allocated. */
+    if (!strncmp(path, "/ramfs/", 7)) vfs_remove(path);
+    __asm volatile("" ::: "memory");
+    actx.start = true;
     return 0;
 }
 
 void app_session_feed_input(const uint8_t *data, size_t n)
 {
-    if (!g_app_lock) return;
-    xSemaphoreTake(g_app_lock, portMAX_DELAY);
+    taskENTER_CRITICAL();
     if (g_app && g_app->async && g_app->in) xStreamBufferSend(g_app->in, data, n, 0);
-    xSemaphoreGive(g_app_lock);
+    taskEXIT_CRITICAL();
 }
 
 void app_session_stop(void)
 {
-    if (!g_app_lock) return;
-    xSemaphoreTake(g_app_lock, portMAX_DELAY);
+    taskENTER_CRITICAL();
     if (g_app && g_app->async) g_app->kill_req = true;
-    xSemaphoreGive(g_app_lock);
+    taskEXIT_CRITICAL();
 }
 
 bool app_session_active(void)

@@ -153,7 +153,11 @@ bool cu_ble_sd_init(void)
     /* If the app started the LFXO by hand (ble=0 boot, `ble on` later), hand
      * the clock back before sd_enable - the SD insists on owning LFCLK and
      * enabling it over an app-started clock can stall inside the SVC. */
-    cu_power_release_lfclk_for_sd();
+    if (!cu_power_release_lfclk_for_sd()) {
+        cli_write("ble: LFCLK handoff timed out\r\n");
+        NVIC_EnableIRQ(POWER_CLOCK_IRQn);
+        return false;
+    }
 
     /* While VTOR points at the MBR below (until the SD learns our app vector
      * base), an app peripheral IRQ would vector through the MBR with no
@@ -186,6 +190,8 @@ bool cu_ble_sd_init(void)
         NVIC_EnableIRQ(USBD_IRQn);
         NVIC_EnableIRQ(GPIOTE_IRQn);
         NVIC_EnableIRQ(RTC1_IRQn);
+        if (!cu_power_reclaim_lfclk_after_sd_failure())
+            cli_write("ble: LFCLK reclaim timed out\r\n");
         return false;
     }
 
@@ -251,10 +257,20 @@ bool cu_ble_sd_init(void)
     if (rc != NRF_SUCCESS) {
         fantasi_log(LOG_ERROR, "ble_enable 0x%04lx need 0x%08lx",
                     (unsigned long)rc, (unsigned long)ram_start);
-        svc_sd_disable();
+        uint32_t disable_rc = svc_sd_disable();
+        if (disable_rc != NRF_SUCCESS) {
+            /* A half-enabled SoftDevice cannot safely be returned to code
+             * that believes CLOCK and POWER are app-owned.  Reboot into a
+             * known state instead of risking direct-register corruption. */
+            cli_printf("ble: sd_disable 0x%04lx\r\n",
+                       (unsigned long)disable_rc);
+            NVIC_SystemReset();
+        }
         SCB->VTOR = saved_vtor;
         __DSB();
         NVIC_EnableIRQ(POWER_CLOCK_IRQn);
+        if (!cu_power_reclaim_lfclk_after_sd_failure())
+            cli_write("ble: LFCLK reclaim timed out\r\n");
         return false;
     }
 

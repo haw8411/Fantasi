@@ -4,6 +4,13 @@ Fantasi uses BLE for wireless CLI access and device-to-device pairing. All BLE
 traffic uses nanopb protobuf framing (CliRequest/CliResponse) over a GATT serial
 service.
 
+Each host CLI process opens its own device session; processes do not coordinate
+or share a host-side connection owner. BlueZ may share one physical BLE link,
+but notifications carry a device session ID and are filtered independently.
+Large requests use per-ATT-write envelopes (`session`, total length, offset), so
+fragments from simultaneous CLI processes can interleave safely. Ctrl-C cancels
+that session's active command. The `w` command shows all live BLE/WebUSB sessions.
+
 ## Quick start
 
 The host CLI pairs on demand - you don't need `bluetoothctl`. Point it at an

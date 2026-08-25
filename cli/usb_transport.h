@@ -7,6 +7,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <sys/types.h>
 
 /* Find the Fantasi device, claim its vendor (class 0xFF) interface, and resolve
@@ -14,6 +15,14 @@
 int  usb_transport_open(void);
 void usb_transport_close(void);
 bool usb_transport_connected(void);
+/* Non-zero for the independent control-endpoint transport; zero means the
+ * legacy claimed bulk interface fallback. */
+uint32_t usb_transport_session_id(void);
+bool usb_transport_multiplexed(void);
+
+/* True for the SAM7S PM3's 8-byte EP0: a device that must pace uploads to one
+ * in-flight chunk (its dual-bank OUT overruns under pipelining). */
+bool usb_transport_constrained_ep0(void);
 
 /* Restrict usb_transport_open() to the device with this name, for
  * disambiguating multiple connected Fantasi devices. The device's name
@@ -30,5 +39,11 @@ bool usb_transport_alive(void);
  * hard error (e.g. device unplugged). */
 ssize_t usb_transport_read(void *buf, size_t len);
 ssize_t usb_transport_write(const void *buf, size_t len);
+/* Acknowledge a fully-decoded mux response frame: releases the device
+ * mailbox so the next streamed frame can be emitted, and resets the read
+ * offset. No-op on the bulk path. */
+void usb_transport_frame_consumed(void);
+/* Rewind the per-frame read offset (no I/O) before issuing a new request. */
+void usb_transport_read_reset(void);
 
 #endif

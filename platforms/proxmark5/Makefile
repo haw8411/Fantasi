@@ -31,7 +31,8 @@ DEFS := -DAT32F435xx \
         -DFANTASI_FAT_STORAGE \
         -DLFS_NO_MALLOC \
         -DLFS_NO_DEBUG -DLFS_NO_WARN -DLFS_NO_ERROR \
-        -DFANTASI_GIT_HASH=\"$(GIT_HASH)\"
+        -DFANTASI_GIT_HASH=\"$(GIT_HASH)\" \
+        -DWEBUSB_PROTO_STACK=512
 
 INCLUDES := \
     -I$(ROOT)/core \

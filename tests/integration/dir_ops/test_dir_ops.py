@@ -21,6 +21,7 @@ The invariant checked throughout: a file only disappears when it is rm'd.
 """
 
 import argparse
+import glob
 import os
 import re
 import subprocess
@@ -133,6 +134,8 @@ def battery(m, v, fses):
     tag = uuid.uuid4().hex[:8]
     content = f"dir-ops-{tag}\n"
     local = os.path.join(REPO_ROOT, "build", f"dir_ops_{tag}.txt")
+    xmv = f"/ramfs/xmv_{tag}.txt"
+    xcp = f"/ramfs/xcp_{tag}.txt"
     with open(local, "w") as f:
         f.write(content)
 
@@ -164,6 +167,24 @@ def battery(m, v, fses):
             check("a.txt" not in names, f"{fs}: rename left the source (a.txt)")
             check(content.strip() in v.cat(b), f"{fs}: rename lost the file content")
 
+            # FAT short entries carry lowercase state in NTRes byte 12. Exercise
+            # an uppercase 8.3 rename, then an LFN rename, with each serial command
+            # in a fresh MSC process so cached alias identity cannot hide a bug.
+            if m.name == "serial" and fs == "/":
+                upper = f"{root.rstrip('/')}/UPPER.TXT"
+                mixed = f"{root.rstrip('/')}/MiXeD.txt"
+                m.run(f"mv {b} {upper}\nexit\n")
+                names = v.ls(root)
+                check("UPPER.TXT" in names and "b.txt" not in names,
+                      "/: uppercase FAT rename lost the exact destination case")
+                m.run(f"mv {upper} {mixed}\nexit\n")
+                names = v.ls(root)
+                check("MiXeD.txt" in names and "UPPER.TXT" not in names,
+                      "/: mixed-case LFN rename was not preserved")
+                m.run(f"mv {mixed} {b}\nexit\n")
+                check(content.strip() in v.cat(b),
+                      "/: case/LFN rename round trip lost content")
+
             # --- same-FS copy: b -> c (both present) ---
             m.run(f"cp {b} {c}\nexit\n")
             names = v.ls(root)
@@ -187,6 +208,76 @@ def battery(m, v, fses):
                 m.run(f"rm {g}\nrmdir {sub}\nexit\n")
                 check("sub" not in v.ls(root), f"{fs}: rmdir left the subdir behind")
 
+                if m.name == "serial" and fs == "/":
+                    # Place one long entry across a 512-byte directory-sector
+                    # boundary, then rename its neighbour in a fresh MSC mount.
+                    # The rewritten sector contains the target SFN but not all
+                    # of its LFN fragments; it must retain the long VFS name.
+                    split = f"{root.rstrip('/')}/lfn_split"
+                    seeded = [f"a{i}.txt" for i in range(5)]
+                    seeded += ["b_padding_long.txt", "m_preserve_long.txt", "z.txt"]
+                    # Seed through the VFS so the next synthetic FAT snapshot gives
+                    # every short-looking name an LFN+SFN pair. Seeding through MSC
+                    # would leave aN.txt as a native one-slot entry and the claimed
+                    # sector-boundary layout would not actually exist.
+                    v.run(f"mkdir {split}\n" +
+                          "".join(f"upload {local} {split}/{name}\n" for name in seeded) +
+                          "exit\n")
+                    try:
+                        m.run(f"mv {split}/z.txt {split}/y.txt\nexit\n")
+                        split_names = v.ls(split)
+                        check("m_preserve_long.txt" in split_names,
+                              "/: split LFN rewrite lost the preserved long name")
+                        check(not any(name.startswith("FAP") for name in split_names),
+                              "/: split LFN rewrite exposed a synthetic alias")
+                        check(content.strip() in v.cat(f"{split}/m_preserve_long.txt"),
+                              "/: split LFN rewrite lost file content")
+                    finally:
+                        # Everything beneath this unique fixture is test-owned.
+                        leftovers = v.ls(split)
+                        if leftovers:
+                            v.run("".join(f"rm {split}/{name}\n" for name in leftovers) +
+                                  f"rmdir {split}\nexit\n")
+                        else:
+                            v.run(f"rmdir {split}\nexit\n")
+
+                    # Two specials + five two-slot names + one three-slot name =
+                    # 15 entries. The next 17-character leaf starts in slot 15, so
+                    # its first LFN fragment is in one sector while its remaining
+                    # fragment and SFN are in the next. Linux writes those sectors
+                    # in either order; both must reconstruct the exact long name.
+                    create_split = f"{root.rstrip('/')}/lfn_create"
+                    create_seeded = [f"a{i}.txt" for i in range(5)]
+                    create_seeded += ["b_padding_long.txt"]
+                    long_created = "x_create_long.txt"
+                    v.run(f"mkdir {create_split}\n" +
+                          "".join(f"upload {local} {create_split}/{name}\n"
+                                  for name in create_seeded) +
+                          "exit\n")
+                    try:
+                        create_out = m.run(
+                            f"upload {local} {create_split}/{long_created}\nexit\n")
+                        create_names = v.ls(create_split)
+                        create_read = v.cat(f"{create_split}/{long_created}")
+                        check(long_created in create_names,
+                              "/: split LFN create lost the exact long name "
+                              f"(command={create_out!r}, names={sorted(create_names)!r})")
+                        check(not any("~" in name or name.startswith("FAP")
+                                      for name in create_names),
+                              "/: split LFN create exposed an 8.3 alias "
+                              f"(names={sorted(create_names)!r})")
+                        check(content.strip() in create_read,
+                              "/: split LFN create lost file content "
+                              f"(read={create_read!r})")
+                    finally:
+                        leftovers = v.ls(create_split)
+                        if leftovers:
+                            v.run("".join(f"rm {create_split}/{name}\n"
+                                          for name in leftovers) +
+                                  f"rmdir {create_split}\nexit\n")
+                        else:
+                            v.run(f"rmdir {create_split}\nexit\n")
+
             # --- rm removes only the target ---
             m.run(f"rm {c}\nexit\n")
             names = v.ls(root)
@@ -198,9 +289,10 @@ def battery(m, v, fses):
         if "/" in fses and "/ramfs" in fses:
             print(f"    [{m.name}] cross-FS  /  <->  /ramfs")
             src = f"{base('/', f'do_{tag}')}/b.txt"    # left over from the / battery
-            xmv, xcp = "/ramfs/xmv.txt", "/ramfs/xcp.txt"
-            m.run(f"cp {src} {xcp}\nexit\n")
-            check(content.strip() in v.cat(xcp), "cross-FS copy content wrong")
+            copy_out = m.run(f"cp {src} {xcp}\nexit\n")
+            copied = v.cat(xcp)
+            check(content.strip() in copied,
+                  f"cross-FS copy content wrong (command={copy_out!r}, read={copied!r})")
             check(content.strip() in v.cat(src), "cross-FS copy lost the source")
             m.run(f"mv {src} {xmv}\nexit\n")
             check(content.strip() in v.cat(xmv), "cross-FS move content wrong")
@@ -216,6 +308,13 @@ def battery(m, v, fses):
             if supports_subdirs(fs):
                 check(f"do_{tag}" not in v.ls(fs), f"{fs}: scratch dir survived teardown")
     finally:
+        # Unique cross-FS names prevent an interrupted transport from poisoning
+        # the next one. Remove them through the verifier as a best-effort fallback
+        # when the mutating transport itself was what failed.
+        try:
+            v.run(f"rm {xmv}\nrm {xcp}\nexit\n")
+        except (OSError, subprocess.SubprocessError):
+            pass
         os.remove(local)
 
 
@@ -236,10 +335,14 @@ def cross_transport(ts):
     p1, p2 = "/" + n1, "/" + n2
     try:
         # created on ts[0] -> visible with correct content on every other transport
-        ts[0].run(f"upload {local} {p1}\nexit\n")
+        create_out = ts[0].run(f"upload {local} {p1}\nexit\n")
         for t in ts[1:]:
-            check(content.strip() in t.cat(p1),
-                  f"{t.name} did not see the file created over {ts[0].name}")
+            created_read = t.cat(p1)
+            if content.strip() not in created_read:
+                raise Fail(
+                    f"{t.name} did not see the file created over {ts[0].name} "
+                    f"(command={create_out!r}, read={created_read!r}, "
+                    f"root={sorted(t.ls('/'))!r})")
         # renamed on ts[1] -> every transport sees the new name, not the old, right content
         ts[1].run(f"mv {p1} {p2}\nexit\n")
         for t in ts:
@@ -254,6 +357,90 @@ def cross_transport(ts):
             check(n2 not in t.ls("/"), f"{t.name} still shows the file after {ts[-1].name} rm'd it")
         print(f"  cross-transport consistency OK across {[t.name for t in ts]}")
     finally:
+        # Best-effort cleanup also covers a failure before the normal delete step.
+        cleaner = next((t for t in ts if t.piped), ts[0])
+        try:
+            cleaner.run(f"rm {p1}\nrm {p2}\nexit\n")
+        except (OSError, subprocess.SubprocessError):
+            pass
+        os.remove(local)
+
+
+def msc_presync_newdir(serial, verify):
+    """Populate a new MSC directory before its parent entry is synced.
+
+    CLI mkdir/upload commands each synchronize, so they cannot reproduce Linux
+    writing a child directory sector before firmware has decoded the parent entry.
+    Seed seven synthetic two-slot names after dot/dot (next SFN = sector slot 16),
+    mutate the already-mounted FAT directly, then issue one explicit CLI sync.
+    """
+    tag = uuid.uuid4().hex[:6]
+    parents = (f"/kdl_{tag}", f"/kdu_{tag}")
+    marker = f"/kd_{tag}.trg"
+    payloads = (("child", f"lower-{tag}\n"), ("CHILD", f"upper-{tag}\n"))
+    local = os.path.join(REPO_ROOT, "build", f"kd_{tag}.txt")
+    with open(local, "w") as f:
+        f.write(f"seed-{tag}\n")
+
+    try:
+        setup = []
+        for parent in parents:
+            setup.append(f"mkdir {parent}")
+            setup.extend(f"upload {local} {parent}/a{i}.txt" for i in range(7))
+        setup.append(f"upload {local} {marker}")
+        verify.run("\n".join(setup) + "\nexit\n")
+
+        # Force the serial/MSC path to refresh and mount the just-seeded layout.
+        serial.run(f"ls {parents[0]}\nexit\n")
+        usb_dev = find_usb_device(USB_VID, USB_PID)
+        blocks = glob.glob(os.path.join(
+            usb_dev, "*", "host*", "target*", "*:*:*:*", "block", "sd*"))
+        check(bool(blocks), "composite MSC block device was not found")
+        block = "/dev/" + os.path.basename(blocks[0])
+        r = subprocess.run(
+            ["findmnt", "-rn", "-S", block, "-o", "TARGET"],
+            capture_output=True, text=True, timeout=10,
+        )
+        mounts = [line.strip() for line in r.stdout.splitlines() if line.strip()]
+        check(r.returncode == 0 and mounts,
+              f"composite MSC block {block} is not mounted ({r.stderr!r})")
+        mountpoint = mounts[0]
+
+        # Deliberately no fsync/syncfs between mkdir and child creation.
+        for parent, (child, payload) in zip(parents, payloads):
+            raw_dir = os.path.join(mountpoint, parent.lstrip("/"), child)
+            os.mkdir(raw_dir)
+            with open(os.path.join(raw_dir, "file.txt"), "wb") as f:
+                f.write(payload.encode())
+
+        # cmd_rm performs syncfs + SCSI SYNCHRONIZE CACHE for the shared mount.
+        sync_out = serial.run(f"rm {marker}\nexit\n")
+        for parent, (child, payload) in zip(parents, payloads):
+            names = verify.ls(f"{parent}/{child}")
+            readback = verify.cat(f"{parent}/{child}/file.txt")
+            check("file.txt" in names and payload.strip() in readback,
+                  "MSC pre-sync child directory write was lost "
+                  f"({parent}/{child}, sync={sync_out!r}, "
+                  f"names={sorted(names)!r}, read={readback!r})")
+        print("  MSC pre-sync new-directory recovery OK")
+    finally:
+        # Best effort: first make any raw host writes visible, then remove only
+        # this test's unique fixture through the VFS ground-truth transport.
+        try:
+            serial.run(f"rm {marker}\nexit\n")
+        except (OSError, subprocess.SubprocessError):
+            pass
+        cleanup = []
+        for parent, (child, _) in zip(parents, payloads):
+            cleanup.append(f"rm {parent}/{child}/file.txt")
+            cleanup.append(f"rmdir {parent}/{child}")
+            cleanup.extend(f"rm {parent}/a{i}.txt" for i in range(7))
+            cleanup.append(f"rmdir {parent}")
+        cleanup.append(f"rm {marker}")
+        try:
+            verify.run("\n".join(cleanup) + "\nexit\n")
+        except (OSError, subprocess.SubprocessError):
+            pass
         os.remove(local)
 
 
@@ -333,9 +520,26 @@ def main():
         return 1
 
     try:
+        # Empty listings and failed opens must remain distinct on stateful
+        # protobuf transports. Check before filesystem mutation begins.
+        for t in (x for x in transports if x.piped):
+            missing = f"/__fantasi_missing_{uuid.uuid4().hex}"
+            out = t.run(f"cd /\ncd {missing}\npwd\nls {missing}\nexit\n")
+            check(f"not a directory: {missing}" in out,
+                  f"{t.name}: cd accepted a nonexistent directory ({out!r})")
+            check(f"error: not a directory" in out,
+                  f"{t.name}: ls did not reject a nonexistent directory ({out!r})")
+            check(any(line.strip() == "/" for line in out.splitlines()),
+                  f"{t.name}: failed cd changed the working directory ({out!r})")
+
         for t in transports:
             print(f"  === transport: {t.name} ===")
             battery(t, verify, fses)
+        if PLATFORMS[args.platform]["msc_mode"] == "composite":
+            serial = next((t for t in transports if t.name == "serial"), None)
+            if serial:
+                print("  === MSC pre-sync directory ordering ===")
+                msc_presync_newdir(serial, verify)
         print("  === cross-transport consistency ===")
         cross_transport(transports)
     except Fail as e:

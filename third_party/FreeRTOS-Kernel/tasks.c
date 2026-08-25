@@ -471,6 +471,12 @@ static void prvAddCurrentTaskToDelayedList( TickType_t xTicksToWait,
                                                      List_t * pxList,
                                                      eTaskState eState ) PRIVILEGED_FUNCTION;
 
+    static void prvFindNextTaskWithinSingleList( List_t * pxList,
+                                                 eTaskState eState,
+                                                 UBaseType_t uxAfter,
+                                                 TCB_t ** ppxBestTCB,
+                                                 eTaskState * peBestState ) PRIVILEGED_FUNCTION;
+
 #endif
 
 /*
@@ -2556,6 +2562,74 @@ char * pcTaskGetName( TaskHandle_t xTaskToQuery ) /*lint !e971 Unqualified char 
         return uxTask;
     }
 
+    /* Fantasi constant-space task iterator. uxTaskGetSystemState() requires a
+     * caller array large enough for every task, which made diagnostics either
+     * impose an arbitrary cap or consume RAM in proportion to the task count.
+     * This returns the live task with the smallest creation number greater than
+     * *puxCursor, one record per call. pcTaskName is copied before the scheduler
+     * resumes, so a task expiring between records cannot leave a dangling name.
+     *
+     * Task creation numbers are monotonic for the practical lifetime of these
+     * 32-bit targets. Tasks created while an iteration is in progress may also
+     * appear; deleted tasks simply disappear. */
+    BaseType_t xTaskGetNextSystemStateEntry( UBaseType_t * puxCursor,
+                                             TaskStatus_t * pxTaskStatus,
+                                             char * pcTaskName )
+    {
+        TCB_t * pxBestTCB = NULL;
+        eTaskState eBestState = eInvalid;
+        UBaseType_t uxQueue = configMAX_PRIORITIES;
+
+        if( ( puxCursor == NULL ) || ( pxTaskStatus == NULL ) || ( pcTaskName == NULL ) )
+        {
+            return pdFALSE;
+        }
+
+        vTaskSuspendAll();
+        {
+            do
+            {
+                uxQueue--;
+                prvFindNextTaskWithinSingleList( &( pxReadyTasksLists[ uxQueue ] ), eReady,
+                                                 *puxCursor, &pxBestTCB, &eBestState );
+            } while( uxQueue > ( UBaseType_t ) tskIDLE_PRIORITY );
+
+            prvFindNextTaskWithinSingleList( ( List_t * ) pxDelayedTaskList, eBlocked,
+                                             *puxCursor, &pxBestTCB, &eBestState );
+            prvFindNextTaskWithinSingleList( ( List_t * ) pxOverflowDelayedTaskList, eBlocked,
+                                             *puxCursor, &pxBestTCB, &eBestState );
+
+            #if ( INCLUDE_vTaskDelete == 1 )
+            {
+                prvFindNextTaskWithinSingleList( &xTasksWaitingTermination, eDeleted,
+                                                 *puxCursor, &pxBestTCB, &eBestState );
+            }
+            #endif
+
+            #if ( INCLUDE_vTaskSuspend == 1 )
+            {
+                prvFindNextTaskWithinSingleList( &xSuspendedTaskList, eSuspended,
+                                                 *puxCursor, &pxBestTCB, &eBestState );
+            }
+            #endif
+
+            if( pxBestTCB != NULL )
+            {
+                vTaskGetInfo( ( TaskHandle_t ) pxBestTCB, pxTaskStatus, pdTRUE, eBestState );
+                *puxCursor = pxBestTCB->uxTCBNumber;
+                for( UBaseType_t ux = 0; ux < ( UBaseType_t ) configMAX_TASK_NAME_LEN; ux++ )
+                {
+                    pcTaskName[ ux ] = pxBestTCB->pcTaskName[ ux ];
+                }
+                pcTaskName[ configMAX_TASK_NAME_LEN - 1 ] = '\0';
+                pxTaskStatus->pcTaskName = pcTaskName;
+            }
+        }
+        ( void ) xTaskResumeAll();
+
+        return ( pxBestTCB != NULL ) ? pdTRUE : pdFALSE;
+    }
+
 #endif /* configUSE_TRACE_FACILITY */
 /*----------------------------------------------------------*/
 
@@ -3818,6 +3892,29 @@ static void prvCheckTasksWaitingTermination( void )
 /*-----------------------------------------------------------*/
 
 #if ( configUSE_TRACE_FACILITY == 1 )
+
+    static void prvFindNextTaskWithinSingleList( List_t * pxList,
+                                                 eTaskState eState,
+                                                 UBaseType_t uxAfter,
+                                                 TCB_t ** ppxBestTCB,
+                                                 eTaskState * peBestState )
+    {
+        ListItem_t const * pxEnd = listGET_END_MARKER( pxList );
+        ListItem_t const * pxItem = listGET_HEAD_ENTRY( pxList );
+
+        while( pxItem != pxEnd )
+        {
+            TCB_t * pxTCB = ( TCB_t * ) listGET_LIST_ITEM_OWNER( pxItem );
+            if( ( pxTCB->uxTCBNumber > uxAfter ) &&
+                ( ( *ppxBestTCB == NULL ) ||
+                  ( pxTCB->uxTCBNumber < ( *ppxBestTCB )->uxTCBNumber ) ) )
+            {
+                *ppxBestTCB = pxTCB;
+                *peBestState = eState;
+            }
+            pxItem = listGET_NEXT( pxItem );
+        }
+    }
 
     static UBaseType_t prvListTasksWithinSingleList( TaskStatus_t * pxTaskStatusArray,
                                                      List_t * pxList,

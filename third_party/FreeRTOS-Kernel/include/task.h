@@ -1809,6 +1809,14 @@ UBaseType_t uxTaskGetSystemState( TaskStatus_t * const pxTaskStatusArray,
                                   const UBaseType_t uxArraySize,
                                   configRUN_TIME_COUNTER_TYPE * const pulTotalRunTime ) PRIVILEGED_FUNCTION;
 
+/* Fantasi extension: enumerate task status one entry at a time with constant
+ * caller memory. Set *puxCursor to zero before the first call; each successful
+ * call advances it and copies the task name into pcTaskName, which must hold
+ * configMAX_TASK_NAME_LEN bytes. Returns pdFALSE after the final live task. */
+BaseType_t xTaskGetNextSystemStateEntry( UBaseType_t * puxCursor,
+                                         TaskStatus_t * pxTaskStatus,
+                                         char * pcTaskName ) PRIVILEGED_FUNCTION;
+
 /**
  * task. h
  * @code{c}

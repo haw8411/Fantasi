@@ -189,13 +189,11 @@ size_t be_fsize(void *hfile) { be_file *f = hfile; return f ? f->size : 0; }
 /* ---- path queries ---- */
 int be_isfile(const char *path) { return vfs_size(path) >= 0; }
 
-static void isdir_cb(const char *n, uint32_t s, bool d, void *ctx) { (void)n; (void)s; (void)d; *(int *)ctx = 1; }
+static void isdir_cb(const char *n, uint32_t s, bool d, void *ctx) { (void)n; (void)s; (void)d; (void)ctx; }
 int be_isdir(const char *path)
 {
     if (vfs_size(path) >= 0) return 0;    /* a regular file */
-    int found = 0;
-    vfs_list(path, isdir_cb, &found);     /* enumerable -> a directory */
-    return found;
+    return vfs_list(path, isdir_cb, NULL) == 0;
 }
 int be_isexist(const char *path) { return be_isfile(path) || be_isdir(path); }
 
@@ -235,7 +233,10 @@ int be_dirfirst(bdirinfo *info, const char *path)
     be_dir *bd = pvPortMalloc(sizeof *bd);
     if (!bd) return 1;
     memset(bd, 0, sizeof *bd);
-    vfs_list(path, dir_cb, bd);
+    if (vfs_list(path, dir_cb, bd) != 0) {
+        vPortFree(bd);
+        return 1;
+    }
     info->dir = bd;
     info->name = "";
     return be_dirnext(info);

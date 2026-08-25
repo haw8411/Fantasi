@@ -52,6 +52,16 @@ int  fatrd_write(uint32_t lba, uint32_t offset, const uint8_t *buf, uint32_t len
  * the next read/write. */
 void fatrd_invalidate(void);
 
+/* A mutation committed from this MSC host itself: rebuild the synthetic model
+ * but do not report removable-media change back to that same mounted host. */
+void fatrd_invalidate_msc(void);
+
+/* Reconcile retained MSC partial-sector state when another transport mutates
+ * the same path. These are path-specific so an unrelated concurrent WebUSB/BLE
+ * write does not disturb an in-flight MSC file. */
+void fatrd_external_forget(const char *path);
+void fatrd_external_rename(const char *from, const char *to);
+
 /* Storage critical section serialising all LittleFS access between the MSC model
  * path (TinyUSB task) and the proto/VFS file ops (cli/proto tasks) - LittleFS is
  * not reentrant. fatrd_store_init() creates the (recursive) lock and must run once
@@ -62,7 +72,7 @@ void fatrd_store_lock(void);
 void fatrd_store_unlock(void);
 
 /* Commit host-over-MSC file writes durably (call on SCSI SYNCHRONIZE CACHE). */
-void fatrd_sync(void);
+bool fatrd_sync(void);
 
 /* True (self-clearing) when the filesystem changed via a non-MSC path since the
  * host last polled - the MSC layer turns this into a "medium may have changed"

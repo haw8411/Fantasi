@@ -27,6 +27,9 @@ void cu_suppress_ticks_and_sleep(uint32_t expected_idle_ticks);
  * app started the LFXO by hand (the ble=0 boot case), stop it so the
  * SoftDevice can take clean ownership - enabling the SD over an app-started
  * LFCLK can stall sd_softdevice_enable. */
-void cu_power_release_lfclk_for_sd(void);
+bool cu_power_release_lfclk_for_sd(void);
+
+/* Restore the app-owned LFXO after a failed or rolled-back SoftDevice init. */
+bool cu_power_reclaim_lfclk_after_sd_failure(void);
 
 #endif

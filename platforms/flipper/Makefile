@@ -40,15 +40,14 @@ DEFS := -DSTM32WB55xx \
         -DLFS_NO_DEBUG -DLFS_NO_WARN -DLFS_NO_ERROR \
         -DFANTASI_DEVICE_ID=\"$(DEVICE_ID)\" \
         -DFANTASI_GIT_HASH=\"$(GIT_HASH)\" \
-        -DWEBUSB_PROTO_STACK=1024 \
+        -DWEBUSB_PROTO_STACK=512 \
         -DPROTO_STACK=1024 \
         -DUSB_TASK_STACK=2048 \
         -DCLI_TASK_STACK=1024 \
         -DGUI_TASK_STACK=1024 \
         -DCFG_TUD_MSC_EP_BUFSIZE=512 \
         $(EXTRA_DEFS)
-# USB_TASK_STACK bumped 1024->2048 words (4KB->8KB): the MSC host-write path (tud_task -> fatrd_write ->
-# build_model's littlefs traversal + write_dir + picolibc vsnprintf) overflows the 4KB "usb" task. Flipper has ample RAM.
+# The USB task covers MSC model traversal and formatted directory output.
 
 INCLUDES := \
     -I$(ROOT)/core \
@@ -188,11 +187,8 @@ $(BUILD)/%.o: $(ROOT)/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
-# Header dependencies. Without these a header-only edit rebuilds nothing, so an object
-# silently keeps a stale view of any struct/macro declared in that header - e.g. a change
-# to app_image_t in core/elf_loader.h would leave core/app_run.o (which owns a static
-# app_image_t) laid out to the old struct while the loader wrote the new fields. -MMD -MP
-# emits a .d per object; -MP adds phony targets so a deleted header doesn't stall make.
+# Track included headers so interface changes rebuild dependent objects.
+# -MP keeps dependency files valid when a header is removed.
 -include $(OBJS:.o=.d)
 
 $(BUILD)/$(TARGET).elf: $(OBJS) $(LDSCRIPT)

@@ -1,113 +1,95 @@
 # Fantasi technical design
 
-Fantasi is a multi-platform firmware that runs on security research devices - the Flipper Zero, Kiisu, Chameleon Ultra, Proxmark3, and Proxmark5. It replaces each device's stock firmware with a common runtime that presents a unified USB CLI and storage interface, then loads and executes applications transferred from the host.
+Fantasi is FreeRTOS firmware for the Flipper Zero, Kiisu, Chameleon Ultra,
+Proxmark3, and Proxmark5. Most of the firmware is shared. Each board supplies
+startup code and drivers through the hardware abstraction layer (HAL).
 
 ## Architecture
 
-Fantasi is a FreeRTOS-based system. The kernel provides preemptive multitasking, heap management, and synchronization primitives. On top of it, a small HAL layer abstracts the hardware differences between targets so that core logic - the CLI, storage, and (eventually) the application loader - is written once and compiled for all platforms.
-
-```
-  ┌──────────────────────────────────┐
-  │         Applications             │  ← loaded into RAM from host
-  ├──────────────────────────────────┤
-  │    core/       CLI, commands     │
-  │    hal/        serial, storage   │
-  ├──────────────────────────────────┤
-  │  platform HAL implementations    │
-  ├──────────────────────────────────┤
-  │          FreeRTOS kernel         │
-  ├──────────────────────────────────┤
-  │          MCU hardware            │
-  └──────────────────────────────────┘
-```
-
-### Tasks
-
-| Task | Priority | Role |
-|---|---|---|
-| USB | `tskIDLE + 2` | Drives TinyUSB (`tud_task`), services CDC and MSC class drivers |
-| CLI | `tskIDLE + 1` | Line-editing, command dispatch, serial I/O |
-| BLE CLI (`blecli`) | `tskIDLE + 1` | BLE-only (FZ/Kiisu/CU): pumps the BLE stack, runs the protobuf CLI transport and the LittleFS write path for BLE file ops |
-| Idle | `tskIDLE` | FreeRTOS idle hook (unused) |
-
-The `blecli` task is created only on platforms built with `FANTASI_ENABLE_BLE_CLI` (Flipper Zero, Kiisu, and Chameleon Ultra); the Proxmark3 has no radio and omits it, as does the Proxmark5 (its external ESP32-C2 BLE link is not integrated yet).
-
-### Code structure
-
-```
-core/           Shared across all targets
-  main.c          Task creation, scheduler start
-  cli.c           Line editor, command dispatch loop
-  commands.c      Built-in commands (help, free, scan, msc, ...)
-
-hal/            Hardware abstraction
-  hal.h           HAL contract - every platform implements these
-  storage/        LittleFS mount/unmount, MSC block-device callbacks
-  tinyusb/        Shared USB descriptors, CDC serial transport
-
-platforms/      One directory per target
-  flipper/        STM32WB55 - hal.c, display, BLE, flash driver, linker
-  kiisu/          STM32WB55 - Flipper-compatible board; reuses flipper/ with a
-                  companion-MCU display
-  chameleon/      nRF52840  - hal.c, BLE, flash driver, linker
-  proxmark3/      AT91SAM7S - hal.c, flash driver, USB mode-switch, linker
-  proxmark5/      AT32F435  - hal.c, flash driver (bank 2), FPGA/RFID driver, linker
-
-third_party/    Auto-cloned dependencies (gitignored)
-  tinyusb/        USB device stack (pinned tag)
-  littlefs/       On-flash filesystem (pinned tag)
-  fatfs/          FatFs, backing external FAT volumes (Flipper SD card)
-  nanopb/         Protobuf codec for the BLE CLI transport
-  FreeRTOS-Kernel/
-  cmsis_core/
-  stm32wb_cmsis/
-  nrf52_mdk/
+```text
+┌──────────────────────────────────────────────────────┐
+│ Applications                                         │
+├──────────────────────────────────────────────────────┤
+│ Fantasi core                                         │
+│ CLI · sessions · VFS · app loader · shared services  │
+├──────────────────────────────────────────────────────┤
+│ Hardware abstraction layer                           │
+├──────────────────────────────────────────────────────┤
+│ Platform implementations                             │
+│ startup · MCU and peripheral drivers                 │
+├──────────────────────────────────────────────────────┤
+│ FreeRTOS                                             │
+├──────────────────────────────────────────────────────┤
+│ Hardware                                             │
+└──────────────────────────────────────────────────────┘
 ```
 
-### HAL contract
+`core/` contains the command dispatcher, protobuf session engine, VFS, app
+loader, Berry host, logging, power policy, and shared RFID code. `hal/` declares
+the hardware interfaces and contains USB and storage code used by several
+boards. `platforms/` implements the HAL and contains each target's startup code,
+linker script, and drivers.
 
-Every platform implements the functions declared in `hal/hal.h`:
+Build flags leave out subsystems that a board cannot use. HAL capability values
+handle differences that must be checked at runtime, such as the presence of a
+display.
 
-- `hal_init` - clock, GPIO, peripheral setup
-- `hal_serial_read/write/connected` - USB CDC transport
-- `hal_reboot`, `hal_reboot_dfu` - warm reset, bootloader entry
-- `hal_battery_percent` - fuel gauge or ADC reading (-1 if unavailable)
-- `hal_ble_scan` - passive BLE scan with per-device callback (-1 if no radio)
-- `hal_flash_free_bytes` - free flash between firmware end and reserved regions
-- `hal_enter_msc_mode` - USB mode switch to MSC (PM3), or -1 if MSC is concurrent (FZ/Kiisu/CU)
+## Runtime
 
-Platforms that lack a feature return a sentinel value rather than requiring compile-time exclusion. The CLI adapts at runtime.
+CDC provides one line-oriented shell. WebUSB and BLE carry protobuf requests;
+each host process gets a logical session. Requests run in order within a
+session, while active sessions can run concurrently. Commands use the same
+dispatcher on every transport. Protobuf file requests call the VFS directly.
 
-## USB
-
-All targets use TinyUSB as the USB device stack. The Flipper Zero, Kiisu, Chameleon Ultra, and Proxmark5 run CDC and MSC as a composite device (both interfaces active simultaneously). The Proxmark3 has only 4 hardware endpoints, so it mode-switches between CDC and MSC on demand - the `msc` CLI command re-enumerates as MSC-only, and host-side `eject` returns to CDC.
+The WebUSB and BLE ingress tasks collect and route input. A worker exists
+while its session has work queued, then exits. Native apps run on their own
+task. Hardware and storage are shared across sessions, and the firmware runs at
+most one native app at a time.
 
 ## Storage
 
-Each device reserves 256 KB of internal flash for a LittleFS filesystem, placed at the top of available flash so firmware updates (which write from the bottom) never touch stored files.
+The VFS maps absolute paths to three kinds of storage:
 
-| Target | Storage region | Placement logic |
-|---|---|---|
-| Flipper Zero | Just below BLE secure flash (SFSA) | Runtime-detected from `FLASH->SFR` |
-| Kiisu | Just below BLE secure flash (SFSA) | Runtime-detected from `FLASH->SFR` (same as Flipper) |
-| Chameleon Ultra | Just below DFU bootloader | Runtime-detected from `UICR.NRFFW[0]` |
-| Proxmark3 | Flash plane 1 (`0x140000`) | Fixed; S512 only |
-| Proxmark5 | Flash bank 2 (`0x08080000+`) | Fixed |
+| Path | Backend |
+|---|---|
+| `/` | Internal-flash LittleFS |
+| `/ramfs` | Heap-backed temporary files |
+| `/mnt/extN` | External LittleFS or FatFs volumes |
 
-The VFS (`core/vfs.c`) is a multi-mount path router. Internal flash is LittleFS (mounted at `/`); app-capable targets add a RAM disk (`ramfs`) at `/ramfs`; and external storage devices mount at `/mnt/extN` in registration order. External volumes come in two backends: a **LittleFS** instance on the second flash chip (the Proxmark3's onboard SPI NOR and the Proxmark5's QSPI NOR), or a **FatFs** volume (the Flipper's microSD card, via `platforms/flipper/vfs_fat.c` over the vendored `third_party/fatfs`). The `df` command reports each mount's total/used/free (RAM disks show `RAM`) plus a trailing `program flash free:` line for the firmware region.
+Commands, apps, scripts, and host file requests use these paths. USB mass
+storage presents the same tree as a generated FAT volume and translates host
+access back into VFS operations.
 
-The on-device firmware mounts LittleFS at boot and reads/writes files via the `lfs_*` API. To the host it does *not* expose the raw LittleFS blocks; instead the MSC LUN presents a **synthetic FAT volume** (labelled `Fantasi`, 512-byte sectors) that is generated on the fly from the underlying filesystem(s). Reads synthesize the boot sector, FAT tables, and directory/data sectors from the live tree (LittleFS at `/`, plus the RAM-backed `/ramfs` on app-capable targets); writes are parsed back out of the FAT structures and committed to the real filesystem. This means any host OS can mount the volume like a normal USB stick - no LittleFS knowledge on the host side - and there is no second copy of the data in RAM. See [cli.md](cli.md) for how the host CLI drives this. The synthetic FAT is implemented in `hal/storage/fat_ramdisk.c` over the `core/vfs.c` path router.
+The Flipper Zero, Kiisu, Chameleon Ultra, and Proxmark5 expose CDC and mass
+storage together. The Proxmark3 has too few USB endpoints for that arrangement,
+so it switches between CDC and mass storage.
 
-## Future: application model
+## Applications
 
-Fantasi's long-term role is a runtime and loader, not a monolithic firmware. The execution model:
+A native app is a relocatable ELF stored in the VFS, usually in `/ramfs` or
+`/apps`. The loader copies its allocated sections into RAM, applies relocations,
+resolves the app API, and starts `app_main`. The API covers console I/O, memory,
+files, timing, and available hardware. App memory and peripheral state are
+released when the app exits or is stopped.
 
-1. **Host deploys an application** via the Fantasi web flasher or CLI tool. The binary is transferred over USB into device RAM.
-2. **The loader executes the application** from RAM. The application has access to a defined API surface (serial I/O, storage, radio, display where available).
-3. **If the application needs persistence**, it reads and writes files on the LittleFS volume. Configuration, calibration data, captured samples - anything that should survive a power cycle lives here.
-4. **An optional startup executable** can be stored in LittleFS. On boot, if a startup binary is present, the loader runs it automatically instead of dropping to the interactive CLI. This lets a device behave as a dedicated tool (e.g., BadUSB, or a long-running BLE scanner) without a host connection.
-5. **Applications are source-portable** across targets. The HAL and loader API abstract hardware differences, with runtime capability queries for target-specific features (display, BLE, etc.). Binaries are architecture-specific (the relocatable ELF is built per core - Cortex-M and ARM7TDMI), so the same source builds one loadable variant per target.
+App source is portable, but binaries match the CPU architecture. The Flipper Zero,
+Kiisu, Chameleon Ultra, and Proxmark5 use the Cortex-M4 build; the Proxmark3 uses
+the ARM7 build. Berry scripts run in a VM connected to the VFS and hardware API.
 
-The first cut of this model is implemented today: `launch <path>` loads a relocatable ELF from `/ramfs` or `/apps` into RAM, runs it on a dedicated interruptible task, and frees it on exit or Ctrl-C. See [apps.md](apps.md).
+See [apps.md](apps.md) for the app ABI and [rfid.md](rfid.md) for the RFID app.
 
-The web flasher provides a browser-based drag-and-drop interface for deploying applications to any connected Fantasi device over Web Bluetooth. The host CLI tool (`build/cli/fantasi`, see [cli.md](cli.md)) provides the same functionality over USB or BLE for scripted and headless workflows.
+## Source layout
+
+```text
+apps/       App API and loadable applications
+cli/        Host CLI and its USB/BLE transports
+core/       Shared firmware runtime
+hal/        Hardware interfaces and shared device code
+platforms/  Board startup, linker configuration, and drivers
+proto/      Protobuf schema and generated messages
+```
+
+Start with `core/main.c` for boot and task creation, `core/cli.c` for commands,
+`core/proto.c` for WebUSB and BLE sessions, `core/vfs.c` for storage routing,
+and `core/app_run.c` for app execution. Platform work starts at `hal/hal.h` and
+the nearest existing board under `platforms/`.

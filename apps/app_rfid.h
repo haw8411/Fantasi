@@ -104,12 +104,12 @@ typedef struct fantasi_rfid {
 
     /* LF reader<->tag round-trip capture (the RX primitive; RX counterpart to lf_modulate's TX):
      * optionally gap-modulate a downlink command (`cmd`/`nbits`, one byte per bit MSB-first; pass
-     * NULL/0 for capture-only), hold the field, and stream the raw 125 kHz envelope - one 8-bit
-     * sample per carrier cycle - into the caller's `buf` (>= a few bit-periods). Returns the sample
-     * count, or <0. This is deliberately just the analog capture: LF has no hardware demod (unlike
-     * hf_transceive), so the DSP - clock recovery, ASK/Manchester demod, framing - lives in the
-     * calling module, which owns the ephemeral sample buffer and is deleted after use. Reusable by
-     * any LF read protocol. Self-contained given set_mode(LF_READER) first. NULL where no LF read. */
+     * NULL/0 for capture-only), hold the field, and stream-demodulate the 125 kHz envelope into one-byte
+     * inter-edge run lengths. Runs normally alternate low/high from index 0; a frontend may prefix
+     * [0, initial_level] to preserve a fixed capture-time phase (0 cannot be a duration). Returns the byte
+     * count, or <0. Manchester/clock recovery and framing remain in the calling module, which owns the
+     * ephemeral buffer and is deleted after use. Self-contained given set_mode(LF_READER) first. NULL where
+     * no LF read. */
     int (*lf_transceive)(const uint8_t *cmd, int nbits, uint8_t *buf, int cap);
 
     /* ---- appended in later ABIs: emulation ---- */

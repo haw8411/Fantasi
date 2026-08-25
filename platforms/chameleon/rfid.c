@@ -192,13 +192,20 @@ static void rc522_reset(void)
  * Frontend + timing reference: ChameleonUltra lf_125khz_radio.c (no nrfx). */
 
 #define LF_PPI_SAADC   1   /* PWMPERIODEND -> SAADC SAMPLE */
+#define LF_PPI_PHASE   2   /* PWMPERIODEND -> TIMER3 COUNT (32-bit response phase) */
+#define LF_PPI_ARM     4   /* TIMER3 count 2047 -> enable SAADC group */
+#define LF_PPI_REPHASE 5   /* completed downlink -> reset response phase */
+#define LF_PPI_GRP_ADC 0
+#define LF_PPI_GRP_ARM 1
 #define LF_AIN         SAADC_CH_PSELP_PSELP_AnalogInput5   /* LF_OA_OUT = P0.29 = AIN5 */
 
 /* Carrier via a 4 MHz PWM clock: f = 4 MHz / COUNTERTOP, so top 32 => 125 kHz.
  * s_pwm_val is the compare (duty) value; a low duty (~1/8) keeps the op-amp gain
  * stages linear - see the acquire comment for why that matters. */
 static uint16_t  s_lf_top = 32;                /* 4 MHz / 32 = 125 kHz (bit rate lands in the op-amp band) */
-#define LF_DUTY_RX  4                          /* ~1/8 duty: linear amps (50% clips them rail-to-rail and erases the data) */
+#define LF_DUTY_RX  4                          /* ~1/8 duty: clean OOK gaps + linear receive amplifier */
+#define LF_DUTY_WRITE 16                       /* 1/2 duty: stock CU field strength for EEPROM programming */
+#define LF_PWM_INVERTED 0x8000u                /* sequence polarity bit: stock CU parks write gaps high */
 /* EasyDMA re-reads this every PWM period (SEQ REFRESH=0 + loop shorts), so a plain store changes the drive
  * within one carrier cycle - volatile because the peripheral, not this code, is the other reader. */
 static volatile uint16_t s_pwm_val = LF_DUTY_RX;
@@ -207,12 +214,44 @@ static bool      s_pwm_running;
 
 /* Envelope sample buffer, sized for ~2 EM4100 frames (64 bits x ~64 carrier
  * cycles/bit x 2) so an aligned 64-bit frame is always contained. */
-#define LF_ENV_SAMPLES 9000
+#define LF_ENV_SAMPLES 9216
 static int16_t s_lf_env[LF_ENV_SAMPLES];
+
+static void lf_saadc_disconnect(void)
+{
+    for (int ch = 0; ch < 8; ch++) {
+        NRF_SAADC->CH[ch].PSELP = 0;
+        NRF_SAADC->CH[ch].PSELN = 0;
+    }
+}
 
 static void lf_hw_init(void)
 {
     if (s_lf_inited) return;
+
+    /* A warm handoff can leave peripheral state behind even though C state was reset. Quiesce every LF
+     * endpoint before installing the fixed PPI topology so no stale channel can prefill a later DMA buffer. */
+    NRF_PPI->TASKS_CHG[LF_PPI_GRP_ADC].DIS = 1;
+    NRF_PPI->TASKS_CHG[LF_PPI_GRP_ARM].DIS = 1;
+    NRF_PPI->CHENCLR = (1u << LF_PPI_SAADC) | (1u << LF_PPI_PHASE) |
+                       (1u << LF_PPI_ARM) | (1u << LF_PPI_REPHASE);
+    NRF_PPI->FORK[LF_PPI_SAADC].TEP = 0;
+    NRF_PPI->FORK[LF_PPI_PHASE].TEP = 0;
+    NRF_PPI->FORK[LF_PPI_ARM].TEP = 0;
+    NRF_PPI->FORK[LF_PPI_REPHASE].TEP = 0;
+    if (NRF_PWM0->ENABLE == PWM_ENABLE_ENABLE_Enabled) {
+        NRF_PWM0->SHORTS = 0;
+        NRF_PWM0->EVENTS_STOPPED = 0;
+        NRF_PWM0->TASKS_STOP = 1;
+        for (uint32_t g = 0; !NRF_PWM0->EVENTS_STOPPED && g < 1000000; g++) { }
+    }
+    if (NRF_SAADC->ENABLE == SAADC_ENABLE_ENABLE_Enabled) {
+        NRF_SAADC->EVENTS_STOPPED = 0;
+        NRF_SAADC->TASKS_STOP = 1;
+        for (uint32_t g = 0; !NRF_SAADC->EVENTS_STOPPED && g < 1000000; g++) { }
+        NRF_SAADC->ENABLE = 0;
+    }
+    lf_saadc_disconnect();
 
     pin_out(PIN_LF_DRV, 0);
     /* LF_OA_OUT read as analog (AIN5) by the SAADC; leave the pin's digital
@@ -252,31 +291,104 @@ static void lf_hw_init(void)
     NRF_PPI->CH[LF_PPI_SAADC].EEP = (uint32_t)(uintptr_t)&NRF_PWM0->EVENTS_PWMPERIODEND;
     NRF_PPI->CH[LF_PPI_SAADC].TEP = (uint32_t)(uintptr_t)&NRF_SAADC->TASKS_SAMPLE;
 
+    /* Carrier-cycle phase over one complete 32-bit RF/64 response (2048 carrier periods). A bit-only modulo
+     * would preserve the Manchester cell grid but still allow a calibration and target to be captured at
+     * different whole-bit rotations. The final field restore of every hardware downlink clears this counter. */
+    NRF_TIMER3->TASKS_STOP  = 1;
+    NRF_TIMER3->MODE        = TIMER_MODE_MODE_Counter;
+    NRF_TIMER3->BITMODE     = TIMER_BITMODE_BITMODE_16Bit;
+    NRF_TIMER3->TASKS_CLEAR = 1;
+    NRF_TIMER3->CC[0]       = 2048;
+    NRF_TIMER3->CC[2]       = 2047;
+    NRF_TIMER3->SHORTS      = TIMER_SHORTS_COMPARE0_CLEAR_Msk;
+    NRF_TIMER3->TASKS_START = 1;
+    NRF_PPI->CH[LF_PPI_PHASE].EEP = (uint32_t)(uintptr_t)&NRF_PWM0->EVENTS_PWMPERIODEND;
+    NRF_PPI->CH[LF_PPI_PHASE].TEP = (uint32_t)(uintptr_t)&NRF_TIMER3->TASKS_COUNT;
+
+    /* Hardware capture arm. At carrier count 2047, enable the PWMEND->SAADC channel. The following PWM period
+     * end is count 0, so sample zero has exact 32-bit response phase if a priority-0 SoftDevice interrupt
+     * preempts the CPU while the capture is being arranged. The arm stays enabled during DMA (re-enabling an
+     * already-enabled channel is harmless) and teardown disables both groups before stopping the SAADC. This
+     * avoids a simultaneous group-EN/self-DIS corner at the compare event. */
+    NRF_PPI->TASKS_CHG[LF_PPI_GRP_ADC].DIS = 1;
+    NRF_PPI->TASKS_CHG[LF_PPI_GRP_ARM].DIS = 1;
+    NRF_PPI->CHG[LF_PPI_GRP_ADC] = (1u << LF_PPI_SAADC);
+    NRF_PPI->CHG[LF_PPI_GRP_ARM] = (1u << LF_PPI_ARM);
+    NRF_PPI->CH[LF_PPI_ARM].EEP = (uint32_t)(uintptr_t)&NRF_TIMER3->EVENTS_COMPARE[2];
+    NRF_PPI->CH[LF_PPI_ARM].TEP = (uint32_t)(uintptr_t)&NRF_PPI->TASKS_CHG[LF_PPI_GRP_ADC].EN;
+    NRF_PPI->FORK[LF_PPI_ARM].TEP = 0;
+    NRF_PPI->CH[LF_PPI_REPHASE].EEP = (uint32_t)(uintptr_t)&NRF_PWM0->EVENTS_SEQEND[1];
+    NRF_PPI->CH[LF_PPI_REPHASE].TEP = (uint32_t)(uintptr_t)&NRF_TIMER3->TASKS_CLEAR;
+
     s_lf_inited = true;
 }
 
 static void lf_start(void)
 {
     if (!s_lf_inited) return;
-    s_pwm_val = LF_DUTY_RX;             /* restore the drive level (a gap parks it at 0) */
-    if (!s_pwm_running) { NRF_PWM0->TASKS_SEQSTART[0] = 1; s_pwm_running = true; }
+    s_pwm_val = LF_DUTY_RX;
+    NRF_PPI->CHENSET = (1u << LF_PPI_PHASE);
+    if (!s_pwm_running) {
+        NRF_PWM0->LOOP = 1;
+        NRF_PWM0->SEQ[0].PTR = (uint32_t)(uintptr_t)&s_pwm_val;
+        NRF_PWM0->SEQ[0].CNT = 1;
+        NRF_PWM0->SEQ[0].REFRESH = 0;
+        NRF_PWM0->SEQ[0].ENDDELAY = 0;
+        NRF_PWM0->SEQ[1].PTR = (uint32_t)(uintptr_t)&s_pwm_val;
+        NRF_PWM0->SEQ[1].CNT = 1;
+        NRF_PWM0->SEQ[1].REFRESH = 0;
+        NRF_PWM0->SEQ[1].ENDDELAY = 0;
+        NRF_PWM0->SHORTS = PWM_SHORTS_LOOPSDONE_SEQSTART0_Msk;
+        NRF_PWM0->TASKS_SEQSTART[0] = 1;
+        s_pwm_running = true;
+    }
 }
 
 static void lf_stop(void)
 {
     if (!s_lf_inited) return;
+    NRF_PPI->TASKS_CHG[LF_PPI_GRP_ADC].DIS = 1;
+    NRF_PPI->TASKS_CHG[LF_PPI_GRP_ARM].DIS = 1;
+    NRF_PPI->CHENCLR = (1u << LF_PPI_SAADC) | (1u << LF_PPI_PHASE) |
+                       (1u << LF_PPI_ARM) | (1u << LF_PPI_REPHASE);
+    if (NRF_SAADC->ENABLE == SAADC_ENABLE_ENABLE_Enabled) {
+        NRF_SAADC->EVENTS_STOPPED = 0;
+        NRF_SAADC->TASKS_STOP = 1;
+        for (uint32_t g = 0; !NRF_SAADC->EVENTS_STOPPED && g < 1000000; g++) { }
+        NRF_SAADC->ENABLE = 0;
+    }
+    lf_saadc_disconnect();
+    NRF_PWM0->SHORTS = 0;                         /* a LOOPSDONE shortcut can otherwise restart after STOP */
+    NRF_PWM0->EVENTS_STOPPED = 0;
     NRF_PWM0->TASKS_STOP = 1;
+    for (uint32_t g = 0; !NRF_PWM0->EVENTS_STOPPED && g < 1000000; g++) { }
     s_pwm_running = false;
-    NRF_PPI->CHENCLR = (1u << LF_PPI_SAADC);
+    pin_set(PIN_LF_DRV, 0);
 }
 
 /* DMA-sample AIN5 for `nsamp` samples at the carrier rate; returns 0 on success. The buffer is int16_t
  * (SAADC result width) regardless of resolution. PWMPERIODEND drives SAMPLE over PPI, so a sample index is a
  * carrier-cycle count - what the EM4100 decoder's interval arithmetic depends on. */
 
-static int lf_sample(int16_t *raw, int nsamp)
+static int lf_sample_prepare(int16_t *raw, int nsamp, uint32_t resolution)
 {
-    NRF_SAADC->RESOLUTION = SAADC_RESOLUTION_VAL_8bit;
+    /* Disable both the direct sample path and its hardware arm before START. If a prior task was cancelled
+     * mid-capture, this prevents carrier edges from filling arbitrary-phase samples into the new buffer. */
+    NRF_PPI->TASKS_CHG[LF_PPI_GRP_ARM].DIS = 1;
+    NRF_PPI->TASKS_CHG[LF_PPI_GRP_ADC].DIS = 1;
+    NRF_PPI->CHENCLR = (1u << LF_PPI_ARM) | (1u << LF_PPI_SAADC);
+    if (NRF_SAADC->ENABLE == SAADC_ENABLE_ENABLE_Enabled) {
+        NRF_SAADC->EVENTS_STOPPED = 0;
+        NRF_SAADC->TASKS_STOP = 1;
+        for (uint32_t g = 0; !NRF_SAADC->EVENTS_STOPPED && g < 1000000; g++) { }
+        NRF_SAADC->ENABLE = 0;
+    }
+
+    /* Normalize inherited scan/oversample state before installing the one-channel, task-triggered capture. */
+    lf_saadc_disconnect();
+    NRF_SAADC->OVERSAMPLE = SAADC_OVERSAMPLE_OVERSAMPLE_Bypass;
+    NRF_SAADC->SAMPLERATE = (SAADC_SAMPLERATE_MODE_Task << SAADC_SAMPLERATE_MODE_Pos);
+    NRF_SAADC->RESOLUTION = resolution;
     NRF_SAADC->CH[0].PSELP  = LF_AIN;
     NRF_SAADC->CH[0].PSELN  = 0;
     NRF_SAADC->CH[0].CONFIG =
@@ -294,20 +406,40 @@ static int lf_sample(int16_t *raw, int nsamp)
     NRF_SAADC->TASKS_START = 1;
     for (uint32_t g = 0; !NRF_SAADC->EVENTS_STARTED && g < 1000000; g++) { }   /* never hang on a stuck SAADC */
 
-    NRF_PPI->CHENSET = (1u << LF_PPI_SAADC);   /* let PWMPERIODEND drive SAMPLE */
+    if (!NRF_SAADC->EVENTS_STARTED) {
+        NRF_SAADC->ENABLE = 0;
+        lf_saadc_disconnect();
+        return -1;
+    }
+    return 0;
+}
 
+static int lf_sample_finish(int nsamp)
+{
     /* nsamp/125kHz ~ 72 ms; poll for completion with margin. */
-    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(nsamp / 100 + 50);
-    while (!NRF_SAADC->EVENTS_END && xTaskGetTickCount() < deadline)
+    TickType_t started = xTaskGetTickCount();
+    TickType_t timeout = pdMS_TO_TICKS(nsamp / 100 + 50);
+    while (!NRF_SAADC->EVENTS_END && (TickType_t)(xTaskGetTickCount() - started) < timeout)
         vTaskDelay(pdMS_TO_TICKS(5));
 
-    NRF_PPI->CHENCLR = (1u << LF_PPI_SAADC);
+    int complete = NRF_SAADC->EVENTS_END != 0;
+    NRF_PPI->TASKS_CHG[LF_PPI_GRP_ARM].DIS = 1;
+    NRF_PPI->TASKS_CHG[LF_PPI_GRP_ADC].DIS = 1;
+    NRF_PPI->CHENCLR = (1u << LF_PPI_ARM) | (1u << LF_PPI_SAADC);
     NRF_SAADC->EVENTS_STOPPED = 0;
     NRF_SAADC->TASKS_STOP = 1;
     for (uint32_t g = 0; !NRF_SAADC->EVENTS_STOPPED && g < 1000000; g++) { }
     NRF_SAADC->ENABLE = 0;
-    NRF_SAADC->CH[0].PSELP = 0;   /* fully disconnect AIN5 so it can't load LF_OA_OUT */
-    return NRF_SAADC->EVENTS_END ? 0 : -1;
+    lf_saadc_disconnect();
+    return complete ? 0 : -1;
+}
+
+static int lf_sample(int16_t *raw, int nsamp)
+{
+    if (lf_sample_prepare(raw, nsamp, SAADC_RESOLUTION_VAL_8bit) != 0) return -1;
+
+    NRF_PPI->CHENSET = (1u << LF_PPI_SAADC);   /* let PWMPERIODEND drive SAMPLE */
+    return lf_sample_finish(nsamp);
 }
 
 /* HF tag-emulation state (defined with the NFCT emulation block below; declared here for set_mode). */
@@ -926,13 +1058,11 @@ int hal_rfid_hf_transceive_par(const uint8_t *tx, int nbytes, const uint8_t *par
 
 /* ---- LF 125 kHz reader ---- */
 
-/* Energise/de-energise the 125 kHz carrier and edge capture. divisor is unused
- * here (the carrier is always 125 kHz; the decoder tries the bit-rate divisors). */
 /* ---- T5577 downlink (OOK gap modulation) + block read ----
  * T55 command bits are sent as brief field gaps: charge the tag, drop the carrier for a start gap, then per
  * bit re-raise the carrier for a long (1) or short (0) burst followed by a write gap, then leave it on. The
- * gap widths are us-critical, so we busy-delay off the Cortex-M4 DWT cycle counter (64 MHz) inside a critical
- * section. Timing + protocol mirror the PM3 lf_tx_cmd; the reply is demodulated by the shared t5577 module. */
+ * complete waveform is played by PWM EasyDMA so interrupts cannot stretch its carrier-counted timings. The
+ * reply is demodulated into the anchored run stream consumed by the shared T5577 module. */
 /* Downlink gap timing, in Tc (1 carrier cycle = 8 us at 125 kHz), taken from the stock ChameleonUltra
  * firmware (lf_t55xx_data.c), which is known to program T5577s on this exact frontend. */
 #define T55_START_GAP_US  240   /* 30 Tc */
@@ -940,14 +1070,13 @@ int hal_rfid_hf_transceive_par(const uint8_t *tx, int nbytes, const uint8_t *par
 #define T55_WRITE_0_US    192   /* 24 Tc - field ON before the gap => bit 0 */
 #define T55_WRITE_1_US    432   /* 54 Tc - field ON before the gap => bit 1 */
 #define T55_POWERUP_MS      8
-#define T55_PROGRAM_MS      6
-/* Settle before capturing the reply: just past the peak detector, not past the reply's start. The demod
- * anchors on the gap->block transition (see lf_demod_t55), which happens microseconds after the command, so
- * the capture must begin while it is still ahead of us. Matches the PM3 platform's value. */
-#define T55_READ_SETTLE_US 120
-#define T55_BIT            (2 * T55_HB)   /* one bit period, in carrier cycles */
-#define LF_T55_ARM         24    /* samples before edges are trusted (dc settles) */
-#define T55_SMOOTH         4     /* boxcar taps over the envelope before slicing (PM3 uses the same) */
+#define T55_PROGRAM_MS     10
+#define T55_READ_RESET_MS  20
+/* The Chameleon's AC-coupled receive chain needs several response repetitions to recover from the downlink
+ * gaps. The tag repeats continuously, so wait with interrupts enabled and then arm on a hardware RF/64
+ * phase below; this loses no information and avoids accepting the visibly distorted early copies. */
+#define T55_REPLY_SETTLE_MS 80
+#define LF_T55_WARM        256   /* carrier cycles discarded before eye calibration / output */
 #define LF_T55_SKIP        150   /* EM4100 path: lead-in excluded from its band estimate + demod */
 #define T55_HB             32     /* half-bit width in carrier cycles = samples (RF/64: 32/half-bit) */
 
@@ -975,25 +1104,70 @@ static inline void spin_us(uint32_t us)
         if (++guard > 4000000) break;              /* never hang if TIMER1 is dead */
     } while ((NRF_TIMER1->CC[0] - start) < us);
 }
-/* Carrier drop for a downlink gap: hold the pin actively low by driving a 0% duty, which damps the antenna
- * tank through the driver's low side. Merely stopping the PWM leaves the pin wherever the last period ended
- * and lets the tank ring down on its own, so the field decays too slowly for the tag to register a gap. The
- * PWM is never stopped or restarted here (see the SEQ config): a bare store retimes the drive on the next
- * carrier cycle, with no chance of a stale-duty pulse punching a hole in the gap. */
-static inline void lf_carrier_off(void) { s_pwm_val = 0; }
-
-static void lf_t55_cmd(const uint8_t *p, int nbits)
+/* Emit the complete downlink from PWM EasyDMA, one compare value per carrier period. CPU busy-delays and live
+ * writes to a sequence that EasyDMA is reading are both vulnerable to SoftDevice timing, whereas this array
+ * fixes every on/gap interval in hardware. The final ON value is held after SEQEND1; that same event clears
+ * TIMER3 through PPI, establishing response-block phase zero at the actual field restore. */
+static int lf_t55_cmd(const uint8_t *p, int nbits, uint16_t cmd_duty, uint16_t hold_duty,
+                      bool cmd_inverted, bool hold_inverted)
 {
-    lf_start();                                   /* field on: charge the tag */
-    vTaskDelay(pdMS_TO_TICKS(T55_POWERUP_MS));
-    taskENTER_CRITICAL();                          /* gap timing must not be preempted */
-    lf_carrier_off(); spin_us(T55_START_GAP_US);   /* start gap */
+    if (!p || nbits <= 0) return -1;
+    int periods = T55_START_GAP_US / 8 + 1;
     for (int i = 0; i < nbits; i++) {
-        lf_start();       spin_us(p[i] ? T55_WRITE_1_US : T55_WRITE_0_US);
-        lf_carrier_off(); spin_us(T55_WRITE_GAP_US);
+        int add = (p[i] ? T55_WRITE_1_US : T55_WRITE_0_US) / 8 + T55_WRITE_GAP_US / 8;
+        if (periods > LF_ENV_SAMPLES - add) return -1;
+        periods += add;
     }
-    lf_start();                                    /* field back on */
-    taskEXIT_CRITICAL();
+
+    uint16_t cmd_polarity = cmd_inverted ? LF_PWM_INVERTED : 0;
+    uint16_t hold_polarity = hold_inverted ? LF_PWM_INVERTED : 0;
+    uint16_t cmd_word = cmd_polarity | cmd_duty;
+    uint16_t hold_word = hold_polarity | hold_duty;
+    uint16_t gap_word = cmd_polarity;              /* compare zero: constant low normally, high if inverted */
+
+    lf_start();                                    /* field on: charge the tag */
+    s_pwm_val = cmd_word;
+    vTaskDelay(pdMS_TO_TICKS(T55_POWERUP_MS));
+
+    uint16_t *seq = (uint16_t *)(void *)s_lf_env;
+    int n = 0;
+    for (int i = 0; i < T55_START_GAP_US / 8; i++) seq[n++] = gap_word;
+    for (int i = 0; i < nbits; i++) {
+        int on = (p[i] ? T55_WRITE_1_US : T55_WRITE_0_US) / 8;
+        for (int j = 0; j < on; j++) seq[n++] = cmd_word;
+        for (int j = 0; j < T55_WRITE_GAP_US / 8; j++) seq[n++] = gap_word;
+    }
+    seq[n++] = hold_word;                           /* restored field, held after playback */
+
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();                                /* only the stop/reconfigure/start handoff (~one carrier) */
+    NRF_PWM0->SHORTS = 0;
+    NRF_PWM0->EVENTS_STOPPED = 0;
+    NRF_PWM0->TASKS_STOP = 1;
+    for (uint32_t g = 0; !NRF_PWM0->EVENTS_STOPPED && g < 1000000; g++) { }
+    NRF_PWM0->LOOP = 1;                             /* nrfx simple-playback count=1 starts sequence 1 */
+    NRF_PWM0->SEQ[0].PTR = (uint32_t)(uintptr_t)seq;
+    NRF_PWM0->SEQ[0].CNT = (uint32_t)n;
+    NRF_PWM0->SEQ[0].REFRESH = 0;
+    NRF_PWM0->SEQ[0].ENDDELAY = 0;
+    NRF_PWM0->SEQ[1].PTR = (uint32_t)(uintptr_t)seq;
+    NRF_PWM0->SEQ[1].CNT = (uint32_t)n;
+    NRF_PWM0->SEQ[1].REFRESH = 0;
+    NRF_PWM0->SEQ[1].ENDDELAY = 0;
+    NRF_PWM0->EVENTS_SEQEND[1] = 0;
+    NRF_PPI->CHENSET = (1u << LF_PPI_PHASE) | (1u << LF_PPI_REPHASE);
+    NRF_PWM0->TASKS_SEQSTART[1] = 1;
+    s_pwm_running = true;
+    if (!primask) __enable_irq();
+
+    for (uint32_t g = 0; !NRF_PWM0->EVENTS_SEQEND[1] && g < 10000000; g++) { }
+    int complete = NRF_PWM0->EVENTS_SEQEND[1] != 0;
+    NRF_PPI->CHENCLR = (1u << LF_PPI_REPHASE);      /* one SEQEND only, but leave no stale endpoint enabled */
+    if (!complete) {
+        lf_stop();
+        return -1;
+    }
+    return 0;
 }
 
 int hal_rfid_lf_field(bool on, uint32_t divisor)
@@ -1093,149 +1267,198 @@ int hal_rfid_lf_modulate(const uint8_t *p, int nbits, uint32_t o)
 {
     (void)o;
     if (s_mode != RFID_LF_READER || !p || nbits <= 0) return RFID_ERR_UNSUPP;
-    lf_t55_cmd(p, nbits);
+    /* Match the stock Chameleon write field exactly: 50% PWM with inverted output polarity. Besides supplying
+     * enough energy through a worst-case all-zero command, inversion makes a compare-zero gap park the driver
+     * high, as nrfx_pwm_stop() does with NRFX_PWM_PIN_INVERTED in the proven upstream implementation. */
+    if (lf_t55_cmd(p, nbits, LF_DUTY_WRITE, LF_DUTY_WRITE, true, true) != 0)
+        return RFID_ERR_TIMEOUT;
     vTaskDelay(pdMS_TO_TICKS(T55_PROGRAM_MS));      /* EEPROM programming window, field steady */
-    lf_carrier_off();
+    lf_stop();
     return 0;
 }
 
-/* Sample index of the last capture's frame anchor (the gap->block falling edge), or -1. */
-static int s_lf_anchor = -1;
-/* Where the anchor sat on the previous read - later reads lock to it (see lf_demod_t55). */
-static int s_lf_expect = -1;
+/* Scratch used only while calibrating the T5577 envelope slicer. */
+static uint8_t s_t55_hb[256];
+static int s_t55_nhb;
 
-/* T55 reply demod: level-run durations (alternating low, high), which is what t55_extract wants - distinct
- * from lf_demod's rising-edge-to-rising-edge intervals (used by the EM4100 decoder). The read gap is
- * unmodulated carrier = envelope high, so start high and anchor recording on the first falling edge (the
- * data-independent gap->block transition); runs then alternate low(0), high(1), ... from index 0. */
+#define T55_EYE_WIDTH 20
+#define T55_EYE_CELLS 256
+#define T55_BLOCK_CELLS 64
+#define T55_EYE_PHASE_CUT 3    /* opposite the hardware-anchored transition (normally phase 17..20) */
+#define T55_EYE_PHASE_GUARD 2
+#define T55_EYE_MIN_QUALITY 192
+static int32_t s_t55_eye[T55_EYE_CELLS];
+
+static void lf_t55_measure_cells(int start, int sample)
+{
+    for (int h = 0; h < T55_EYE_CELLS; h++) {
+        int cell = start + h * T55_HB + sample;
+        int32_t sum = 0;
+        for (int j = 0; j < T55_EYE_WIDTH; j++) sum += s_lf_env[cell + j];
+        s_t55_eye[h] = sum;
+    }
+
+    /* Each 64-half-bit Manchester period has exactly 32 high and 32 low cells at every rotation. Its mean is
+     * therefore a data-independent baseline measurement. Remove one baseline per physical repetition so the
+     * frozen eye threshold does not follow the AC-coupled front end's slow drift through the capture. */
+    for (int base = 0; base < T55_EYE_CELLS; base += T55_BLOCK_CELLS) {
+        int32_t sum = 0;
+        for (int h = 0; h < T55_BLOCK_CELLS; h++) sum += s_t55_eye[base + h];
+        int32_t mean = sum / T55_BLOCK_CELLS;
+        for (int h = 0; h < T55_BLOCK_CELLS; h++) s_t55_eye[base + h] -= mean;
+    }
+}
+
+static void lf_t55_sort_cells(int first, int count)
+{
+    for (int i = first + 1; i < first + count; i++) {
+        int32_t v = s_t55_eye[i]; int j = i;
+        while (j > first && s_t55_eye[j - 1] > v) {
+            s_t55_eye[j] = s_t55_eye[j - 1]; j--;
+        }
+        s_t55_eye[j] = v;
+    }
+}
+
+/* Return the mean physical eye quality across the four complete response periods at one fine phase. The
+ * score measures inner-cluster separation relative to within-level spread; unlike one adjacent-rank gap, it
+ * follows the broad eye and cannot be won by one noisy order-statistic spacing. Averaging makes the phase
+ * curve describe the common analog transition instead of allowing one noisy repetition to create its valley.
+ * Each period also gets its own balanced-population midpoint: the AC-coupled frontend's level centre moves
+ * through a capture even after mean removal, so pooling otherwise-open eyes under one threshold can close
+ * the combined eye. These four thresholds are fixed analog calibration, not decoded-value selection. */
+static int lf_t55_eye_at(int start, int sample, int32_t threshold[4], int period_quality[4])
+{
+    lf_t55_measure_cells(start, sample);
+    int quality_sum = 0;
+    for (int base = 0; base < T55_EYE_CELLS; base += T55_BLOCK_CELLS) {
+        lf_t55_sort_cells(base, T55_BLOCK_CELLS);
+        int32_t lo = s_t55_eye[base + T55_BLOCK_CELLS / 2 - 1];
+        int32_t hi = s_t55_eye[base + T55_BLOCK_CELLS / 2];
+
+        /* Ranks 28/35 are several cells inside the two 32-cell populations; ranks 3/60 estimate their
+         * outer spread without letting extrema dominate. A tied central pair is a closed slicing gap,
+         * regardless of the wider ranks. Q10 scaling keeps this integer-only. */
+        int32_t inner = s_t55_eye[base + 35] - s_t55_eye[base + 28];
+        int32_t spread = (s_t55_eye[base + 28] - s_t55_eye[base + 3]) +
+                         (s_t55_eye[base + 60] - s_t55_eye[base + 35]);
+        int quality = hi > lo ? (int)(((int64_t)inner << 10) / (spread + 1)) : 0;
+        quality_sum += quality;
+        if (threshold) threshold[base / T55_BLOCK_CELLS] = lo + (hi - lo) / 2;
+        if (period_quality) period_quality[base / T55_BLOCK_CELLS] = quality;
+    }
+    return quality_sum / (T55_EYE_CELLS / T55_BLOCK_CELLS);
+}
+
+/* Calibrate the data eye without using decoded values. Every Manchester block has exactly 32 high and 32
+ * low half-bits, so four complete periods contain an exactly balanced population at any block rotation.
+ * The broad minimum of the normalized cluster-quality curve marks where the integration window straddles the
+ * analog transition. Move its start back by half a window so the calibrated window ends just before that
+ * edge, after the receive chain has had almost the complete cell to recover.
+ * A guarded, unwrapped fine-phase branch preserves which hardware-anchored 32-cycle cell owns each sample
+ * across phase 31<->0. Decoded bits never choose, retry, or repair either the phase or level calibration. */
 static int lf_demod_t55(uint8_t *buf, int cap)
 {
-    if (lf_sample(s_lf_env, LF_ENV_SAMPLES) != 0) return RFID_ERR_TIMEOUT;
+    s_t55_nhb = 0;
+    const int start = LF_T55_WARM + 2 * T55_HB;
+    int32_t threshold[T55_EYE_CELLS / T55_BLOCK_CELLS];
+    int quality[T55_HB];
+    for (int sample = 0; sample < T55_HB; sample++)
+        quality[sample] = lf_t55_eye_at(start, sample, NULL, NULL);
 
-    /* Ported from the PM3 platform's T55 demod, which reads every block reliably. Two things matter:
-     *
-     * Anchor. The read gap is unmodulated carrier - envelope high - so start `high` and begin recording on
-     * the first falling edge, the gap->block transition. That edge's timing is data-independent, so every
-     * block frames identically and one rotation calibrated on block 0 transfers to any target. Taking
-     * whatever edge arrives first instead starts 1-2 half-bits into the block depending on its leading bits,
-     * a data-dependent phase.
-     *
-     * Band. Track the envelope amplitude with an EMA and slice at half of it, rather than sizing a fixed
-     * band from the whole capture's peak-to-peak: the post-downlink transient dwarfs the reply, so a global
-     * pk-pk sets the band from the transient and swallows real edges. */
-    /* Pre-converge the slicing band over the steady part of the capture, then hold it fixed for the edge
-     * pass. Letting the amplitude EMA warm up inside the edge loop leaves the threshold wrong for exactly
-     * the first few dozen samples - which is where the anchor edge lives. */
-    int32_t band;
-    { int32_t d2 = (int32_t)s_lf_env[LF_T55_ARM] << 8, a2 = 0;
-      int16_t w2[T55_SMOOTH] = {0}; int32_t s2 = 0;
-      for (int i = LF_T55_ARM; i < LF_ENV_SAMPLES; i++) {
-          s2 += s_lf_env[i] - w2[i % T55_SMOOTH];
-          w2[i % T55_SMOOTH] = s_lf_env[i];
-          int32_t v = (s2 / T55_SMOOTH) << 8;
-          d2 += (v - d2) >> 7;
-          int ac = (int)((v - d2) >> 8);
-          int32_t a = ac < 0 ? -ac : ac;
-          a2 += ((a << 8) - a2) >> 6;
-      }
-      band = (a2 >> 8) / 2;
-      if (band < 2) band = 2;                            /* floor: don't chase pure noise */
-    }
-
-    /* Boxcar the envelope before slicing (as the PM3 demod does): constant group delay, so it denoises
-     * without moving edges, and it stops single-sample noise from tripping the detector near a threshold. */
-    /* Pass 1: collect candidate falling edges (gap->block transitions). */
-    int fall[24], nf = 0;
-    { int hi = 1; int32_t d2 = (int32_t)s_lf_env[0] << 8;
-      int16_t w2[T55_SMOOTH] = {0}; int32_t s2 = 0;
-      for (int i = 0; i < LF_ENV_SAMPLES && nf < 24; i++) {
-          s2 += s_lf_env[i] - w2[i % T55_SMOOTH];
-          w2[i % T55_SMOOTH] = s_lf_env[i];
-          int32_t v = (s2 / T55_SMOOTH) << 8;
-          d2 += (v - d2) >> 7;
-          int ac = (int)((v - d2) >> 8);
-          if (i < LF_T55_ARM) continue;
-          if (hi && ac < -band)      { hi = 0; fall[nf++] = i; }
-          else if (!hi && ac > band) { hi = 1; }
-      }
-    }
-    if (!nf) return 0;
-
-    /* Pick the anchor. Every read of a given tag places the gap->block edge at essentially the same sample
-     * (measured 203-210 across a whole dump), because the command is timed to the microsecond and the tag's
-     * reply delay is fixed. So once one read has established where it sits, lock subsequent reads to that
-     * position rather than trusting a run-length heuristic. Length plausibility is still used to
-     * skip the transient on the first read, when there is nothing to lock to yet. */
-    int anchor = -1;
-    if (s_lf_expect >= 0) {
-        int best = 1 << 30;
-        for (int k = 0; k < nf; k++) {
-            int d = fall[k] - s_lf_expect; if (d < 0) d = -d;
-            if (d < best) { best = d; anchor = fall[k]; }
+    int edge_score = 0x7FFFFFFF, edge = -1;
+    for (int p = 0; p < T55_HB; p++) {
+        int score = quality[(p + T55_HB - 1) % T55_HB] + quality[p] +
+                    quality[(p + 1) % T55_HB];
+        if (score < edge_score) {
+            edge_score = score;
+            edge = p;
         }
-        if (best > T55_BIT) anchor = -1;          /* nothing near the expected spot: fall back */
     }
-    if (anchor < 0) {
-        /* First read (nothing to lock to yet): skip the post-downlink transient. In settled data the tag
-         * puts a falling edge every 1-2 bit periods; through the transient they are sparse and irregular, so
-         * take the first candidate followed by a run of properly-spaced ones. */
-        for (int k = 0; k + 3 < nf && anchor < 0; k++) {
-            int good = 1;
-            for (int j = k; j < k + 3; j++) {
-                int sp = fall[j + 1] - fall[j];
-                if (sp < T55_HB || sp > 2 * T55_BIT) { good = 0; break; }
-            }
-            if (good) anchor = fall[k];
-        }
-        if (anchor < 0) anchor = fall[0];
-    }
-    s_lf_anchor = anchor;
-    if (s_lf_expect < 0) s_lf_expect = anchor;        /* lock later reads to the first good position */
+    if (edge < 0) return 0;
 
-    /* Pass 2: emit level runs from the chosen anchor. */
-    int count = 0, last_edge = anchor, high = 0;
-    { int32_t d2 = (int32_t)s_lf_env[0] << 8;
-      int16_t w2[T55_SMOOTH] = {0}; int32_t s2 = 0;
-      for (int i = 0; i < LF_ENV_SAMPLES && count < cap; i++) {
-          s2 += s_lf_env[i] - w2[i % T55_SMOOTH];
-          w2[i % T55_SMOOTH] = s_lf_env[i];
-          int32_t v = (s2 / T55_SMOOTH) << 8;
-          d2 += (v - d2) >> 7;
-          int ac = (int)((v - d2) >> 8);
-          if (i <= anchor) continue;
-          if (high && ac < -band) {
-              int d = i - last_edge; buf[count++] = d > 0xFF ? 0xFF : (uint8_t)d; last_edge = i; high = 0;
-          } else if (!high && ac > band) {
-              int d = i - last_edge; buf[count++] = d > 0xFF ? 0xFF : (uint8_t)d; last_edge = i; high = 1;
-          }
-      }
+    /* Fine phase is circular, but the exported half-bit grid is not. Keep the phase branch cut well away
+     * from the observed transition and reject its guard band: config and target can then jitter through
+     * phase 31<->0 without silently changing which physical cell owns a sample. */
+    int cut_distance = edge - T55_EYE_PHASE_CUT;
+    if (cut_distance < 0) cut_distance = -cut_distance;
+    if (cut_distance > T55_HB / 2) cut_distance = T55_HB - cut_distance;
+    if (cut_distance <= T55_EYE_PHASE_GUARD) return 0;
+    int unwrapped_edge = edge < T55_EYE_PHASE_CUT ? edge + T55_HB : edge;
+    int sample = unwrapped_edge - T55_EYE_WIDTH / 2;
+
+    int eye_quality = lf_t55_eye_at(start, sample, threshold, NULL);
+    /* A Q10 score of 192 requires the mean inner-cluster separation to exceed 3/16 of the within-level
+     * spread. Judge the calibrated capture as a whole: the exported stream deliberately includes an ignored
+     * lead copy, so allowing that unused physical period to veto an otherwise open eye only compounds misses
+     * across a dump's 21 acquisitions. Corrupted used periods still fail the shared decoder's zero-error,
+     * exact-duplicate requirement; decoded values never influence this analog confidence gate. */
+    if (eye_quality < T55_EYE_MIN_QUALITY) return 0;
+
+    /* Leave two fixed half-bits ahead of the exported anchor. The shared stream cap is 256 bytes and an
+     * anchored stream spends two of them on [0, initial_level]; an alternating block therefore carries at
+     * most 254 half-bits. Starting two cells later moves this frontend's calibrated boundary from phase 63
+     * to phase 61, leaving one cell of framing margin while two complete repetitions still fit even for
+     * 00000000/FFFFFFFF (one transition per cell). */
+    lf_t55_measure_cells(start, sample);
+    for (int h = 0; h < T55_EYE_CELLS; h++)
+        s_t55_hb[s_t55_nhb++] = (uint8_t)(s_t55_eye[h] > threshold[h / T55_BLOCK_CELLS]);
+
+    if (s_t55_nhb < 3 || cap < 3) return 0;
+    int count = 0, run = 1;
+    uint8_t level = s_t55_hb[0];
+    buf[count++] = 0;
+    buf[count++] = level;
+    for (int i = 1; i < s_t55_nhb; i++) {
+        if (s_t55_hb[i] == level) { run++; continue; }
+        if (count >= cap) break;
+        int d = run * T55_HB;
+        buf[count++] = d > 0xFF ? 0xFF : (uint8_t)d;
+        level = s_t55_hb[i]; run = 1;
+    }
+    if (count < cap) {
+        int d = run * T55_HB;
+        buf[count++] = d > 0xFF ? 0xFF : (uint8_t)d;
     }
     return count;
 }
-
 
 /* T5577 READ: send the read downlink (field left on), settle past the peak-detector, then demodulate the
  * tag's continuously-repeated block into level-run durations for the shared t55 decoder (t55_extract). */
 int hal_rfid_lf_transceive(const uint8_t *cmd, int nbits, uint8_t *buf, int cap)
 {
     if (s_mode != RFID_LF_READER) return RFID_ERR_UNSUPP;
-
-    /* A null/empty command is a phase nudge, not a read: it advances the settle used by subsequent reads and
-     * returns immediately. The reply's phase relative to the capture depends on that delay, so a block that
-     * frames one bit off at one settle frames correctly at another (measured: CAFEBABE/12345678 fail at 15 ms
-     * yet verify at 5 ms; 0F0F0F0F/A5A5A5A5 the reverse). Framing is deterministic for a given settle, so a
-     * plain retry repeats the same wrong answer - the write-verify loop needs to change the settle to get an
-     * independent look. Nudging is explicit rather than automatic because a whole-tag dump must hold one
-     * settle for all its blocks. */
     if (!cmd || nbits <= 0) return RFID_ERR_UNSUPP;
     if (!buf || cap <= 0) return RFID_ERR_UNSUPP;
 
+    /* Direct access needs the same strong, idle-high gap waveform as programming. The final EasyDMA word
+     * switches straight back to the low-duty, non-inverted carrier so the receive amplifier remains linear. */
+    if (lf_t55_cmd(cmd, nbits, LF_DUTY_WRITE, LF_DUTY_RX, true, false) != 0)
+        return RFID_ERR_TIMEOUT;
+    vTaskDelay(pdMS_TO_TICKS(T55_REPLY_SETTLE_MS)); /* let the AC-coupled receive path recover */
 
-    spin_us(1);                                     /* ensure TIMER1 is initialised + running */
-    lf_t55_cmd(cmd, nbits);                         /* downlink; field left on */
-    /* Capture almost immediately, on the microsecond timebase. The demod anchors on the gap->block edge,
-     * so that edge has to be inside the capture - a long settle lets it pass before sampling starts and
-     * leaves nothing to anchor to. */
-    spin_us(T55_READ_SETTLE_US);
-    return lf_demod_t55(buf, cap);
+    /* Prepare only after recovery so the SAADC input does not load the analog path during the downlink.
+     * Twelve-bit conversion resolves the T5577's load-modulation swing; EM4100 acquisition remains 8-bit. */
+    if (lf_sample_prepare(s_lf_env, LF_ENV_SAMPLES, SAADC_RESOLUTION_VAL_12bit) != 0) {
+        lf_stop();
+        vTaskDelay(pdMS_TO_TICKS(T55_READ_RESET_MS));
+        return RFID_ERR_TIMEOUT;
+    }
+    NRF_TIMER3->EVENTS_COMPARE[2] = 0;
+    NRF_PPI->TASKS_CHG[LF_PPI_GRP_ARM].EN = 1;      /* hardware opens ADC at count 2047 for phase-0 sample */
+
+    int rc = lf_sample_finish(LF_ENV_SAMPLES);
+    if (rc != 0) {
+        lf_stop();
+        vTaskDelay(pdMS_TO_TICKS(T55_READ_RESET_MS));
+        return RFID_ERR_TIMEOUT;
+    }
+    int nr = lf_demod_t55(buf, cap);
+    /* A short carrier interruption does not reset a T5577 reliably. Fully stop it between independently
+     * addressed captures and let its reservoir discharge, matching the proven Proxmark path. This also makes
+     * the dump module's documented inter-block reset real on the Chameleon; the next command recharges it. */
+    lf_stop();
+    vTaskDelay(pdMS_TO_TICKS(T55_READ_RESET_MS));
+    taskYIELD();                                    /* let the transport drain before the module emits this block */
+    return nr;
 }

@@ -5,14 +5,18 @@
 #include <errno.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 static void cmd_upload(const char *args)
 {
     char local[256] = "", remote[256] = "";
-    if (!args || sscanf(args, "%255s %255s", local, remote) < 2) {
-        fprintf(stderr, "usage: upload <local-path> <remote-path>\n");
+    int nargs = args ? sscanf(args, "%255s %255s", local, remote) : 0;
+    if (nargs < 1) {
+        fprintf(stderr, "usage: upload <local-path> [remote-path]\n");
         return;
     }
+    if (nargs < 2) strcpy(remote, ".");   /* cwd + basename, matching protobuf upload */
 
     FILE *fp = fopen(local, "rb");
     if (!fp) { fprintf(stderr, "cannot open %s: %s\n", local, strerror(errno)); return; }
@@ -24,6 +28,14 @@ static void cmd_upload(const char *args)
 
     char rpath[256];
     resolve_path(remote, rpath, sizeof(rpath));
+    /* Match normal copy semantics: a directory destination receives the local
+     * file's basename. stat covers an existing directory named without a
+     * trailing slash; otherwise dir_target preserves syntactic intent lost
+     * during path normalization (`.` -> cwd and a trailing slash is removed). */
+    struct stat dst_st;
+    bool existing_dir = stat(fat_path(rpath), &dst_st) == 0 &&
+                        S_ISDIR(dst_st.st_mode);
+    dir_target(local, existing_dir ? "." : remote, rpath, sizeof(rpath));
 
     FILE *out = fopen(fat_path(rpath), "wb");
     if (!out) {
@@ -37,13 +49,20 @@ static void cmd_upload(const char *args)
     while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) {
         if (fwrite(buf, 1, n, out) != n) { ok = false; break; }
         total += n;
+        /* Force FAT data + the current directory size to the device in bounded
+         * increments. Firmware can then retire the staged prefix instead of
+         * retaining one 520-byte staging node per sector for the whole file. */
+        if (fflush(out) != 0 || fsync(fileno(out)) != 0 || !fat_sync()) {
+            ok = false;
+            break;
+        }
     }
     fclose(fp);
     if (fclose(out) != 0) ok = false;
 
     if (!ok) { fprintf(stderr, "write failed\n"); return; }
 
-    fat_sync();
+    if (!fat_sync()) { fprintf(stderr, "upload was not committed\n"); return; }
     printf("%s -> %s (%zu bytes)\n", local, rpath, total);
 }
 
@@ -91,9 +110,7 @@ int proto_upload(const char *local_path, const char *remote_path)
 
     /* Drain any stale data once, up front; the window loop must not drain
      * again or it would eat the acks it depends on. */
-    ble_transport_process();
-    { char d[256]; while (ble_transport_read(d, sizeof(d)) > 0) {} }
-    proto_rx_len = 0;
+    proto_drain_quiet();
 
     while (acked < total && !error) {
         while (sent < total && inf_count < window) {
@@ -169,11 +186,10 @@ int proto_upload(const char *local_path, const char *remote_path)
     return error ? -1 : 0;
 }
 
-/* True if device `path` is a directory. Checks the PARENT listing for an entry named
- * `path`'s basename with is_dir set - a plain dir_list on `path` itself can't tell a
- * directory from a file or a missing path (it never errors, and flat ramfs lists its
- * whole root for any subpath), but the per-entry is_dir flag the device already sends
- * is reliable. */
+/* True if device `path` is a directory. Check the parent listing for an entry
+ * named `path`'s basename with is_dir set; this recognizes empty directories
+ * without walking the target directory itself. The device reports an error for
+ * a missing parent instead of treating it as a successful empty listing. */
 static bool proto_path_is_dir(const char *path)
 {
     const char *slash = strrchr(path, '/');

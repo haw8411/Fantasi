@@ -25,19 +25,19 @@ static char state_char(eTaskState s)
 static int cmd_ps(int argc, char **argv)
 {
     (void)argc; (void)argv;
-    TaskStatus_t st[16];
-    UBaseType_t n = uxTaskGetSystemState(st, sizeof(st) / sizeof(st[0]), NULL);
-    if (n == 0) { cli_write("ps: too many tasks to enumerate\r\n"); return 1; }
-
     cli_write("  PID  NAME          ST  PRI  STACKFREE\r\n");
+    TaskStatus_t st;
+    char name[configMAX_TASK_NAME_LEN];
     char line[80];
-    for (UBaseType_t i = 0; i < n; i++) {
+    UBaseType_t cursor = 0, n = 0;
+    while (xTaskGetNextSystemStateEntry(&cursor, &st, name) == pdTRUE) {
         snprintf(line, sizeof(line), "  %3u  %-12s  %c   %2u  %6u B\r\n",
-                 (unsigned)st[i].xTaskNumber, st[i].pcTaskName,
-                 state_char(st[i].eCurrentState),
-                 (unsigned)st[i].uxCurrentPriority,
-                 (unsigned)((uint32_t)st[i].usStackHighWaterMark * sizeof(StackType_t)));
+                 (unsigned)st.xTaskNumber, st.pcTaskName,
+                 state_char(st.eCurrentState),
+                 (unsigned)st.uxCurrentPriority,
+                 (unsigned)((uint32_t)st.usStackHighWaterMark * sizeof(StackType_t)));
         cli_write(line);
+        n++;
     }
     cli_printf("  %u tasks   heap: %u/%u B free (min-ever %u)\r\n",
                (unsigned)n, (unsigned)hal_free_heap_bytes(),

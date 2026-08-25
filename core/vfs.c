@@ -27,6 +27,9 @@ static char        s_ext_prefix[VFS_MAX_EXT][12];   /* "/mnt/extN" */
 static int         s_nmounts;
 static int         s_next_ext;
 static int         s_inited;
+/* Every LittleFS file operation below holds this same recursive store lock
+ * from open through close, so their per-open caches can share one buffer. */
+static uint8_t     s_file_cache[256];
 
 static void vfs_init_mounts(void)
 {
@@ -108,8 +111,8 @@ __attribute__((weak)) int vfs_fat_rename(int drv, const char *from, const char *
 { (void)drv; (void)from; (void)to; return -1; }
 __attribute__((weak)) int vfs_fat_statfs(int drv, uint32_t *total, uint32_t *freeb)
 { (void)drv; if (total) *total = 0; if (freeb) *freeb = 0; return -1; }
-__attribute__((weak)) void vfs_fat_list(int drv, const char *leaf, vfs_list_cb cb, void *ctx)
-{ (void)drv; (void)leaf; (void)cb; (void)ctx; }
+__attribute__((weak)) int vfs_fat_list(int drv, const char *leaf, vfs_list_cb cb, void *ctx)
+{ (void)drv; (void)leaf; (void)cb; (void)ctx; return -1; }
 
 const vfs_mount_t *vfs_resolve(const char *path, const char **leaf_out)
 {
@@ -193,8 +196,7 @@ int vfs_read_all(const char *path, const uint8_t **data, uint32_t *len, bool *ow
     lfs_t *lfs = vfs_mount_lfs(m);
     if (!lfs) return -1;
 
-    static uint8_t fcache[256];
-    struct lfs_file_config fcfg = { .buffer = fcache };
+    struct lfs_file_config fcfg = { .buffer = s_file_cache };
     lfs_file_t f;
     fatrd_store_lock();
     if (lfs_file_opencfg(lfs, &f, leaf, LFS_O_RDONLY, &fcfg) < 0) { fatrd_store_unlock(); return -1; }
@@ -219,6 +221,19 @@ void vfs_free(const uint8_t *data)
     if (data) vPortFree((void *)data);
 }
 
+int vfs_take_ramfs(const char *path, uint8_t **data, uint32_t *len)
+{
+#if HAS_RAMFS
+    const char *leaf;
+    const vfs_mount_t *m = vfs_resolve(path, &leaf);
+    if (m && m->kind == VFS_BK_RAMFS)
+        return ramfs_take(leaf, data, len);
+#else
+    (void)path; (void)data; (void)len;
+#endif
+    return -1;
+}
+
 int32_t vfs_pread(const char *path, uint32_t off, void *buf, uint32_t len)
 {
     const char *leaf;
@@ -232,8 +247,7 @@ int32_t vfs_pread(const char *path, uint32_t off, void *buf, uint32_t len)
         return vfs_fat_pread(m->fatdrv, leaf, off, buf, len);
     lfs_t *lfs = vfs_mount_lfs(m);
     if (!lfs) return -1;
-    static uint8_t fc[256];
-    struct lfs_file_config fcfg = { .buffer = fc };
+    struct lfs_file_config fcfg = { .buffer = s_file_cache };
     lfs_file_t f;
     fatrd_store_lock();
     if (lfs_file_opencfg(lfs, &f, leaf, LFS_O_RDONLY, &fcfg) < 0) { fatrd_store_unlock(); return -1; }
@@ -253,7 +267,8 @@ int32_t vfs_read_file(const char *path, void *buf, uint32_t max)
  * never before: a pre-commit bump lets a concurrent MSC read cache a model that
  * predates the write under the new generation, and that poisoned cache survives.
  * See the fuller note in proto.c handle_file_write. */
-int vfs_write_file(const char *path, const void *buf, uint32_t len)
+static int vfs_write_file_origin(const char *path, const void *buf, uint32_t len,
+                                 bool from_msc)
 {
     const char *leaf;
     const vfs_mount_t *m = vfs_resolve(path, &leaf);
@@ -269,8 +284,7 @@ int vfs_write_file(const char *path, const void *buf, uint32_t len)
     } else {
         lfs_t *lfs = vfs_mount_lfs(m);
         if (!lfs) return -1;
-        static uint8_t fc[256];
-        struct lfs_file_config fcfg = { .buffer = fc };
+        struct lfs_file_config fcfg = { .buffer = s_file_cache };
         lfs_file_t f;
         fatrd_store_lock();
         if (lfs_file_opencfg(lfs, &f, leaf,
@@ -280,9 +294,20 @@ int vfs_write_file(const char *path, const void *buf, uint32_t len)
         fatrd_store_unlock();
         rc = (n == (lfs_ssize_t)len && crc >= 0) ? 0 : -1;
     }
-    fatrd_invalidate();
+    if (from_msc) {
+        fatrd_invalidate_msc();
+    } else {
+        if (rc == 0) fatrd_external_forget(path);
+        fatrd_invalidate();
+    }
     return rc;
 }
+
+int vfs_write_file(const char *path, const void *buf, uint32_t len)
+{ return vfs_write_file_origin(path, buf, len, false); }
+
+int vfs_msc_write_file(const char *path, const void *buf, uint32_t len)
+{ return vfs_write_file_origin(path, buf, len, true); }
 
 /* Append `buf` to the end of `path` (created if absent). Lets a module stream a large log incrementally
  * without buffering it all - the whole-file write_file would truncate. */
@@ -304,8 +329,7 @@ int vfs_append(const char *path, const void *buf, uint32_t len)
     } else {
         lfs_t *lfs = vfs_mount_lfs(m);
         if (!lfs) return -1;
-        static uint8_t fc[256];
-        struct lfs_file_config fcfg = { .buffer = fc };
+        struct lfs_file_config fcfg = { .buffer = s_file_cache };
         lfs_file_t f;
         fatrd_store_lock();
         if (lfs_file_opencfg(lfs, &f, leaf,
@@ -315,6 +339,7 @@ int vfs_append(const char *path, const void *buf, uint32_t len)
         fatrd_store_unlock();
         rc = (n == (lfs_ssize_t)len && crc >= 0) ? 0 : -1;
     }
+    if (rc == 0) fatrd_external_forget(path);
     fatrd_invalidate();
     return rc;
 }
@@ -339,8 +364,7 @@ int vfs_pwrite(const char *path, uint32_t off, const void *buf, uint32_t len)
     } else {
         lfs_t *lfs = vfs_mount_lfs(m);
         if (!lfs) return -1;
-        static uint8_t fc[256];
-        struct lfs_file_config fcfg = { .buffer = fc };
+        struct lfs_file_config fcfg = { .buffer = s_file_cache };
         lfs_file_t f;
         fatrd_store_lock();
         if (lfs_file_opencfg(lfs, &f, leaf,
@@ -351,7 +375,93 @@ int vfs_pwrite(const char *path, uint32_t off, const void *buf, uint32_t len)
         fatrd_store_unlock();
         rc = (n == (lfs_ssize_t)len && crc >= 0) ? 0 : -1;
     }
+    if (rc == 0) fatrd_external_forget(path);
     fatrd_invalidate();
+    return rc;
+}
+
+int vfs_msc_write_chunks(const char *path, uint32_t off, uint32_t size,
+                         vfs_write_chunk_cb next, void *ctx)
+{
+    if (!next || off > size) return -1;
+
+    const char *leaf;
+    const vfs_mount_t *m = vfs_resolve(path, &leaf);
+    if (!m) return -1;
+    int rc = 0;
+
+#if HAS_RAMFS
+    if (m->kind == VFS_BK_RAMFS) {
+        /* Resize once so incremental sector writes do not repeatedly grow and
+         * copy the RAMFS allocation. A failed callback leaves a partial file,
+         * matching the failure semantics of the other write helpers. */
+        if (ramfs_resize(leaf, size) != 0) return -1;
+        for (uint32_t pos = off; pos < size;) {
+            const void *data = NULL;
+            uint32_t len = size - pos;
+            if (!next(ctx, pos, &data, &len) || !data || !len || len > size - pos ||
+                ramfs_write_at(leaf, pos, data, len) != 0) {
+                rc = -1;
+                break;
+            }
+            pos += len;
+        }
+    } else
+#endif
+    if (m->kind == VFS_BK_FAT) {
+        /* The first stream for a file starts at zero (FA_CREATE_ALWAYS in the
+         * backend); later streams append to the exact length committed by the
+         * preceding one. This keeps the primitive backend interface intact. */
+        for (uint32_t pos = off; pos < size;) {
+            const void *data = NULL;
+            uint32_t len = size - pos;
+            if (!next(ctx, pos, &data, &len) || !data || !len || len > size - pos ||
+                vfs_fat_wchunk(m->fatdrv, leaf, pos, data, len,
+                               pos + len == size) != 0) {
+                rc = -1;
+                break;
+            }
+            pos += len;
+        }
+    } else {
+        lfs_t *lfs = vfs_mount_lfs(m);
+        if (!lfs) return -1;
+
+        struct lfs_file_config fcfg = { .buffer = s_file_cache };
+        lfs_file_t f;
+        fatrd_store_lock();
+        if (lfs_file_opencfg(lfs, &f, leaf,
+                             LFS_O_WRONLY | LFS_O_CREAT, &fcfg) < 0) {
+            fatrd_store_unlock();
+            return -1;
+        }
+        /* Offset zero is replacement, not an in-place patch. Drop the prior
+         * tail before allocating new copy-on-write blocks; otherwise a nearly
+         * full LittleFS needs space for both the old large file and its new
+         * first checkpoint even when the replacement is much smaller. */
+        if (off == 0 && lfs_file_truncate(lfs, &f, 0) < 0) rc = -1;
+        if (off && lfs_file_seek(lfs, &f, off, LFS_SEEK_SET) < 0) rc = -1;
+
+        for (uint32_t pos = off; rc == 0 && pos < size;) {
+            const void *data = NULL;
+            uint32_t len = size - pos;
+            if (!next(ctx, pos, &data, &len) || !data || !len || len > size - pos) {
+                rc = -1;
+                break;
+            }
+            lfs_ssize_t n = lfs_file_write(lfs, &f, data, len);
+            if (n != (lfs_ssize_t)len) {
+                rc = -1;
+                break;
+            }
+            pos += len;
+        }
+        if (rc == 0 && lfs_file_truncate(lfs, &f, size) < 0) rc = -1;
+        if (lfs_file_close(lfs, &f) < 0) rc = -1;
+        fatrd_store_unlock();
+    }
+
+    fatrd_invalidate_msc();
     return rc;
 }
 
@@ -375,8 +485,7 @@ int vfs_truncate(const char *path, uint32_t size)
     } else {
         lfs_t *lfs = vfs_mount_lfs(m);
         if (!lfs) return -1;
-        static uint8_t fc[256];
-        struct lfs_file_config fcfg = { .buffer = fc };
+        struct lfs_file_config fcfg = { .buffer = s_file_cache };
         lfs_file_t f;
         fatrd_store_lock();
         if (lfs_file_opencfg(lfs, &f, leaf, LFS_O_WRONLY | LFS_O_CREAT, &fcfg) < 0) { fatrd_store_unlock(); return -1; }
@@ -385,6 +494,7 @@ int vfs_truncate(const char *path, uint32_t size)
         fatrd_store_unlock();
         rc = (trc >= 0 && crc >= 0) ? 0 : -1;
     }
+    if (rc == 0) fatrd_external_forget(path);
     fatrd_invalidate();
     return rc;
 }
@@ -410,7 +520,7 @@ int32_t vfs_size(const char *path)
     return (info.type == LFS_TYPE_REG) ? (int32_t)info.size : -1;
 }
 
-int vfs_remove(const char *path)
+static int vfs_remove_origin(const char *path, bool from_msc)
 {
     const char *leaf;
     const vfs_mount_t *m = vfs_resolve(path, &leaf);
@@ -428,11 +538,22 @@ int vfs_remove(const char *path)
         rc = lfs_remove(lfs, leaf) < 0 ? -1 : 0;   /* lfs_remove also drops empty dirs */
         fatrd_store_unlock();
     }
-    fatrd_invalidate();
+    if (from_msc) {
+        fatrd_invalidate_msc();
+    } else {
+        if (rc == 0) fatrd_external_forget(path);
+        fatrd_invalidate();
+    }
     return rc;
 }
 
-int vfs_mkdir(const char *path)
+int vfs_remove(const char *path)
+{ return vfs_remove_origin(path, false); }
+
+int vfs_msc_remove(const char *path)
+{ return vfs_remove_origin(path, true); }
+
+static int vfs_mkdir_origin(const char *path, bool from_msc)
 {
     /* /mnt is a synthetic container for the external mounts, not a real dir -
      * accept but never materialise it in the internal FS (it would then shadow
@@ -455,19 +576,33 @@ int vfs_mkdir(const char *path)
         fatrd_store_unlock();
         rc = (mrc == 0 || mrc == LFS_ERR_EXIST) ? 0 : -1;
     }
-    fatrd_invalidate();
+    if (from_msc) {
+        fatrd_invalidate_msc();
+    } else {
+        fatrd_invalidate();
+    }
     return rc;
 }
 
-int vfs_rename(const char *src, const char *dst)
+int vfs_mkdir(const char *path)
+{ return vfs_mkdir_origin(path, false); }
+
+int vfs_msc_mkdir(const char *path)
+{ return vfs_mkdir_origin(path, true); }
+
+static int vfs_rename_origin(const char *src, const char *dst, bool from_msc)
 {
     const char *sl, *dl;
     const vfs_mount_t *ms = vfs_resolve(src, &sl);
     const vfs_mount_t *md = vfs_resolve(dst, &dl);
     if (!ms || !md) return -1;
     if (ms != md) return VFS_ERR_XDEV;            /* different backends - caller copies */
-    if (ms->kind == VFS_BK_RAMFS) return ramfs_rename(sl, dl);
     int rc;
+#if HAS_RAMFS
+    if (ms->kind == VFS_BK_RAMFS) {
+        rc = ramfs_rename(sl, dl);
+    } else
+#endif
     if (ms->kind == VFS_BK_FAT) {
         rc = vfs_fat_rename(ms->fatdrv, sl, dl);
     } else {
@@ -477,9 +612,20 @@ int vfs_rename(const char *src, const char *dst)
         rc = lfs_rename(lfs, sl, dl) < 0 ? -1 : 0;
         fatrd_store_unlock();
     }
-    fatrd_invalidate();
+    if (from_msc) {
+        fatrd_invalidate_msc();
+    } else {
+        if (rc == 0) fatrd_external_rename(src, dst);
+        fatrd_invalidate();
+    }
     return rc;
 }
+
+int vfs_rename(const char *src, const char *dst)
+{ return vfs_rename_origin(src, dst, false); }
+
+int vfs_msc_rename(const char *src, const char *dst)
+{ return vfs_rename_origin(src, dst, true); }
 
 int vfs_mount_count(void)
 {
@@ -523,7 +669,7 @@ static void ramfs_list_adapt(const char *name, uint32_t size, void *vctx)
 }
 #endif
 
-void vfs_list(const char *path, vfs_list_cb cb, void *ctx)
+int vfs_list(const char *path, vfs_list_cb cb, void *ctx)
 {
     vfs_init_mounts();
 
@@ -532,46 +678,58 @@ void vfs_list(const char *path, vfs_list_cb cb, void *ctx)
         for (int i = 0; i < s_nmounts; i++)
             if (is_ext_mount(&s_mounts[i]))
                 cb(s_mounts[i].prefix + 5, 0, true, ctx);   /* "extN" (skip "/mnt/") */
-        return;
+        return 0;
     }
 
     const char *leaf;
     const vfs_mount_t *m = vfs_resolve(path, &leaf);
-    if (!m) return;
+    if (!m) return -1;
 #if HAS_RAMFS
     if (m->kind == VFS_BK_RAMFS) {
+        /* RAMFS is deliberately flat. Only the mount itself is a directory;
+         * a file or missing leaf must not masquerade as another view of root. */
+        if (leaf && leaf[0]) return -1;
         list_adapt_t a = { cb, ctx };
         ramfs_iterate(ramfs_list_adapt, &a);
-        return;
+        return 0;
     }
 #endif
     if (m->kind == VFS_BK_FAT) {
-        vfs_fat_list(m->fatdrv, leaf, cb, ctx);
-        return;
+        return vfs_fat_list(m->fatdrv, leaf, cb, ctx);
     }
     lfs_t *lfs = vfs_mount_lfs(m);
-    if (!lfs) return;
+    if (!lfs) return -1;
 
     /* /ramfs and /mnt are synthetic mounts, not real LittleFS entries, so they
      * never appear in the internal root read below. Inject them when listing the
      * root so every consumer (proto `ls`, the MSC view) sees them. */
     bool internal_root = (m->prefix[0] == '/' && m->prefix[1] == '\0') &&
                          path && (path[0] == '\0' || (path[0] == '/' && path[1] == '\0'));
-    if (internal_root) {
-#if HAS_RAMFS
-        cb(VFS_RAMFS_MOUNT + 1, 0, true, ctx);   /* "ramfs" */
-#endif
-        if (s_next_ext > 0)
-            cb(VFS_EXT_MOUNT + 1, 0, true, ctx);  /* "mnt" */
-    }
-
     lfs_dir_t dir;
     fatrd_store_lock();
-    if (lfs_dir_open(lfs, &dir, leaf) < 0) { fatrd_store_unlock(); return; }
+    if (lfs_dir_open(lfs, &dir, leaf) < 0) {
+        fatrd_store_unlock();
+        return -1;
+    }
+
+    if (internal_root) {
+#if HAS_RAMFS
+        fatrd_store_unlock();
+        cb(VFS_RAMFS_MOUNT + 1, 0, true, ctx);   /* "ramfs" */
+        fatrd_store_lock();
+#endif
+        if (s_next_ext > 0) {
+            fatrd_store_unlock();
+            cb(VFS_EXT_MOUNT + 1, 0, true, ctx);  /* "mnt" */
+            fatrd_store_lock();
+        }
+    }
+
     struct lfs_info info;
+    int rc = 0;
     for (;;) {
         int drc = lfs_dir_read(lfs, &dir, &info);
-        if (drc <= 0) break;
+        if (drc <= 0) { if (drc < 0) rc = -1; break; }
         if (info.name[0] == '.' && (info.name[1] == '\0' ||
             (info.name[1] == '.' && info.name[2] == '\0')))
             continue;
@@ -592,4 +750,5 @@ void vfs_list(const char *path, vfs_list_cb cb, void *ctx)
     }
     lfs_dir_close(lfs, &dir);
     fatrd_store_unlock();
+    return rc;
 }

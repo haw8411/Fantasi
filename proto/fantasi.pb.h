@@ -10,6 +10,10 @@
 #endif
 
 /* Struct definitions */
+typedef struct _CancelRequest {
+    uint32_t request_id;
+} CancelRequest;
+
 typedef PB_BYTES_ARRAY_T(512) FileWriteChunk_data_t;
 typedef struct _FileWriteChunk {
     char path[64];
@@ -60,6 +64,9 @@ typedef struct _CliResponse {
      host answers with FileWriteChunk(s) into /ramfs. id echoes the app_launch. */
         char module_request[32];
     } payload;
+    /* Echoes the logical session for multiplexing. Omitted for a legacy client. */
+    bool has_session;
+    uint32_t session;
 } CliResponse;
 
 typedef struct _FileDeleteRequest {
@@ -94,7 +101,20 @@ typedef struct _CliRequest {
         CliRequest_app_input_t app_input;
         bool app_stop;
         FileRenameRequest file_rename;
+        /* Session lifecycle/control. session_open has no session value; the device
+     allocates one and returns it in CliResponse.session. session_close uses
+     the envelope session above. cancel may bypass a blocked request in the
+     same session and targets that request's id. */
+        bool session_open;
+        bool session_close;
+        CancelRequest cancel;
+        bool session_ping;
     } payload;
+    /* Logical session on a multiplexed protobuf transport. A client opens a
+ session once, then includes the returned value on every request. Omitted
+ means the legacy, connection-wide serial session. */
+    bool has_session;
+    uint32_t session;
 } CliRequest;
 
 
@@ -103,8 +123,9 @@ extern "C" {
 #endif
 
 /* Initializer values for message structs */
-#define CliRequest_init_default                  {0, 0, {""}}
-#define CliResponse_init_default                 {0, 0, 0, {""}}
+#define CliRequest_init_default                  {0, 0, {""}, false, 0}
+#define CliResponse_init_default                 {0, 0, 0, {""}, false, 0}
+#define CancelRequest_init_default               {0}
 #define FileWriteChunk_init_default              {"", 0, {0, {0}}, 0, false, 0}
 #define FileReadRequest_init_default             {"", 0, 0}
 #define FileReadChunk_init_default               {0, {0, {0}}, 0}
@@ -114,8 +135,9 @@ extern "C" {
 #define FileDeleteRequest_init_default           {""}
 #define MkdirRequest_init_default                {""}
 #define FileRenameRequest_init_default           {"", ""}
-#define CliRequest_init_zero                     {0, 0, {""}}
-#define CliResponse_init_zero                    {0, 0, 0, {""}}
+#define CliRequest_init_zero                     {0, 0, {""}, false, 0}
+#define CliResponse_init_zero                    {0, 0, 0, {""}, false, 0}
+#define CancelRequest_init_zero                  {0}
 #define FileWriteChunk_init_zero                 {"", 0, {0, {0}}, 0, false, 0}
 #define FileReadRequest_init_zero                {"", 0, 0}
 #define FileReadChunk_init_zero                  {0, {0, {0}}, 0}
@@ -127,6 +149,7 @@ extern "C" {
 #define FileRenameRequest_init_zero              {"", ""}
 
 /* Field tags (for use in manual encoding/decoding) */
+#define CancelRequest_request_id_tag             1
 #define FileWriteChunk_path_tag                  1
 #define FileWriteChunk_offset_tag                2
 #define FileWriteChunk_data_tag                  3
@@ -150,6 +173,7 @@ extern "C" {
 #define CliResponse_error_tag                    5
 #define CliResponse_dir_entry_tag                6
 #define CliResponse_module_request_tag           7
+#define CliResponse_session_tag                  8
 #define FileDeleteRequest_path_tag               1
 #define MkdirRequest_path_tag                    1
 #define FileRenameRequest_src_tag                1
@@ -165,6 +189,11 @@ extern "C" {
 #define CliRequest_app_input_tag                 9
 #define CliRequest_app_stop_tag                  10
 #define CliRequest_file_rename_tag               11
+#define CliRequest_session_open_tag              13
+#define CliRequest_session_close_tag             14
+#define CliRequest_cancel_tag                    15
+#define CliRequest_session_ping_tag              16
+#define CliRequest_session_tag                   12
 
 /* Struct field encoding specification for nanopb */
 #define CliRequest_FIELDLIST(X, a) \
@@ -178,7 +207,12 @@ X(a, STATIC,   ONEOF,    MESSAGE,  (payload,mkdir,payload.mkdir),   7) \
 X(a, STATIC,   ONEOF,    STRING,   (payload,app_launch,payload.app_launch),   8) \
 X(a, STATIC,   ONEOF,    BYTES,    (payload,app_input,payload.app_input),   9) \
 X(a, STATIC,   ONEOF,    BOOL,     (payload,app_stop,payload.app_stop),  10) \
-X(a, STATIC,   ONEOF,    MESSAGE,  (payload,file_rename,payload.file_rename),  11)
+X(a, STATIC,   ONEOF,    MESSAGE,  (payload,file_rename,payload.file_rename),  11) \
+X(a, STATIC,   OPTIONAL, UINT32,   session,          12) \
+X(a, STATIC,   ONEOF,    BOOL,     (payload,session_open,payload.session_open),  13) \
+X(a, STATIC,   ONEOF,    BOOL,     (payload,session_close,payload.session_close),  14) \
+X(a, STATIC,   ONEOF,    MESSAGE,  (payload,cancel,payload.cancel),  15) \
+X(a, STATIC,   ONEOF,    BOOL,     (payload,session_ping,payload.session_ping),  16)
 #define CliRequest_CALLBACK NULL
 #define CliRequest_DEFAULT NULL
 #define CliRequest_payload_file_write_MSGTYPE FileWriteChunk
@@ -187,6 +221,7 @@ X(a, STATIC,   ONEOF,    MESSAGE,  (payload,file_rename,payload.file_rename),  1
 #define CliRequest_payload_file_delete_MSGTYPE FileDeleteRequest
 #define CliRequest_payload_mkdir_MSGTYPE MkdirRequest
 #define CliRequest_payload_file_rename_MSGTYPE FileRenameRequest
+#define CliRequest_payload_cancel_MSGTYPE CancelRequest
 
 #define CliResponse_FIELDLIST(X, a) \
 X(a, STATIC,   REQUIRED, UINT32,   id,                1) \
@@ -195,12 +230,18 @@ X(a, STATIC,   ONEOF,    STRING,   (payload,output,payload.output),   3) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (payload,file_data,payload.file_data),   4) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (payload,error,payload.error),   5) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (payload,dir_entry,payload.dir_entry),   6) \
-X(a, STATIC,   ONEOF,    STRING,   (payload,module_request,payload.module_request),   7)
+X(a, STATIC,   ONEOF,    STRING,   (payload,module_request,payload.module_request),   7) \
+X(a, STATIC,   OPTIONAL, UINT32,   session,           8)
 #define CliResponse_CALLBACK NULL
 #define CliResponse_DEFAULT NULL
 #define CliResponse_payload_file_data_MSGTYPE FileReadChunk
 #define CliResponse_payload_error_MSGTYPE ErrorResponse
 #define CliResponse_payload_dir_entry_MSGTYPE DirEntry
+
+#define CancelRequest_FIELDLIST(X, a) \
+X(a, STATIC,   REQUIRED, UINT32,   request_id,        1)
+#define CancelRequest_CALLBACK NULL
+#define CancelRequest_DEFAULT NULL
 
 #define FileWriteChunk_FIELDLIST(X, a) \
 X(a, STATIC,   REQUIRED, STRING,   path,              1) \
@@ -260,6 +301,7 @@ X(a, STATIC,   REQUIRED, STRING,   dst,               2)
 
 extern const pb_msgdesc_t CliRequest_msg;
 extern const pb_msgdesc_t CliResponse_msg;
+extern const pb_msgdesc_t CancelRequest_msg;
 extern const pb_msgdesc_t FileWriteChunk_msg;
 extern const pb_msgdesc_t FileReadRequest_msg;
 extern const pb_msgdesc_t FileReadChunk_msg;
@@ -273,6 +315,7 @@ extern const pb_msgdesc_t FileRenameRequest_msg;
 /* Defines for backwards compatibility with code written before nanopb-0.4.0 */
 #define CliRequest_fields &CliRequest_msg
 #define CliResponse_fields &CliResponse_msg
+#define CancelRequest_fields &CancelRequest_msg
 #define FileWriteChunk_fields &FileWriteChunk_msg
 #define FileReadRequest_fields &FileReadRequest_msg
 #define FileReadChunk_fields &FileReadChunk_msg
@@ -284,8 +327,9 @@ extern const pb_msgdesc_t FileRenameRequest_msg;
 #define FileRenameRequest_fields &FileRenameRequest_msg
 
 /* Maximum encoded size of messages (where known) */
-#define CliRequest_size                          603
-#define CliResponse_size                         534
+#define CancelRequest_size                       6
+#define CliRequest_size                          609
+#define CliResponse_size                         540
 #define DirEntry_size                            73
 #define DirListRequest_size                      65
 #define ErrorResponse_size                       65

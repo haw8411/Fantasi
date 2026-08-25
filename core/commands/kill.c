@@ -10,6 +10,7 @@
 #include "../cli.h"
 #include "../app_run.h"
 
+#include <limits.h>
 #include <stdlib.h>
 
 static int cmd_kill(int argc, char **argv)
@@ -20,7 +21,13 @@ static int cmd_kill(int argc, char **argv)
         return 1;
     }
     if (argc >= 2) {
-        int pid = atoi(argv[1]);
+        char *end = NULL;
+        long parsed = strtol(argv[1], &end, 10);
+        if (!argv[1][0] || !end || *end || parsed < 0 || parsed > INT_MAX) {
+            cli_write("kill: expected the numeric app pid shown by ps\r\n");
+            return 1;
+        }
+        int pid = (int)parsed;
         if (pid != app_pid) {
             cli_printf("kill: pid %d is not the running app (pid %d); "
                        "only the app is killable (see ps)\r\n", pid, app_pid);

@@ -63,7 +63,10 @@ static void ble_set_enabled(bool on)
 {
     if (on) {
         if (!hal_ble_is_active()) {
-            hal_ble_pair_setup(HAL_BLE_IO_DISPLAY_ONLY);
+            if (hal_ble_pair_setup(HAL_BLE_IO_DISPLAY_ONLY) != 0) {
+                cli_write("ble on failed\r\n");
+                return;
+            }
             cli_write("ble on\r\n");
         } else {
             cli_write("ble already on\r\n");

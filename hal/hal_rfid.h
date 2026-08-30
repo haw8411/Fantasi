@@ -124,6 +124,21 @@ int hal_rfid_hf_emu_send_stream(uint8_t (*next)(void *ctx), void *ctx, int nsymb
  * the whole reply (iso14a_tag_encode buffer) and passes it here, never pointer-cached. Used by the module only
  * when hf_emu_send_stream returns <0. Weak-defaults to unsupported. */
 int hal_rfid_hf_emu_send_stream_buf(const uint8_t *tosend, int len);
+/* Incremental receive variant. The data callback runs in caller task context;
+ * bits identifies a seven-bit prefix or a complete byte. A standard frame
+ * reports index zero twice (first at seven bits, then as the complete byte).
+ * Data remains tentative until the function returns a positive frame length.
+ * The callback may stage a deferred reply with an emulation-send function but
+ * must not block or call other RFID HAL functions. */
+int hal_rfid_hf_emu_recv_progress(uint8_t *rx, uint8_t *rx_par, int cap, uint32_t timeout_ms,
+                                  void (*data_ready)(void *ctx, int index, uint8_t raw, int bits), void *ctx);
+/* Optionally prepare a static encoded reply before a receive/reply window. */
+int hal_rfid_hf_emu_prepare(const uint8_t *tosend, int len);
+/* Stage a streamed reply from an incremental-receive callback, committing it
+ * only when the completed frame exactly matches request. */
+int hal_rfid_hf_emu_send_stream_match(uint8_t (*next)(void *ctx), void *ctx, int nsymbols,
+                                      const uint8_t *request, int request_len, int request_min_len,
+                                      int *result);
 
 /* ---- HF sniffer (passive listen; hardware-specific, weak-defaults to unsupported) ----
  * Passively capture a live 13.56 MHz reader<->card exchange without generating a field

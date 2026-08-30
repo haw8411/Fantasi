@@ -44,6 +44,7 @@ static uint8_t  s_crash_note;
 static volatile bool s_vbus = true;      /* conservative until first I2C read */
 static volatile bool s_deep_ok;
 static bool          s_deep_enabled;     /* off unless settings deepsleep=1 */
+static volatile bool s_tickless_blocked;
 
 void hal_crash_note(uint8_t code)
 {
@@ -481,6 +482,7 @@ static void light_suppress(TickType_t xExpectedIdleTime)
 
 void vPortSuppressTicksAndSleep(TickType_t xExpectedIdleTime)
 {
+    if (s_tickless_blocked) return;
     if (xTaskGetTickCount() < pdMS_TO_TICKS(PWR_BOOT_GRACE_MS)) return;
 
     /* A live BLE link does not force light sleep: CPU2 maintains the radio link
@@ -516,6 +518,11 @@ void vPortSuppressTicksAndSleep(TickType_t xExpectedIdleTime)
         pwr_note_deep_sleep(stepped);
     }
     __enable_irq();
+}
+
+void fz_power_tickless_block(bool block)
+{
+    s_tickless_blocked = block;
 }
 
 /* ---- Init ---- */

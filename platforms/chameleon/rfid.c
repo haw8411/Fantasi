@@ -445,6 +445,40 @@ static int lf_sample(int16_t *raw, int nsamp)
 /* HF tag-emulation state (defined with the NFCT emulation block below; declared here for set_mode). */
 static int s_emu_armed;
 static int s_emu_active;
+static bool s_emu_hfclk;
+static TaskHandle_t s_emu_hot_task;
+static UBaseType_t s_emu_hot_prio;
+
+static void emu_hot_enter(void)
+{
+    if (s_emu_hot_task) return;
+    s_emu_hot_task = xTaskGetCurrentTaskHandle();
+    s_emu_hot_prio = uxTaskPriorityGet(NULL);
+    if (s_emu_hot_prio < configMAX_PRIORITIES - 1)
+        vTaskPrioritySet(NULL, configMAX_PRIORITIES - 1);
+}
+
+static void emu_hot_leave(void)
+{
+    if (!s_emu_hot_task) return;
+    if (xTaskGetCurrentTaskHandle() == s_emu_hot_task &&
+        uxTaskPriorityGet(NULL) != s_emu_hot_prio)
+        vTaskPrioritySet(NULL, s_emu_hot_prio);
+    s_emu_hot_task = NULL;
+}
+
+static void emu_stop(void)
+{
+    emu_hot_leave();
+    NRF_NFCT->SHORTS &= ~NFCT_SHORTS_TXFRAMEEND_ENABLERXDATA_Msk;
+    NRF_NFCT->TASKS_DISABLE = 1;
+    s_emu_armed = 0;
+    s_emu_active = 0;
+    if (s_emu_hfclk) {
+        cu_hfclk_release();
+        s_emu_hfclk = false;
+    }
+}
 
 /* ---- HAL contract ---- */
 
@@ -458,6 +492,7 @@ uint32_t hal_rfid_caps(void)
 int hal_rfid_set_mode(rfid_mode_t mode)
 {
     if (mode == s_mode) return 0;
+    if (s_mode == RFID_HF_EMU) emu_stop();
 
     switch (mode) {
     case RFID_HF_READER:
@@ -487,13 +522,12 @@ int hal_rfid_set_mode(rfid_mode_t mode)
          * put the reader frontend away so it cannot drive the antenna. Auto-collision-resolution is disabled
          * so every frame reaches software - the module owns anticollision (it answers ATQA/UID/SAK itself)
          * and, more importantly, MIFARE auth frames must not be answered by hardware. */
+        if (!cu_hfclk_request()) return -1;
+        s_emu_hfclk = true;
         reg_clear(TxControlReg, 0x03);            /* make sure the reader field is off before switching */
         spi_deinit();
         pin_out(PIN_RDR_POWER, 0);
         pin_out(PIN_HF_ANTSEL, 1);                /* shared antenna -> NFCT */
-        NRF_CLOCK->EVENTS_HFCLKSTARTED = 0;       /* NFCT needs the crystal, not the internal RC */
-        NRF_CLOCK->TASKS_HFCLKSTART = 1;
-        for (uint32_t g = 0; g < 200000 && !NRF_CLOCK->EVENTS_HFCLKSTARTED; g++) { }
         NRF_NFCT->FRAMEDELAYMODE = 3;             /* WindowGrid: HW places the reply on the 14443-A timing grid */
         NRF_NFCT->FRAMEDELAYMAX  = 0xFFFF;
         NRF_NFCT->SENSRES = (NRF_NFCT->SENSRES & ~NFCT_SENSRES_BITFRAMESDD_Msk)
@@ -504,7 +538,9 @@ int hal_rfid_set_mode(rfid_mode_t mode)
         NRF_NFCT->EVENTS_RXFRAMESTART  = 0;
         NRF_NFCT->EVENTS_RXFRAMEEND    = 0;
         NRF_NFCT->EVENTS_RXERROR       = 0;
+        NRF_NFCT->EVENTS_STARTED       = 0;
         NRF_NFCT->EVENTS_TXFRAMEEND    = 0;
+        NRF_NFCT->SHORTS &= ~NFCT_SHORTS_TXFRAMEEND_ENABLERXDATA_Msk;
         NRF_NFCT->ERRORSTATUS = 0xFFFFFFFFUL;
         NRF_NFCT->TASKS_SENSE = 1;
         s_emu_armed = 0;
@@ -580,8 +616,6 @@ static uint8_t s_nfc_rx[261] __attribute__((aligned(4)));
  * Leaving NFCT's automatic PARITY off is what makes MIFARE work at all: Crypto1 ENCRYPTS the parity bits, so
  * they do not follow the odd-parity rule and hardware-generated parity would be wrong on every encrypted
  * response. The module already produced the right (encrypted) parity symbols; we just pass them through. */
-static inline void spin_us(uint32_t us);   /* defined with the LF block below */
-
 #define EMU_SEC_D 0xF0     /* logic 1 - subcarrier in the first half-bit  */
 #define EMU_SEC_F 0x00     /* stop bit / no modulation                    */
 
@@ -591,7 +625,7 @@ static uint8_t s_nfc_tx[64] __attribute__((aligned(4)));
 
 /* Arm EasyDMA for one reader frame. NoParity RX (FRAMECONFIG bit0 = 0) hands us the raw 9-bits-per-byte
  * stream so nfct_unwrap can recover the reader's parity bits too. */
-static void emu_arm_rx(void)
+static void emu_prepare_rx(void)
 {
     /* SOF expected (bit 2) so the HW consumes the start-of-frame symbol; PARITY off (bit 0) so the reader's
      * parity bits stay in the stream for nfct_unwrap. Clearing SOF instead makes NFCT hand the start bit over
@@ -599,21 +633,50 @@ static void emu_arm_rx(void)
     NRF_NFCT->RXD.FRAMECONFIG = NFCT_RXD_FRAMECONFIG_SOF_Msk;
     NRF_NFCT->PACKETPTR = (uint32_t)(uintptr_t)s_nfc_rx;
     NRF_NFCT->MAXLEN = sizeof s_nfc_rx;
+    NRF_NFCT->EVENTS_RXFRAMESTART = 0;
     NRF_NFCT->EVENTS_RXFRAMEEND = 0;
     NRF_NFCT->EVENTS_RXERROR    = 0;
-    NRF_NFCT->TASKS_ENABLERXDATA = 1;
     s_emu_armed = 1;
 }
 
-/* Pack a symbol run into s_nfc_tx and fire it. `skip` is how many leading symbols to drop before the data:
- * a frame built by iso14a_tag_encode carries a correction template and a start bit (2), while the streaming
- * Crypto1 source emits only a start bit (1). Both are PM3 artefacts - the template exists to pick the 1236
- * vs 1172 FDT there, and NFCT's SOF supplies the start bit - so neither belongs on the wire here. Returns
- * bits sent, or <0. */
-static int emu_tx_bits(const uint8_t *sym, int n, int skip)
+static void emu_arm_rx(void)
+{
+    emu_prepare_rx();
+    NRF_NFCT->TASKS_ENABLERXDATA = 1;
+}
+
+/* Once STARTED captures the TX descriptor, PACKETPTR can describe the next RX.
+ * Let hardware re-arm at the final transmitted symbol so SoftDevice activity
+ * cannot make us miss a reader frame at the minimum turnaround. */
+static bool emu_rearm_at_tx_end(void)
+{
+    for (uint32_t g = 0; !NRF_NFCT->EVENTS_STARTED && g < 200000; g++) { }
+    if (!NRF_NFCT->EVENTS_STARTED) return false;
+    NRF_NFCT->EVENTS_STARTED = 0;
+    emu_prepare_rx();
+    NRF_NFCT->SHORTS |= NFCT_SHORTS_TXFRAMEEND_ENABLERXDATA_Msk;
+    return true;
+}
+
+static void emu_finish_tx(bool hw_rearm)
+{
+    for (uint32_t g = 0; !NRF_NFCT->EVENTS_TXFRAMEEND && g < 2000000; g++) { }
+    bool tx_done = NRF_NFCT->EVENTS_TXFRAMEEND != 0;
+    NRF_NFCT->EVENTS_TXFRAMEEND = 0;
+    NRF_NFCT->SHORTS &= ~NFCT_SHORTS_TXFRAMEEND_ENABLERXDATA_Msk;
+    if (!hw_rearm || !tx_done) {
+        s_emu_armed = 0;
+        emu_arm_rx();
+    }
+}
+
+/* Pack an iso14a_tag_encode symbol run into s_nfc_tx and fire it. The first two
+ * symbols are the PM3 timing template and start bit; NFCT supplies its own SOF.
+ * Returns the number of bits sent, or <0. */
+static int emu_tx_bits(const uint8_t *sym, int n)
 {
     int nbits = 0;
-    for (int i = skip; i < n && nbits < (int)sizeof s_nfc_tx * 8; i++) {
+    for (int i = 2; i < n && nbits < (int)sizeof s_nfc_tx * 8; i++) {
         if (sym[i] == EMU_SEC_F) break;            /* stop bit ends the frame */
         if (sym[i] == EMU_SEC_D) s_nfc_tx[nbits >> 3] |=  (uint8_t)(1u << (nbits & 7));
         else                     s_nfc_tx[nbits >> 3] &= (uint8_t)~(1u << (nbits & 7));
@@ -626,21 +689,17 @@ static int emu_tx_bits(const uint8_t *sym, int n, int skip)
     NRF_NFCT->TXD.AMOUNT = (uint32_t)nbits;
     NRF_NFCT->TXD.FRAMECONFIG = NFCT_TXD_FRAMECONFIG_SOF_Msk;   /* SOF only: parity is already in the stream */
     NRF_NFCT->FRAMEDELAYMODE = 3;                  /* WindowGrid - HW lands the reply on the 14443-A grid */
+    NRF_NFCT->EVENTS_STARTED = 0;
     NRF_NFCT->EVENTS_TXFRAMEEND = 0;
     NRF_NFCT->TASKS_STARTTX = 1;
 
-    for (uint32_t g = 0; !NRF_NFCT->EVENTS_TXFRAMEEND && g < 2000000; g++) { }  /* never hang on a missed TX */
-    NRF_NFCT->EVENTS_TXFRAMEEND = 0;
-    /* Let the modulation settle before re-arming, else the tail of our own reply is captured as a bogus
-     * reader frame (seen as a full-length RXD.AMOUNT of 4095). */
-    spin_us(60);
-    NRF_NFCT->ERRORSTATUS = 0xFFFFFFFFUL;
-    emu_arm_rx();                                  /* the reader's next command follows immediately */
+    emu_finish_tx(emu_rearm_at_tx_end());
     return nbits;
 }
 
 int hal_rfid_hf_emu_recv(uint8_t *rx, uint8_t *rx_par, int cap, uint32_t timeout_ms)
 {
+    emu_hot_leave();
     if (s_mode != RFID_HF_EMU || !rx || cap <= 0) return RFID_ERR_UNSUPP;
     TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms ? timeout_ms : 100);
 
@@ -656,20 +715,35 @@ int hal_rfid_hf_emu_recv(uint8_t *rx, uint8_t *rx_par, int cap, uint32_t timeout
             NRF_NFCT->EVENTS_FIELDLOST = 0;
             NRF_NFCT->TASKS_SENSE = 1;
             s_emu_active = 0; s_emu_armed = 0;
+            emu_hot_leave();
         }
         if (s_emu_active && !s_emu_armed) emu_arm_rx();
 
+        if (NRF_NFCT->EVENTS_RXFRAMESTART) {
+            NRF_NFCT->EVENTS_RXFRAMESTART = 0;
+            NRF_NFCT->EVENTS_STARTED = 0;          /* next STARTED belongs to the reply's TX descriptor */
+            NRF_NFCT->ERRORSTATUS = 0xFFFFFFFFUL;
+            emu_hot_enter();
+        }
         if (NRF_NFCT->EVENTS_RXERROR) {            /* framing/parity glitch: requeue, the reader will retry */
             NRF_NFCT->EVENTS_RXERROR = 0;
             NRF_NFCT->ERRORSTATUS = 0xFFFFFFFFUL;
             s_emu_armed = 0;
+            emu_hot_leave();
             continue;
         }
         if (NRF_NFCT->EVENTS_RXFRAMEEND) {
             NRF_NFCT->EVENTS_RXFRAMEEND = 0;
+            if (NRF_NFCT->EVENTS_STARTED) {        /* short-frame fallback when polling missed RXFRAMESTART */
+                NRF_NFCT->EVENTS_STARTED = 0;
+                NRF_NFCT->ERRORSTATUS = 0xFFFFFFFFUL;
+            }
             s_emu_armed = 0;
             int bits = (int)(NRF_NFCT->RXD.AMOUNT & 0xFFF);
-            if (bits >= 0xFFF) { continue; }       /* saturated count = not a real reader frame */
+            if (bits >= 0xFFF) {                   /* saturated count = not a real reader frame */
+                emu_hot_leave();
+                continue;
+            }
             uint32_t par = 0;
             int n = nfct_unwrap(s_nfc_rx, bits, rx, &par, cap);
             /* rx_par[i] = the parity bit RECEIVED for byte i (nfct_unwrap flags violations of odd parity;
@@ -677,67 +751,36 @@ int hal_rfid_hf_emu_recv(uint8_t *rx, uint8_t *rx_par, int cap, uint32_t timeout
             if (rx_par)
                 for (int i = 0; i < n; i++)
                     rx_par[i] = (uint8_t)(((par >> i) & 1) ? !!__builtin_parity(rx[i]) : !__builtin_parity(rx[i]));
-            if (n > 0) return n;
+            if (n > 0) {
+                emu_hot_enter();                   /* fallback when a short frame hid RXFRAMESTART from polling */
+                return n;
+            }
+            emu_hot_leave();
             continue;
         }
-        if (xTaskGetTickCount() > deadline) return 0;
+        if (xTaskGetTickCount() > deadline) {
+            emu_hot_leave();
+            return 0;
+        }
     }
 }
 
 int hal_rfid_hf_emu_send(const uint8_t *tosend, int len)
 {
-    if (s_mode != RFID_HF_EMU || !tosend || len <= 1) return RFID_ERR_UNSUPP;
-    return emu_tx_bits(tosend, len, 2) < 0 ? RFID_ERR_UNSUPP : 0;   /* template + start bit */
+    if (s_mode != RFID_HF_EMU || !tosend || len <= 1) {
+        emu_hot_leave();
+        return RFID_ERR_UNSUPP;
+    }
+    int rc = emu_tx_bits(tosend, len) < 0 ? RFID_ERR_UNSUPP : 0;
+    emu_hot_leave();
+    return rc;
 }
 
-int hal_rfid_hf_emu_send_stream(uint8_t (*next)(void *ctx), void *ctx, int nsymbols)
+/* Keep the callback stream unsupported: NFCT EasyDMA may fetch ahead, so its
+ * buffer must be complete before STARTTX. The module uses this buffer fallback. */
+int hal_rfid_hf_emu_send_stream_buf(const uint8_t *tosend, int len)
 {
-    if (s_mode != RFID_HF_EMU || !next || nsymbols <= 3) return RFID_ERR_UNSUPP;
-
-    /* Protocol-agnostic: `next` yields one ISO14443-A tag symbol per call (EMU_SEC_D/E for a logic 1/0), and
-     * this streams them to air. What the symbols are - a Crypto1-encrypted MIFARE reply today, some future
-     * ISO14443-4 frame tomorrow - lives entirely in the caller's producer; the HAL never decodes it. The
-     * frame is start-bit + (nsymbols-2) data/parity symbols + stop-bit (the ISO14443-A tag framing every HF
-     * card protocol shares), and each middle symbol is one air bit.
-     *
-     * The optimisation is generic too, which is why it belongs here and not in any protocol module: overlap
-     * the producer with transmission, the NFCT analog of the PM3's paced FPGA feed. Pulling every symbol
-     * before STARTTX would put the producer's whole cost into the FDT (~400 us for an 18-byte reply when the
-     * producer is a per-symbol software cipher). Instead pull a head, fire STARTTX, then pull the tail while
-     * EasyDMA drains the buffer: WindowGrid delays the first symbol to FRAMEDELAYMIN (~85 us) after STARTTX
-     * and the 9.4 us/bit air rate outpaces any reasonable producer, so a small lead stays ahead to the last
-     * bit. Any streamed tag reply benefits, whatever produced it. */
-    int nbits = nsymbols - 2;
-    if (nbits <= 0 || nbits > (int)sizeof s_nfc_tx * 8) return RFID_ERR_UNSUPP;
-
-    (void)next(ctx);                                 /* consume the start bit - NFCT's SOF supplies it */
-    int head = nbits < 16 ? nbits : 16;              /* 2-byte lead: EasyDMA prefetches ~2 bytes at STARTTX, so 1 byte underruns */
-    int p = 0;
-    for (; p < head; p++) {
-        if (next(ctx) == EMU_SEC_D) s_nfc_tx[p >> 3] |=  (uint8_t)(1u << (p & 7));
-        else                        s_nfc_tx[p >> 3] &= (uint8_t)~(1u << (p & 7));
-    }
-
-    NRF_NFCT->PACKETPTR = (uint32_t)(uintptr_t)s_nfc_tx;
-    NRF_NFCT->TXD.AMOUNT = (uint32_t)nbits;           /* BYTES<<3|BITS; DiscardEnd drops the last byte's unused
-                                                       * high bits (LSB-first safe) */
-    NRF_NFCT->TXD.FRAMECONFIG = NFCT_TXD_FRAMECONFIG_SOF_Msk;   /* SOF only: parity comes from the producer's
-                                                                * symbols, not HW (it may not be plain odd parity) */
-    NRF_NFCT->FRAMEDELAYMODE = 3;
-    NRF_NFCT->EVENTS_TXFRAMEEND = 0;
-    NRF_NFCT->TASKS_STARTTX = 1;
-
-    for (; p < nbits; p++) {                          /* pull the tail while the head is already on air */
-        if (next(ctx) == EMU_SEC_D) s_nfc_tx[p >> 3] |=  (uint8_t)(1u << (p & 7));
-        else                        s_nfc_tx[p >> 3] &= (uint8_t)~(1u << (p & 7));
-    }
-
-    for (uint32_t g = 0; !NRF_NFCT->EVENTS_TXFRAMEEND && g < 2000000; g++) { }
-    NRF_NFCT->EVENTS_TXFRAMEEND = 0;
-    spin_us(60);
-    NRF_NFCT->ERRORSTATUS = 0xFFFFFFFFUL;
-    emu_arm_rx();
-    return 0;
+    return hal_rfid_hf_emu_send(tosend, len);
 }
 
 /* ---- Passive dual-receiver HF sniff (see the rfid-chameleon-sniff design) ----
@@ -1080,30 +1123,6 @@ int hal_rfid_hf_transceive_par(const uint8_t *tx, int nbytes, const uint8_t *par
 #define LF_T55_SKIP        150   /* EM4100 path: lead-in excluded from its band estimate + demod */
 #define T55_HB             32     /* half-bit width in carrier cycles = samples (RF/64: 32/half-bit) */
 
-/* us busy-delay off a free-running 1 MHz TIMER1 (1 tick = 1 us). Not the Cortex-M4 DWT cycle counter: on the
- * nRF52 CYCCNT does not run unless a debugger is attached, so a DWT busy-wait spins forever (and here it runs
- * IRQs-off, so that hard-hangs the device). The TIMER counts in hardware regardless. Started in lf_hw_init. */
-static int s_spin_ready = 0;
-static void spin_timer_init(void)
-{
-    NRF_TIMER1->TASKS_STOP  = 1;
-    NRF_TIMER1->MODE        = TIMER_MODE_MODE_Timer;
-    NRF_TIMER1->BITMODE     = TIMER_BITMODE_BITMODE_32Bit;
-    NRF_TIMER1->PRESCALER   = 4;                  /* 16 MHz / 2^4 = 1 MHz -> 1 us/tick */
-    NRF_TIMER1->TASKS_CLEAR = 1;
-    NRF_TIMER1->TASKS_START = 1;
-    s_spin_ready = 1;
-}
-static inline void spin_us(uint32_t us)
-{
-    if (!s_spin_ready) spin_timer_init();          /* free-runs thereafter; never re-stopped */
-    NRF_TIMER1->TASKS_CAPTURE[0] = 1;
-    uint32_t start = NRF_TIMER1->CC[0], guard = 0;
-    do {
-        NRF_TIMER1->TASKS_CAPTURE[0] = 1;
-        if (++guard > 4000000) break;              /* never hang if TIMER1 is dead */
-    } while ((NRF_TIMER1->CC[0] - start) < us);
-}
 /* Emit the complete downlink from PWM EasyDMA, one compare value per carrier period. CPU busy-delays and live
  * writes to a sequence that EasyDMA is reading are both vulnerable to SoftDevice timing, whereas this array
  * fixes every on/gap interval in hardware. The final ON value is held after SEQEND1; that same event clears

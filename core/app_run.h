@@ -84,6 +84,11 @@ int      app_running_pid(void);
  * sleep-governance/idle path may use. */
 bool     app_is_running(void);
 
+/* Extend the app callback gate to optional API tables implemented outside
+ * app_run.c. The returned token is opaque and may be NULL when no app runs. */
+void    *app_api_gate_enter(void);
+void     app_api_gate_leave(void *token);
+
 /* App launch shortcuts (slots 0-7, persisted as scN=<path> in settings.cfg).
  * Used by the Flipper Shortcuts menu, the `shortcut` command, and the screenless
  * LED+button launchers. shortcut_get fills buf and returns its length (0 if the

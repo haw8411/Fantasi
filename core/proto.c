@@ -103,8 +103,12 @@ typedef struct {
 static fantasi_proto_session_t *s_sessions;
 static SemaphoreHandle_t s_sessions_lock;
 static SemaphoreHandle_t s_response_lock;
-static CliRequest s_probe_request;
-static CliResponse s_response;
+static union {
+    CliRequest request;
+    CliResponse response;
+} s_codec;
+#define s_probe_request s_codec.request
+#define s_response      s_codec.response
 static uint32_t s_next_session;
 
 /* One async application is supported by app_run itself. Retaining the owning

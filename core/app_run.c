@@ -60,6 +60,33 @@ static app_ctx_t *g_app;
  * launcher also owns this image as part of forced teardown. */
 static app_image_t s_module_img;
 
+/* Forced teardown must not delete the app while it owns a mutex reached through
+ * the API. Reuse the allocation-list mutex as a recursive call gate: teardown
+ * takes it before suspending the task, so an in-flight callback can finish but
+ * the app cannot enter another one. */
+static app_ctx_t *app_api_enter(void)
+{
+    app_ctx_t *a = g_app;
+    if (!a || !a->alloc_lock) return NULL;
+    if (xSemaphoreTakeRecursive(a->alloc_lock, portMAX_DELAY) != pdTRUE) return NULL;
+    return a;
+}
+
+static void app_api_leave(app_ctx_t *a)
+{
+    if (a) xSemaphoreGiveRecursive(a->alloc_lock);
+}
+
+void *app_api_gate_enter(void)
+{
+    return app_api_enter();
+}
+
+void app_api_gate_leave(void *token)
+{
+    app_api_leave((app_ctx_t *)token);
+}
+
 /* Cross-channel kill: the `kill` command (running on a different CLI/proto task
  * than the one streaming the app) requests termination by setting a flag; the
  * launching session's loop sees it and does the single-owner teardown. Only the
@@ -121,6 +148,15 @@ __attribute__((weak)) int hal_hid_enable(int on) { (void)on; return -1; }
 __attribute__((weak)) int hal_hid_send(uint8_t modifiers, const uint8_t *keys, uint8_t n) { (void)modifiers; (void)keys; (void)n; return -1; }
 __attribute__((weak)) uint32_t hal_hid_host(void) { return 0; }
 
+static bool app_try_suspend_task(app_ctx_t *a)
+{
+    if (!a || !a->task) return false;
+    if (xSemaphoreTakeRecursive(a->alloc_lock, 0) != pdTRUE) return false;
+    hal_app_suspend_task(a->task);
+    xSemaphoreGiveRecursive(a->alloc_lock);
+    return true;
+}
+
 /* A killed ELF cannot unwind its own C stack, so the launcher must return
  * shared peripherals to a safe state after suspending it. Besides disabling a
  * potentially stuck HID key, RFID_OFF tears down capture DMA/IRQs and frees
@@ -156,25 +192,27 @@ static int api_printf(const char *fmt, ...)
 
 static void *api_malloc(size_t n)
 {
+    app_ctx_t *a = app_api_enter();
+    if (!a) return NULL;
     app_alloc_t *h = pvPortMalloc(sizeof(app_alloc_t) + n);
-    if (!h) return NULL;
-    xSemaphoreTake(g_app->alloc_lock, portMAX_DELAY);
-    h->next = g_app->allocs;
-    g_app->allocs = h;
-    xSemaphoreGive(g_app->alloc_lock);
+    if (!h) { app_api_leave(a); return NULL; }
+    h->next = a->allocs;
+    a->allocs = h;
+    app_api_leave(a);
     return h + 1;
 }
 
 static void api_free(void *p)
 {
     if (!p) return;
+    app_ctx_t *a = app_api_enter();
+    if (!a) return;
     app_alloc_t *h = (app_alloc_t *)p - 1;
-    xSemaphoreTake(g_app->alloc_lock, portMAX_DELAY);
-    for (app_alloc_t **pp = &g_app->allocs; *pp; pp = &(*pp)->next) {
+    for (app_alloc_t **pp = &a->allocs; *pp; pp = &(*pp)->next) {
         if (*pp == h) { *pp = h->next; break; }
     }
-    xSemaphoreGive(g_app->alloc_lock);
     vPortFree(h);
+    app_api_leave(a);
 }
 
 /* Read callback the ELF loader streams the app image through - ctx is the VFS path. */
@@ -183,12 +221,59 @@ static int32_t app_elf_read(void *ctx, uint32_t off, void *dst, uint32_t len)
     return vfs_pread((const char *)ctx, off, dst, len);
 }
 
-static int32_t api_read_file(const char *path, void *buf, uint32_t max) { return vfs_read_file(path, buf, max); }
-static int32_t api_pread(const char *path, uint32_t off, void *buf, uint32_t max) { return vfs_pread(path, off, buf, max); }
-static int api_append(const char *path, const void *buf, uint32_t len) { return vfs_append(path, buf, len); }
-static int     api_write_file(const char *path, const void *buf, uint32_t len) { return vfs_write_file(path, buf, len); }
-static int32_t api_file_size(const char *path) { return vfs_size(path); }
-static int     api_remove(const char *path) { return vfs_remove(path); }
+static int32_t api_read_file(const char *path, void *buf, uint32_t max)
+{
+    app_ctx_t *a = app_api_enter();
+    if (!a) return -1;
+    int32_t rc = vfs_read_file(path, buf, max);
+    app_api_leave(a);
+    return rc;
+}
+
+static int32_t api_pread(const char *path, uint32_t off, void *buf, uint32_t max)
+{
+    app_ctx_t *a = app_api_enter();
+    if (!a) return -1;
+    int32_t rc = vfs_pread(path, off, buf, max);
+    app_api_leave(a);
+    return rc;
+}
+
+static int api_append(const char *path, const void *buf, uint32_t len)
+{
+    app_ctx_t *a = app_api_enter();
+    if (!a) return -1;
+    int rc = vfs_append(path, buf, len);
+    app_api_leave(a);
+    return rc;
+}
+
+static int api_write_file(const char *path, const void *buf, uint32_t len)
+{
+    app_ctx_t *a = app_api_enter();
+    if (!a) return -1;
+    int rc = vfs_write_file(path, buf, len);
+    app_api_leave(a);
+    return rc;
+}
+
+static int32_t api_file_size(const char *path)
+{
+    app_ctx_t *a = app_api_enter();
+    if (!a) return -1;
+    int32_t rc = vfs_size(path);
+    app_api_leave(a);
+    return rc;
+}
+
+static int api_remove(const char *path)
+{
+    app_ctx_t *a = app_api_enter();
+    if (!a) return -1;
+    int rc = vfs_remove(path);
+    app_api_leave(a);
+    return rc;
+}
 static void    api_crit_enter(void) { taskENTER_CRITICAL(); }
 static void    api_crit_exit(void)  { taskEXIT_CRITICAL(); }
 static void    api_delay(uint32_t ms) { vTaskDelay(pdMS_TO_TICKS(ms)); }
@@ -227,10 +312,21 @@ static void app_dir_adapt(const char *name, uint32_t size, bool is_dir, void *vc
 static int api_list_dir(const char *path, fantasi_dirent_fn cb, void *ctx)
 {
     if (!cb) return -1;
+    app_ctx_t *guard = app_api_enter();
+    if (!guard) return -1;
     dir_adapt_t a = { cb, ctx };
-    return vfs_list(path, app_dir_adapt, &a);
+    int rc = vfs_list(path, app_dir_adapt, &a);
+    app_api_leave(guard);
+    return rc;
 }
-static int api_mkdir(const char *path) { return vfs_mkdir(path); }
+static int api_mkdir(const char *path)
+{
+    app_ctx_t *a = app_api_enter();
+    if (!a) return -1;
+    int rc = vfs_mkdir(path);
+    app_api_leave(a);
+    return rc;
+}
 
 /* Berry runner - weak default so non-Berry builds link; core/berry_host.c
  * overrides it where the VM is compiled in. */
@@ -296,8 +392,14 @@ static void drain_output(app_ctx_t *a)
 int app_run_module(const char *path, const fantasi_api_t *api, bool delete_source)
 {
     if (!path || !api) return -1;
+    app_ctx_t *guard = app_api_enter();
+    if (!guard) return -1;
     int32_t total = vfs_size(path);
-    if (total < 0) { api->printf("module: source missing: %s\r\n", path); return -1; }
+    if (total < 0) {
+        app_api_leave(guard);
+        api->printf("module: source missing: %s\r\n", path);
+        return -1;
+    }
 
     int lr;
     bool source_taken = false;
@@ -305,12 +407,14 @@ int app_run_module(const char *path, const fantasi_api_t *api, bool delete_sourc
         uint8_t *elf = NULL;
         uint32_t len = 0;
         if (vfs_take_ramfs(path, &elf, &len) != 0) {
+            app_api_leave(guard);
             api->printf("module: RAMFS handoff failed: %s\r\n", path);
             return -1;
         }
         if (len != (uint32_t)total) {
-            api->printf("module: size changed: %s\r\n", path);
             vPortFree(elf);
+            app_api_leave(guard);
+            api->printf("module: size changed: %s\r\n", path);
             return -1;
         }
         source_taken = true;
@@ -324,6 +428,7 @@ int app_run_module(const char *path, const fantasi_api_t *api, bool delete_sourc
         lr = app_load(app_elf_read, (void *)path, (uint32_t)total, &s_module_img);
     }
     if (lr != 0) {
+        app_api_leave(guard);
         api->printf("module: load failed: %s\r\n", app_load_error());
         return -1;
     }
@@ -334,9 +439,14 @@ int app_run_module(const char *path, const fantasi_api_t *api, bool delete_sourc
 
     int (*entry)(const fantasi_api_t *) =
         (int (*)(const fantasi_api_t *))s_module_img.entry;
+    app_api_leave(guard);
     int rc = entry(api);
 
-    app_unload(&s_module_img);
+    guard = app_api_enter();
+    if (guard) {
+        app_unload(&s_module_img);
+        app_api_leave(guard);
+    }
     return rc;
 }
 
@@ -397,7 +507,7 @@ int app_run(const char *path)
     actx.entry = img.entry;
     actx.out = xStreamBufferCreate(APP_OUT_BUF, 1);
     actx.in  = xStreamBufferCreate(APP_IN_BUF, 1);
-    actx.alloc_lock = xSemaphoreCreateMutex();
+    actx.alloc_lock = xSemaphoreCreateRecursiveMutex();
 
     static fantasi_api_t api;
     if (actx.out && actx.alloc_lock) {
@@ -447,7 +557,11 @@ int app_run(const char *path)
          * buffer send). vTaskSuspend removes it from the ready/delayed list and
          * from any event list it's blocked on, so the delete and the stream
          * buffer / mutex teardown below can't dereference a still-queued task. */
-        hal_app_suspend_task(actx.task);
+        while (!app_try_suspend_task(&actx)) {
+            drain_output(&actx);
+            if (ctx->transport.flush) ctx->transport.flush();
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
         vTaskDelete(actx.task);
         drain_output(&actx);
     }
@@ -503,7 +617,11 @@ static void app_pump_entry(void *arg)
         vTaskDelay(pdMS_TO_TICKS(2));
     }
 
-    hal_app_suspend_task(a->task);                           /* stop the app writing */
+    while (!app_try_suspend_task(a)) {
+        while ((n = xStreamBufferReceive(a->out, buf, sizeof(buf), 0)) > 0)
+            a->cb->output(a->session, buf, n);
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
     app_cleanup_peripherals();                               /* release hardware owned by a killed app */
     while ((n = xStreamBufferReceive(a->out, buf, sizeof(buf), 0)) > 0)
         a->cb->output(a->session, buf, n);                  /* flush the tail */
@@ -544,7 +662,7 @@ int app_launch_async(const char *path, uint32_t session, const app_session_cb_t 
     memset(&actx, 0, sizeof(actx));
     actx.out = xStreamBufferCreate(APP_OUT_BUF, 1);
     actx.in  = xStreamBufferCreate(APP_IN_BUF, 1);
-    actx.alloc_lock = xSemaphoreCreateMutex();
+    actx.alloc_lock = xSemaphoreCreateRecursiveMutex();
     actx.async = true;
     actx.cb = cb;
     actx.session = session;

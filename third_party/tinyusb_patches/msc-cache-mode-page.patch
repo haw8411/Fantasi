@@ -1,0 +1,43 @@
+diff --git a/src/class/msc/msc_device.c b/src/class/msc/msc_device.c
+index 447560b..3031a60 100644
+--- a/src/class/msc/msc_device.c
++++ b/src/class/msc/msc_device.c
+@@ -795,14 +795,9 @@ static int32_t proc_builtin_scsi(uint8_t lun, uint8_t const scsi_cmd[16], uint8_
+ 
+     case SCSI_CMD_MODE_SENSE_6:
+     {
+-      scsi_mode_sense6_resp_t mode_resp =
+-      {
+-          .data_len             = 3,
+-          .medium_type          = 0,
+-          .write_protected      = false,
+-          .reserved             = 0,
+-          .block_descriptor_len = 0  // no block descriptor are included
+-      };
++      // Header plus the caching mode page. WCE tells hosts to issue
++      // SYNCHRONIZE CACHE before treating writes as durable.
++      uint8_t mode_resp[24] = { 23, 0, 0, 0, 0x08, 0x12, 0x04 };
+ 
+       bool writable = true;
+       if ( tud_msc_is_writable_cb )
+@@ -810,10 +805,17 @@ static int32_t proc_builtin_scsi(uint8_t lun, uint8_t const scsi_cmd[16], uint8_
+         writable = tud_msc_is_writable_cb(lun);
+       }
+ 
+-      mode_resp.write_protected = !writable;
++      if (!writable) mode_resp[2] = 0x80;
++
++      uint8_t const page_control = scsi_cmd[2] >> 6;
++      uint8_t const page_code = scsi_cmd[2] & 0x3f;
++      bool const cache_page = page_control != 3 &&
++                              (page_code == 0x08 || page_code == 0x3f);
++      if (page_control == 1) mode_resp[6] = 0; // WCE is not changeable
++      if (!cache_page) mode_resp[0] = 3;
+ 
+-      resplen = sizeof(mode_resp);
+-      TU_VERIFY(0 == tu_memcpy_s(buffer, bufsize, &mode_resp, (size_t) resplen));
++      resplen = cache_page ? sizeof(mode_resp) : 4;
++      TU_VERIFY(0 == tu_memcpy_s(buffer, bufsize, mode_resp, (size_t) resplen));
+     }
+     break;
+ 

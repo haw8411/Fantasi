@@ -7,17 +7,17 @@
  * uses). fantasi_rfid() returns NULL when the device/build has no RFID.
  *
  * The struct is defined here once and #included by the firmware (core/rfid/
- * rfid_api.c) so both sides share one layout. Every field below ships in this
- * first release (ABI 1); per-platform capability is signalled by a NULL function
- * pointer, not the version. New members are only ever appended, so a post-v1
- * addition bumps FANTASI_RFID_ABI and its user gates on `->abi >= N` (to guard
- * against a freshly-flashed firmware paired with a stale host-side app ELF). */
+ * rfid_api.c) so both sides share one layout. Per-platform capability is
+ * signalled by a NULL function pointer, not the version. New members are only
+ * ever appended, so an addition bumps FANTASI_RFID_ABI and its user gates on
+ * `->abi >= N` (to guard against a freshly-flashed firmware paired with a stale
+ * host-side app ELF). */
 #ifndef FANTASI_APP_RFID_H
 #define FANTASI_APP_RFID_H
 
 #include <stdint.h>
 
-#define FANTASI_RFID_ABI 1
+#define FANTASI_RFID_ABI 2
 
 /* Scratch size an hf_sniff_capture caller must provide (decode text + DMA ring +
  * frame buffers). The module allocates this ephemerally for the duration of a
@@ -139,6 +139,28 @@ typedef struct fantasi_rfid {
      * hf_emu_send_stream returns <0 (the frontend doesn't stream), so streaming frontends keep their low-FDT
      * overlap and non-streaming ones still get a fast tight-loop encode. NULL where no tag emulation. */
     int (*hf_emu_send_stream_buf)(const uint8_t *tosend, int len);
+
+    /* Incremental receive (ABI 2): data_ready runs in the caller's task when a
+     * seven-bit prefix or a complete data byte becomes stable. A standard frame
+     * reports (index 0, bits 7), then (index 0, bits 8); a short frame reports
+     * only the prefix. Data remains tentative until receive succeeds. The
+     * callback must not block. It may stage a deferred reply with hf_emu_send or
+     * hf_emu_send_stream, but must not call other RFID HAL functions. */
+    int (*hf_emu_recv_progress)(uint8_t *rx, uint8_t *rx_par, int cap, uint32_t timeout_ms,
+                                void (*data_ready)(void *ctx, int index, uint8_t raw, int bits), void *ctx);
+
+    /* Prepare a static encoded reply outside the receive/reply window. This is
+     * an optional performance hint; callers must still send the reply normally. */
+    int (*hf_emu_prepare)(const uint8_t *tosend, int len);
+
+    /* Conditional stream staging (ABI 2): usable only from a progress callback.
+     * The HAL commits the reply if the completed frame matches at least
+     * request_min_len bytes of request. A predictable, transition-free suffix
+     * may therefore be supplied without weakening the module's validation.
+     * result is set to one when committed and remains zero otherwise. */
+    int (*hf_emu_send_stream_match)(uint8_t (*next)(void *ctx), void *ctx, int nsymbols,
+                                    const uint8_t *request, int request_len, int request_min_len,
+                                    int *result);
 } fantasi_rfid_t;
 
 /* Resolved by the loader; NULL when this device/build has no RFID. */

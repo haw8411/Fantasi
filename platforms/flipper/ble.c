@@ -43,6 +43,7 @@
 #define SHCI_OPCODE_SET_FLASH_ACT   0xFC73
 #define SHCI_OPCODE_FLASH_ERASE_ACT 0xFC69
 #define SHCI_OPCODE_FUS_GET_STATE   0xFC52
+#define SHCI_OPCODE_SET_SYSTEM_CLOCK 0xFC79
 
 #define HCI_LE_SET_SCAN_PARAMS  0x200B
 #define HCI_LE_SET_SCAN_ENABLE  0x200C
@@ -790,8 +791,12 @@ void HSEM_IRQHandler(void)
 /*  System channel (SHCI) - synchronous command/response              */
 /* ------------------------------------------------------------------ */
 
+static SemaphoreHandle_t sys_mutex;
+
 static int shci_send(uint16_t opcode, const void *params, uint8_t plen)
 {
+    if (sys_mutex) xSemaphoreTake(sys_mutex, portMAX_DELAY);
+
     /* Vote out of deep sleep for the whole CPU2 round-trip: sleeping between
      * command and response risks a missed/misordered SHCI handshake. Phase A
      * never deep-sleeps, but the vote makes Phase B safe. */
@@ -811,6 +816,7 @@ static int shci_send(uint16_t opcode, const void *params, uint8_t plen)
     while (ipcc_c1_flag_active(IPCC_CH_SYS)) {
         if (xTaskGetTickCount() >= deadline) {
             pwr_inhibit_exit(PWR_CLIENT_SD_OP);
+            if (sys_mutex) xSemaphoreGive(sys_mutex);
             return -2;
         }
         taskYIELD();
@@ -819,8 +825,9 @@ static int shci_send(uint16_t opcode, const void *params, uint8_t plen)
 
     uint8_t *rsp = (uint8_t *)&sys_cmd_buf + sizeof(list_node_t);
     /* rsp: [type][evtcode=0x0E][plen][numcmd][cmdcode_lo][cmdcode_hi][status] */
-    if (rsp[1] != EVT_CMD_COMPLETE) return -1;
-    return (int)rsp[6];
+    int rc = rsp[1] == EVT_CMD_COMPLETE ? (int)rsp[6] : -1;
+    if (sys_mutex) xSemaphoreGive(sys_mutex);
+    return rc;
 }
 
 /* ------------------------------------------------------------------ */
@@ -933,12 +940,14 @@ bool ble_init(void)
 
     c2_ready_sem = xSemaphoreCreateBinary();
     hci_resp_sem = xSemaphoreCreateBinary();
+    sys_mutex    = xSemaphoreCreateMutex();
     hci_mutex    = xSemaphoreCreateMutex();
     scan_queue   = xQueueCreate(SCAN_QUEUE_LEN, sizeof(ble_scan_result_t));
     pair_queue   = xQueueCreate(PAIR_QUEUE_LEN, sizeof(ble_event_t));
     adv_timer    = xTimerCreate("adv", pdMS_TO_TICKS(200), pdFALSE,
                                 NULL, adv_timer_cb);
-    if (!c2_ready_sem || !hci_resp_sem || !scan_queue || !pair_queue) goto fail;
+    if (!c2_ready_sem || !hci_resp_sem || !sys_mutex || !hci_mutex ||
+        !scan_queue || !pair_queue) goto fail;
 
     /* Clear shared SRAM2A (MB_MEM1 + ref table).  MB_MEM2 buffers are
      * in SRAM1 (.bss) and already zeroed by startup. */
@@ -1315,6 +1324,13 @@ bool ble_is_active(void)
 bool ble_cpu2_running(void)
 {
     return ble_state == BLE_READY || ble_state == BLE_DISABLED;
+}
+
+int ble_cpu2_set_system_clock(ble_system_clock_t clock)
+{
+    if (!ble_cpu2_running()) return -1;
+    uint8_t v = (uint8_t)clock;
+    return shci_send(SHCI_OPCODE_SET_SYSTEM_CLOCK, &v, 1);
 }
 
 /* Tell CPU2 a long flash erase is about to start (ON) / has finished (OFF) so it

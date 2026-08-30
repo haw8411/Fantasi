@@ -164,6 +164,10 @@ def main():
         return 1
     print("  Large-file CRC verified")
 
+    # The large fixture has served its purpose. Release it before the separate
+    # reconcile stress so the PM3's 128 KiB internal filesystem has working room.
+    cli(cdc_port, "rm /test-large.bin\nexit\n", timeout=120)
+
     # Composite targets keep their MSC volume mounted indefinitely. This exceeds
     # both bounded reconcile tables in one mount and also fills a new directory's
     # initial FAT cluster, catching leaked completed records, moving directory

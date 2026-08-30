@@ -780,6 +780,7 @@ bool fat_mount(void)
         ser_close();
         ser_connected = false;
         g_switched = true;
+        g_switch_mode = true;
 
         if (!wait_for_fantasi_block(blk, sizeof(blk), 10)) {
             fprintf(stderr, "  block device did not appear\n");

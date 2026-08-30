@@ -394,32 +394,67 @@ int main(void)
                              &complete_len) ==
            FANTASI_BLE_MUX_RESPONSE_CONSUMED);
 
-    /* Accept zero padding to the negotiated ATT payload for compatibility;
-     * non-zero excess remains malformed. */
-    uint8_t padded[FANTASI_BLE_MUX_RESPONSE_HEADER_SIZE + 64] = {0};
-    padded[0] = FANTASI_BLE_MUX_RESPONSE_MAGIC_0;
-    padded[1] = FANTASI_BLE_MUX_RESPONSE_MAGIC_1;
-    padded[2] = FANTASI_BLE_MUX_RESPONSE_MAGIC_2;
-    padded[3] = FANTASI_BLE_MUX_RESPONSE_MAGIC_3;
-    p32(padded + 4, 44); p16(padded + 8, 44);
-    p16(padded + 10, framed_len); p16(padded + 12, 0);
-    memcpy(padded + FANTASI_BLE_MUX_RESPONSE_HEADER_SIZE, framed, framed_len);
-    complete_len = 0;
-    assert(fantasi_ble_mux_response_accept(&response_rx, assembled,
-                                           sizeof(assembled), padded,
-                                           sizeof(padded), &complete_len) ==
-           FANTASI_BLE_MUX_RESPONSE_COMPLETE);
-    assert(complete_len == framed_len &&
-           memcmp(assembled, framed, framed_len) == 0);
+    /* Reject payload beyond the remaining declared frame length regardless of
+     * whether the excess byte is zero. */
+    uint8_t overlong[FANTASI_BLE_MUX_RESPONSE_HEADER_SIZE + 64] = {0};
+    overlong[0] = FANTASI_BLE_MUX_RESPONSE_MAGIC_0;
+    overlong[1] = FANTASI_BLE_MUX_RESPONSE_MAGIC_1;
+    overlong[2] = FANTASI_BLE_MUX_RESPONSE_MAGIC_2;
+    overlong[3] = FANTASI_BLE_MUX_RESPONSE_MAGIC_3;
+    p32(overlong + 4, 44);
+    p16(overlong + 10, framed_len); p16(overlong + 12, 0);
+    memcpy(overlong + FANTASI_BLE_MUX_RESPONSE_HEADER_SIZE, framed, framed_len);
+    size_t overlong_len = FANTASI_BLE_MUX_RESPONSE_HEADER_SIZE + framed_len + 1;
+    for (uint16_t sequence = 44; sequence <= 45; sequence++) {
+        p16(overlong + 8, sequence);
+        overlong[FANTASI_BLE_MUX_RESPONSE_HEADER_SIZE + framed_len] =
+            sequence == 44 ? 0 : 1;
+        response_rx.active = true;
+        complete_len = 0;
+        assert(fantasi_ble_mux_response_accept(&response_rx, assembled,
+                                               sizeof(assembled), overlong,
+                                               overlong_len, &complete_len) ==
+               FANTASI_BLE_MUX_RESPONSE_CONSUMED);
+        assert(!response_rx.active && complete_len == 0);
+    }
 
-    p16(padded + 8, 45);
-    padded[FANTASI_BLE_MUX_RESPONSE_HEADER_SIZE + framed_len] = 1;
+    /* An overlong final fragment cancels the partial frame. Its tail cannot
+     * complete later, while the next offset-zero sequence recovers normally. */
+    assert(framed_len > 3);
+    assert(response_fragment(&response_rx, assembled, sizeof(assembled),
+                             44, 46, framed, framed_len, 0, 3,
+                             &complete_len) ==
+           FANTASI_BLE_MUX_RESPONSE_CONSUMED);
+    p16(overlong + 8, 46); p16(overlong + 12, 3);
+    memcpy(overlong + FANTASI_BLE_MUX_RESPONSE_HEADER_SIZE,
+           framed + 3, framed_len - 3);
+    overlong[FANTASI_BLE_MUX_RESPONSE_HEADER_SIZE + framed_len - 3] = 0;
+    overlong_len = FANTASI_BLE_MUX_RESPONSE_HEADER_SIZE + framed_len - 2;
     complete_len = 0;
     assert(fantasi_ble_mux_response_accept(&response_rx, assembled,
-                                           sizeof(assembled), padded,
-                                           sizeof(padded), &complete_len) ==
+                                           sizeof(assembled), overlong,
+                                           overlong_len, &complete_len) ==
            FANTASI_BLE_MUX_RESPONSE_CONSUMED);
-    assert(complete_len == 0);
+    assert(!response_rx.active && complete_len == 0);
+    assert(response_fragment(&response_rx, assembled, sizeof(assembled),
+                             44, 46, framed, framed_len, 3, framed_len - 3,
+                             &complete_len) ==
+           FANTASI_BLE_MUX_RESPONSE_CONSUMED);
+    assert(response_fragment(&response_rx, assembled, sizeof(assembled),
+                             44, 47, framed, framed_len, 0, framed_len,
+                             &complete_len) ==
+           FANTASI_BLE_MUX_RESPONSE_COMPLETE);
+
+    /* Zero bytes inside the declared length are data, including at the end. */
+    uint8_t zero_tail_frame[] = { 4, 0, 0x08, 0, 0, 0 };
+    complete_len = 0;
+    assert(response_fragment(&response_rx, assembled, sizeof(assembled),
+                             44, 48, zero_tail_frame,
+                             sizeof(zero_tail_frame), 0,
+                             sizeof(zero_tail_frame), &complete_len) ==
+           FANTASI_BLE_MUX_RESPONSE_COMPLETE);
+    assert(complete_len == sizeof(zero_tail_frame) &&
+           memcmp(assembled, zero_tail_frame, sizeof(zero_tail_frame)) == 0);
 
     uint8_t legacy[] = { 1, 0, 0x08 };
     assert(fantasi_ble_mux_response_accept(&response_rx, assembled,

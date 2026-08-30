@@ -34,7 +34,8 @@ DEFS := -DCFG_TUSB_MCU=OPT_MCU_AT91SAM7S \
         -DWEBUSB_PROTO_STACK=512 \
         -DAPP_TASK_STACK_WORDS=832 \
         -DAPP_PUMP_STACK_WORDS=320 \
-        -DAPP_KEEP_SESSION_WORKER
+        -DAPP_KEEP_SESSION_WORKER \
+        -DWEBUSB_FRAME_ON_TASK_STACK
         # Target-specific stack sizes leave contiguous heap for RFID modules.
         # The session worker also runs Berry; the USB task covers MSC
         # reconciliation.

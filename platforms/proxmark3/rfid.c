@@ -113,6 +113,26 @@
 #define FPGA_LZSS_STAGE  512
 
 static rfid_mode_t s_mode;
+static TaskHandle_t s_emu_hot_task;
+static UBaseType_t s_emu_hot_prio;
+
+static void emu_hot_enter(void)
+{
+    if (s_emu_hot_task) return;
+    s_emu_hot_task = xTaskGetCurrentTaskHandle();
+    s_emu_hot_prio = uxTaskPriorityGet(NULL);
+    if (s_emu_hot_prio < configMAX_PRIORITIES - 1)
+        vTaskPrioritySet(NULL, configMAX_PRIORITIES - 1);
+}
+
+static void emu_hot_leave(void)
+{
+    if (!s_emu_hot_task) return;
+    if (xTaskGetCurrentTaskHandle() == s_emu_hot_task &&
+        uxTaskPriorityGet(NULL) != s_emu_hot_prio)
+        vTaskPrioritySet(NULL, s_emu_hot_prio);
+    s_emu_hot_task = NULL;
+}
 
 /* Which bitstream the FPGA currently holds, so set_mode skips a redundant reload
  * when consecutive operations stay in one protocol family (e.g. a MIFARE dump is
@@ -517,14 +537,17 @@ static int rfid_set_mode_u(rfid_mode_t mode)
      * ~90 ms reload. It streams from /fpga, provisioned there from the host on first
      * use; if it isn't present the app failed to provision it -> RFID_ERR_UNSUPP. */
     int want = hf ? RES_HF : RES_LF;
-    if (s_loaded != want || s_stale) {
+    /* TAGSIM entry resets its own state; stale demod state requires a reload
+     * only when returning to reader mode. */
+    bool reload = s_loaded != want || (s_stale && mode != RFID_HF_EMU);
+    if (reload) {
         if (fpga_load(hf ? FPGA_HF_PATH : FPGA_LF_PATH) != 0) {
             s_loaded = RES_NONE; s_mode = RFID_OFF; return RFID_ERR_UNSUPP;
         }
         s_loaded = want;
+        s_stale = false;
         spin_ms(5);                           /* post-DONE startup before driving CONFREG */
     }
-    s_stale = false;
     fpga_spi_setup();
 
     if (mode == RFID_HF_EMU) {
@@ -830,8 +853,14 @@ static int SN_RAMFUNC sn_miller(uint8_t bit, uint32_t t)
 
     if (s_u.state == U_UNSYNCD) {
         s_u.syncBit = -1;
+        /* The PM3 FPGA can widen the start pause from three samples to four.
+         * Accept that shape only with the full unmodulated prefix present. */
         for (int sh = 0; sh <= 7; sh++)
-            if ((s_u.fourBits & (0x07FFEF80u >> sh)) == (0x07FF8F80u >> sh)) { s_u.syncBit = 7 - sh; break; }
+            if ((s_u.fourBits & (0x07FFEF80u >> sh)) == (0x07FF8F80u >> sh) ||
+                (s_u.fourBits & (0x1FFFFF00u >> sh)) == (0x1FFF0F00u >> sh)) {
+                s_u.syncBit = 7 - sh;
+                break;
+            }
         if (s_u.syncBit >= 0) {
             s_u.startTime = t - (uint32_t)s_u.syncBit;
             s_u.endTime = s_u.startTime;
@@ -1216,14 +1245,12 @@ static uint32_t ssp_clk_get(void)
  * so hf_emu_send can pick the 1236-vs-1172 correction bit. */
 static int rfid_hf_emu_recv_u(uint8_t *rx, uint8_t *rx_par, int cap, uint32_t timeout_ms)
 {
-    if (s_mode != RFID_HF_EMU || !rx || !rx_par || cap <= 0) return RFID_ERR_UNSUPP;
+    if (s_mode != RFID_HF_EMU || !rx || !rx_par || cap <= 0) {
+        emu_hot_leave();
+        return RFID_ERR_UNSUPP;
+    }
 
-    fpga_conf(FPGA_MAJOR_MODE_HF_ISO14443A | FPGA_HF_14A_TAGSIM_LISTEN);
     s_u.out = rx; s_u.cap = cap; sn_uart_reset();
-    /* Flush all SSC RX left over from the preceding TAGSIM_MOD send (the fdt_indicator/queue-delay reads):
-     * feeding those stale bytes into the Miller decoder desyncs its sync on the next reader command. Drain what's pending now - the
-     * next command hasn't arrived yet (the reader's FDT gap), so this can't eat it. */
-    for (int f = 0; f < 64 && (AT91C_BASE_SSC->SSC_SR & AT91C_SSC_RXRDY); f++) (void)AT91C_BASE_SSC->SSC_RHR;
 
     int n = 0;
 
@@ -1250,6 +1277,7 @@ static int rfid_hf_emu_recv_u(uint8_t *rx, uint8_t *rx_par, int cap, uint32_t ti
      * may be idle for ms). Decode IRQs-off once a command starts, same as before. A missed idle poll (REQA/WUPA)
      * is simply retried by the reader, so preemption here is harmless - unlike a dropped mid-sequence command. */
     if (!n && s_u.state == U_UNSYNCD) {
+        emu_hot_leave();
         TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms ? timeout_ms : 200);
         uint32_t spins = 0;
         int crit = 0;
@@ -1273,6 +1301,7 @@ static int rfid_hf_emu_recv_u(uint8_t *rx, uint8_t *rx_par, int cap, uint32_t ti
 
     for (int i = 0; i < n && i < 32; i++)
         rx_par[i] = oddparity8(rx[i]) ^ (uint8_t)((s_u.parerr >> i) & 1);
+    if (n > 0) emu_hot_enter(); else emu_hot_leave();
     return n;
 }
 
@@ -1320,8 +1349,8 @@ static int rfid_hf_emu_send_u(const uint8_t *tosend, int len)
         AT91C_BASE_SSC->SSC_THR = tosend[i++];
         s_queue_delay = (uint8_t)AT91C_BASE_SSC->SSC_RHR;
     }
-    /* drain the FPGA delay queue with idle symbols so the last reply symbol propagates all the way out the
-     * coil before the caller's next recv switches to TAGSIM_LISTEN (a short drain also truncates the reply). */
+    /* Drain the FPGA delay queue with idle symbols so the last reply symbol propagates all the way out the
+     * coil before returning to TAGSIM_LISTEN (a short drain also truncates the reply). */
     uint8_t queued = s_queue_delay >> 3;
     int flush = (queued >> 3) + 1; if (flush < 6) flush = 6;
     for (i = 0; i < flush; ) {
@@ -1330,7 +1359,7 @@ static int rfid_hf_emu_send_u(const uint8_t *tosend, int len)
         s_queue_delay = (uint8_t)AT91C_BASE_SSC->SSC_RHR;
         i++;
     }
-
+    fpga_conf(FPGA_MAJOR_MODE_HF_ISO14443A | FPGA_HF_14A_TAGSIM_LISTEN);
     taskEXIT_CRITICAL();
     return 0;
 }
@@ -1383,7 +1412,7 @@ static int rfid_hf_emu_send_stream_u(uint8_t (*next)(void *ctx), void *ctx, int 
         s_queue_delay = (uint8_t)AT91C_BASE_SSC->SSC_RHR;
         k++;
     }
-
+    fpga_conf(FPGA_MAJOR_MODE_HF_ISO14443A | FPGA_HF_14A_TAGSIM_LISTEN);
     taskEXIT_CRITICAL();
     return 0;
 }
@@ -1605,15 +1634,11 @@ static int rfid_lf_transceive_u(const uint8_t *cmd, int nbits, uint8_t *buf, int
 
 /* ---- SPI0 bus arbitration: FPGA config register vs onboard flash --------------
  * The FPGA config register shares hardware SPI0 with the onboard flash (spi_flash.c),
- * on different FreeRTOS tasks. Each public RFID op holds the shared bus for its whole
- * duration and, if the flash touched the bus since, re-runs fpga_spi_setup to restore
- * the NPCS0/16-bit config. The lock must sit at the operation boundary, not around the
- * individual config writes: those run inside taskENTER_CRITICAL (interrupts off), where
- * taking a mutex is illegal - and the critical section itself already blocks the flash
- * task from preempting mid-write. RFID running alone reconfigures exactly once (the
- * owner flag stays FPGA), so its behaviour and timing are unchanged; the lock only ever
- * blocks when a flash access on another task genuinely overlaps an RFID op. The mutex is
- * recursive, so the (currently flat) call graph is safe even if ops later nest. */
+ * on different FreeRTOS tasks. RFID operations that touch SPI0 hold the shared bus and,
+ * if the flash touched it since, re-run fpga_spi_setup to restore the NPCS0/16-bit
+ * config. The lock is acquired before functions enter taskENTER_CRITICAL; acquiring a
+ * mutex from inside a critical section is illegal. The mutex is recursive, so nested
+ * operations remain safe. */
 #define RFID_ENTER() do { spi_bus_lock(); if (spi_bus_claim(SPI_OWNER_FPGA)) fpga_spi_setup(); } while (0)
 #define RFID_LEAVE() spi_bus_unlock()
 
@@ -1621,7 +1646,10 @@ int hal_rfid_fpga_load(const char *path)
 { RFID_ENTER(); int r = rfid_fpga_load_u(path); RFID_LEAVE(); return r; }
 
 int hal_rfid_set_mode(rfid_mode_t mode)
-{ RFID_ENTER(); int r = rfid_set_mode_u(mode); RFID_LEAVE(); return r; }
+{
+    if (mode != RFID_HF_EMU) emu_hot_leave();
+    RFID_ENTER(); int r = rfid_set_mode_u(mode); RFID_LEAVE(); return r;
+}
 
 void hal_rfid_field(bool on)
 { RFID_ENTER(); rfid_field_u(on); RFID_LEAVE(); }
@@ -1644,13 +1672,21 @@ int hal_rfid_hf_sniff_capture(uint8_t *buf, uint32_t cap_bytes, uint32_t quiet_m
 { RFID_ENTER(); int r = rfid_hf_sniff_capture_u(buf, cap_bytes, quiet_ms, max_ms); RFID_LEAVE(); return r; }
 
 int hal_rfid_hf_emu_recv(uint8_t *rx, uint8_t *rx_par, int cap, uint32_t timeout_ms)
-{ RFID_ENTER(); int r = rfid_hf_emu_recv_u(rx, rx_par, cap, timeout_ms); RFID_LEAVE(); return r; }
+{ return rfid_hf_emu_recv_u(rx, rx_par, cap, timeout_ms); }
 
 int hal_rfid_hf_emu_send(const uint8_t *tosend, int len)
-{ RFID_ENTER(); int r = rfid_hf_emu_send_u(tosend, len); RFID_LEAVE(); return r; }
+{
+    RFID_ENTER(); int r = rfid_hf_emu_send_u(tosend, len); RFID_LEAVE();
+    if (r < 0) emu_hot_leave();
+    return r;
+}
 
 int hal_rfid_hf_emu_send_stream(uint8_t (*next)(void *ctx), void *ctx, int nsymbols)
-{ RFID_ENTER(); int r = rfid_hf_emu_send_stream_u(next, ctx, nsymbols); RFID_LEAVE(); return r; }
+{
+    RFID_ENTER(); int r = rfid_hf_emu_send_stream_u(next, ctx, nsymbols); RFID_LEAVE();
+    if (r < 0) emu_hot_leave();
+    return r;
+}
 
 int hal_rfid_lf_modulate(const uint8_t *p, int nbits, uint32_t opts)
 { RFID_ENTER(); int r = rfid_lf_modulate_u(p, nbits, opts); RFID_LEAVE(); return r; }

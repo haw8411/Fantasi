@@ -21,6 +21,9 @@ void fz_power_buttons_wake(BaseType_t *woken);
  * (re)starting background advertising). */
 bool fz_power_adv_slow(void);
 
+/* Runtime clock changes cannot use the fixed-32-MHz tickless accounting. */
+void fz_power_tickless_block(bool block);
+
 /* VBUS presence from the BQ25896 charger (I2C; the WB55 USB core cannot
  * sense VBUS). Implemented in hal.c; polled by the idle-policy timer. */
 bool fz_hal_vbus_present(void);

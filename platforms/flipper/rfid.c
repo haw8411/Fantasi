@@ -19,6 +19,8 @@
 #include "../../hal/hal_rfid.h"
 #include "../../core/vfs.h"
 #include "../../core/log.h"   /* TEMP (port bring-up): for debugging */
+#include "ble.h"
+#include "power.h"
 
 #include "FreeRTOS.h"
 #include "task.h"
@@ -173,6 +175,11 @@ static void spi_init(void)
     RCC->APB2ENR |= RCC_APB2ENR_SPI1EN;
     (void)RCC->APB2ENR;
 
+    /* PA2 is shared by ST25R3916 IRQ and the LF RFID_PULL control. Release the
+     * LF output before the ST25 enables its push-pull IRQ driver. */
+    GPIOA->MODER &= ~GPIO_MODER_MODE2;
+    GPIOA->PUPDR &= ~GPIO_PUPDR_PUPD2;
+
     /* PA5 = SCK (AF5, very-high speed) */
     GPIOA->MODER = (GPIOA->MODER & ~GPIO_MODER_MODE5) | (2u << GPIO_MODER_MODE5_Pos);
     GPIOA->AFR[0] = (GPIOA->AFR[0] & ~(0xFu << (5 * 4))) | (5u << (5 * 4));
@@ -226,20 +233,6 @@ static void reg_write(uint8_t addr, uint8_t val)
 static void reg_set(uint8_t a, uint8_t m)   { reg_write(a, (uint8_t)(reg_read(a) | m)); }
 static void reg_clear(uint8_t a, uint8_t m) { reg_write(a, (uint8_t)(reg_read(a) & ~m)); }
 
-static void fifo_write(const uint8_t *buf, int n)
-{
-    cs_low();
-    spi_xfer(ST_FIFO_LOAD);
-    for (int i = 0; i < n; i++) spi_xfer(buf[i]);
-    cs_high();
-}
-static void fifo_read(uint8_t *buf, int n)
-{
-    cs_low();
-    spi_xfer(ST_FIFO_READ);
-    for (int i = 0; i < n; i++) buf[i] = spi_xfer(0xFF);
-    cs_high();
-}
 static void direct_cmd(uint8_t cmd) { cs_low(); spi_xfer(cmd); cs_high(); }
 
 /* Read + clear the 4-byte IRQ status burst at 0x1A into a 32-bit word. */
@@ -248,6 +241,12 @@ static uint32_t get_irq(void)
     uint8_t b[4];
     reg_read_burst(REG_IRQ_MAIN, b, 4);
     return (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+}
+
+static void mask_all_irqs(void)
+{
+    for (int i = 0; i < 4; i++) reg_write((uint8_t)(REG_IRQ_MASK_MAIN + i), 0xFF);
+    (void)get_irq();
 }
 
 /* Bring the ST25R3916 up as an ISO14443-A poller. Returns 0, or -1 if no chip. */
@@ -445,7 +444,6 @@ static void lf_stop(void)
                                  * the 847 kHz subcarrier so it resolves cleanly. All sample-unit decode
                                  * constants below are scaled to match (x0.833 of the 3.2 MHz values). */
 
-static inline int  miso_read(void)   { return (int)((GPIOB->IDR >> MISO_PIN) & 1u); }
 static void        miso_as_input(void){ GPIOB->MODER &= ~GPIO_MODER_MODE4; }
 static void        miso_as_spi(void)  { GPIOB->MODER = (GPIOB->MODER & ~GPIO_MODER_MODE4)
                                                      | (2u << GPIO_MODER_MODE4_Pos); }
@@ -532,12 +530,10 @@ static int efd_wait_measure(uint32_t timeout_ms)
 static void dma_cap_go(void)   { TIM2->CNT = 0; TIM2->CR1 |= TIM_CR1_CEN; }
 static void dma_cap_stop(void) { TIM2->CR1 &= ~TIM_CR1_CEN; TIM2->DIER = 0; DMA1_Channel1->CCR = 0; }
 
-/* Capture source, so the same DMA + scan_span serve two pins: the sniff reads the transparent-mode demod
- * on PB4/MISO (reader mode), while emulation reads it on PA2 (the ST25R3916 IRQ line, where the chip puts
- * the demod in target transparent mode - see the hf_emu block / the stock ISO15693 listener). Each user
- * sets these before arming; defaults are the sniff's PB4. */
+/* Capture source, so the same DMA + scan_span serve the transparent-mode demod on PB4/MISO for sniffing
+ * and emulation. Each user sets these before arming. */
 static volatile uint32_t *s_cap_idr   = &GPIOB->IDR;   /* low byte holds the capture pin */
-static uint8_t            s_cap_shift  = MISO_PIN;      /* bit of the captured byte: 4 (PB4) or 2 (PA2) */
+static uint8_t            s_cap_shift  = MISO_PIN;      /* bit of the captured byte: PB4/MISO */
 static uint32_t           s_cap_arr    = CAP_ARR;       /* TIM2 reload: 12 @32MHz (sniff) -> 2.462 MHz; the emu
                                                          * clock-boost raises it to 25 @64MHz to keep 2.462 MHz */
 
@@ -578,9 +574,6 @@ static uint16_t *s_tr;        /* transition (edge) sample positions - heap scrat
 static uint8_t  *s_seq;       /* Miller per-etu symbol scratch (miller_decode) - heap, live only during a sniff */
 static int      s_ntr;
 static int      s_ongrid, s_offgrid;   /* reader pauses that fit / miss the etu grid (reader-dir confidence) */
-static volatile int s_dbg_maxi;        /* TEMP */
-static volatile uint32_t s_dbg_ret;    /* TEMP: DWT at recv return, to split decode vs module-dispatch latency */
-static volatile int s_dbg_m; static volatile uint8_t s_dbg_bb[4];   /* TEMP: last decoded frame (m, first bytes) */
 static int      s_card_samp;           /* total samples of detected card 847 kHz subcarrier - PHYSICAL, so it
                                         * gauges the gain without reading any (possibly encrypted) data byte */
 static int      s_tr_init;             /* level of the samples before s_tr[0] (reader run polarity) */
@@ -618,7 +611,6 @@ static int miller_decode(const uint16_t *ps, int np, uint8_t *out, uint32_t *par
         if (idx >= 0 && idx < 160) { if (seq[idx] == 0) seq[idx] = half ? 2 : 1; if (idx > maxi) maxi = idx; }
         base = (long)ps[i]*100 - (long)idx*ETU100 - (half ? 3*ETU100/4 : ETU100/4);   /* re-sync on trusted pauses */
     }
-    s_dbg_maxi = maxi;                             /* TEMP: etu span the bit loop covers */
     int sr = 0, nb = 0, n = 0;
     for (int k = 1; k <= maxi && n < 32; k++) {    /* skip SOC (k=0) */
         int bit = (seq[k] == 2) ? 1 : 0;
@@ -649,18 +641,24 @@ static long  s_mp_base;      /* current etu-0 boundary (x100 samples), from the 
 static int   s_mp_has;       /* base anchored (SOC pause seen) */
 static int   s_mp_maxi;      /* highest etu slot filled so far */
 static int   s_mp_prev;      /* previous pause centre (sample), for the FRAME_GAP new-frame trim */
-static int   s_mp_np;        /* pauses folded in the current frame (matches emu_reader_pauses np) */
+static int   s_mp_np;        /* pauses folded in the current frame */
 /* Incremental byte-grouping (loop-2), also pipelined: group filled grid slots into bytes DURING reception so
  * a long command's frame-end decode is cheap. Slots are final once set (first pause wins), so grouping up to
  * maxi-2 (a margin for pause re-sync) is safe; finish groups the rest. */
 static int   s_grp_k, s_grp_sr, s_grp_nb, s_grp_n; static uint32_t s_grp_par; static uint8_t s_grp_out[32];
-static int s_cf_n; static uint16_t s_cf_pc[24];                    /* TEMP DIAG: current-frame raw pause centres */
+static void (*s_grp_byte_ready)(void *ctx, int index, uint8_t raw, int bits);
+static void *s_grp_byte_ctx;
+static int s_grp_callback_active;
+static int s_grp_prefix_ready;
+static void emu_early_stream_cancel(void);
 
 static void miller_inc_reset(void)
 {
+    emu_early_stream_cancel();
     __builtin_memset(s_seq, 0, 160);
     s_mp_proc = 1; s_mp_has = 0; s_mp_maxi = 0; s_mp_prev = 0; s_mp_np = 0;
     s_grp_k = 1; s_grp_sr = 0; s_grp_nb = 0; s_grp_n = 0; s_grp_par = 0;
+    s_grp_prefix_ready = 0;
 }
 
 /* Group grid slots s_grp_k..upto into 9-bit (8 data + parity) bytes, appending to s_grp_out. */
@@ -670,10 +668,24 @@ static void miller_inc_group(int upto)
     while (s_grp_k <= upto && s_grp_n < 32) {
         int bit = (s_seq[s_grp_k] == 2) ? 1 : 0;
         s_grp_sr = (s_grp_sr >> 1) | (bit << 8); s_grp_nb++;
+        if (s_grp_n == 0 && s_grp_nb == 7 && s_grp_byte_ready && !s_grp_prefix_ready) {
+            s_grp_prefix_ready = 1;
+            s_grp_callback_active = 1;
+            s_grp_byte_ready(s_grp_byte_ctx, s_grp_n, (uint8_t)(s_grp_sr >> 2), 7);
+            s_grp_callback_active = 0;
+        }
+        if (s_grp_nb == 8 && s_grp_byte_ready) {
+            uint8_t raw = (uint8_t)(s_grp_sr >> 1);
+            if (s_grp_n == 0 && s_grp_prefix_ready) emu_early_stream_cancel();
+            s_grp_callback_active = 1;
+            s_grp_byte_ready(s_grp_byte_ctx, s_grp_n, raw, 8);
+            s_grp_callback_active = 0;
+        }
         if (s_grp_nb == 9) {
             int v = s_grp_sr & 0xFF;
             if ((s_grp_sr >> 8 & 1) == __builtin_parity(v)) s_grp_par |= (1u << s_grp_n);
             s_grp_out[s_grp_n++] = (uint8_t)v; s_grp_sr = 0; s_grp_nb = 0;
+            s_grp_prefix_ready = 0;
         }
         s_grp_k++;
     }
@@ -691,15 +703,13 @@ static inline void miller_inc_place(int c)
     if (dZ < 0) dZ = -dZ;
     if (dX < 0) dX = -dX;
     int half = (dX < dZ) ? 1 : 0;
-    if ((half ? dX : dZ) > ETU100 * 16 / 100) { s_offgrid++; return; }         /* off-grid: jitter/clip */
-    s_ongrid++;
+    if ((half ? dX : dZ) > ETU100 * 16 / 100) return;                          /* off-grid: jitter/clip */
     if (idx >= 0 && idx < 160) { if (s_seq[idx] == 0) s_seq[idx] = half ? 2 : 1; if (idx > s_mp_maxi) s_mp_maxi = idx; }
     s_mp_base = (long)c * 100 - (long)idx * ETU100 - (half ? 3 * ETU100 / 4 : ETU100 / 4);   /* re-sync */
 }
 
 /* Fold any newly-recorded s_tr intervals into the grid: a wide LOW run at reader polarity is a pause.
- * A pause >= FRAME_GAP after the previous one starts a new frame (matches emu_reader_pauses' keep-last-frame
- * trim), so the grid resets to it. */
+ * A pause >= FRAME_GAP after the previous one starts a new frame, so the grid resets to it. */
 __attribute__((optimize("O2")))
 static void miller_inc_feed(void)
 {
@@ -714,15 +724,27 @@ static void miller_inc_feed(void)
         if (w >= 4 && w <= 13) {
             int c = (s_tr[i - 1] + s_tr[i]) / 2;
             if (s_mp_has && c - s_mp_prev >= FRAME_GAP) {          /* between-frame gap: restart on this pause */
+                emu_early_stream_cancel();
                 __builtin_memset(s_seq, 0, 160);
                 s_mp_has = 0; s_mp_maxi = 0; s_mp_np = 0;
+                s_grp_k = 1; s_grp_sr = 0; s_grp_nb = 0; s_grp_n = 0; s_grp_par = 0;
+                s_grp_prefix_ready = 0;
             }
             miller_inc_place(c);
             s_mp_prev = c; s_mp_np++;
         }
     }
     s_mp_proc = s_ntr;
-    if (s_mp_maxi > 2) miller_inc_group(s_mp_maxi - 2);   /* pipeline loop-2, leaving a re-sync margin */
+    if (!s_grp_prefix_ready && s_grp_n == 0 && s_mp_maxi >= 7 && s_grp_byte_ready) {
+        uint8_t raw = 0;
+        for (int b = 0; b < 7; b++)
+            if (s_seq[b + 1] == 2) raw |= (uint8_t)(1u << b);
+        s_grp_prefix_ready = 1;
+        s_grp_callback_active = 1;
+        s_grp_byte_ready(s_grp_byte_ctx, 0, raw, 7);
+        s_grp_callback_active = 0;
+    }
+    if (s_mp_maxi > 2) miller_inc_group(s_mp_maxi - 2);
 }
 
 /* Frame end: fold any tail edges, then group the etu grid into bytes (loop-2 of miller_decode). */
@@ -730,17 +752,21 @@ __attribute__((optimize("O2")))
 static int miller_inc_finish(uint8_t *out, uint32_t *par)
 {
     miller_inc_feed();
-    s_dbg_maxi = s_mp_maxi;
     miller_inc_group(s_mp_maxi);                                  /* finalize the last (ungrouped) slots */
     int n = s_grp_n;
-    if (n == 0 && s_grp_nb >= 6 && s_grp_nb <= 7)                 /* 7-bit short frame (REQA/WUPA) */
-        s_grp_out[n++] = (uint8_t)((s_grp_sr >> (9 - s_grp_nb)) & ((1 << s_grp_nb) - 1));
-    else if (n >= 1 && s_grp_nb >= 1 && s_grp_nb <= 8 && n < 32) {
-        /* A byte-aligned reader frame whose last bits are modified-Miller sequence Y (logic 0 = no pause) leaves
-         * those trailing etus unrecorded (the grid stops at the last pause = s_mp_maxi), so the final
-         * 8-data-bit + parity byte comes up short. The missing trailing bits are 0 by definition (Y == 0), so
-         * complete the byte by shifting in zeros. This recovers the encrypted 8-byte AUTH nr||ar, which often
-         * ends in 0s. */
+    if (n == 0 && s_grp_nb >= 6 && s_grp_nb <= 7) {               /* 7-bit short frame (REQA/WUPA) */
+        uint8_t raw = (uint8_t)((s_grp_sr >> (9 - s_grp_nb)) & ((1 << s_grp_nb) - 1));
+        if (!s_grp_prefix_ready && s_grp_byte_ready) {
+            s_grp_prefix_ready = 1;
+            s_grp_callback_active = 1;
+            s_grp_byte_ready(s_grp_byte_ctx, 0, raw, 7);
+            s_grp_callback_active = 0;
+        }
+        s_grp_out[n++] = raw;
+    }
+    else if (n >= 1 && s_grp_nb == 8 && n < 32) {
+        /* A final sequence-Y parity bit has no pause, so the grid can end one
+         * bit short. Do not pad shorter fragments caused by post-frame noise. */
         uint32_t sr = s_grp_sr;
         for (int b = s_grp_nb; b < 9; b++) sr >>= 1;             /* pad the lost trailing 0-bits (Y) */
         int v = sr & 0xFF;
@@ -1421,15 +1447,9 @@ static int reader_xcv(const uint8_t *tx, int tx_bits, const uint8_t *par, uint8_
 }
 
 /* ============ HF ISO14443-A / MIFARE Classic TAG emulation (passive target) ============
- * RX uses the framing engine with auto anti-collision off (PASSIVE_TARGET d_106_ac_a=1), so every reader
- * frame - REQA, anti-collision, SELECT, AUTH, READ - is delivered to software via the FIFO, and the shared
- * mfc_emu.c answers all of them (module unchanged). But the framing-engine TRANSMIT is subject to the
- * chip's HW FDT, which is wrong from the stuck-IDLE state (post-ATQA replies land a half-bit off-phase).
- * So the reply is sent the way Picopass / stock custom-parity replies are: enter transparent mode (framing
- * + chip FDT bypassed), wait out the ISO14443-A frame-delay time ourselves off a DWT reference taken at
- * RXE, then load-modulate the 847 kHz Manchester subcarrier on MOSI, then leave transparent mode and
- * re-arm the framing RX. Timing is CPU-bit-banged in a critical section (the Flipper's own iso14443_3a
- * DMA DigitalSignal is the "proper" generator; this is the lighter equivalent). */
+ * The ST25R3916 remains in transparent mode for the complete exchange. TIM2 and DMA capture the reader's
+ * envelope from PB4/MISO for software Miller decoding. Replies load-modulate the field through PB5/MOSI;
+ * TIM17 schedules the frame delay and TIM1 with two DMA channels generates the Manchester waveform. */
 
 /* Air-symbol values the module hands us (mirror iso14a_emu.h; the HAL can't include the app header). */
 #define EMU_SEC_D  0xF0     /* logic 1 - subcarrier in the first half-bit */
@@ -1441,13 +1461,12 @@ static int reader_xcv(const uint8_t *tx, int tx_bits, const uint8_t *par, uint8_
 #define EMU_CHIP_SUBC 0
 #define EMU_PHASE_OFF 66u    /* fixed reply-start offset (cyc). Sweeping this was proven to have no effect on decode
                              * (PM3 Mod_Manchester_LUT accepts >=3 of 4 sub-samples, so fine phase is not the lever). */
-/* Reply FDT (frame delay time), CPU cycles @64 MHz from the last reader modulation edge. ISO14443-A spec is 1236 fc
- * if the reader's last bit = 1, 1172 fc if 0; a single value is within the reader's SOF listen window. 1236 fc =
- * 5834 cyc @64MHz. TIM17 fires EMU_FDT_ARR after the last edge, then emu_tx_raw busy-waits the rest to s_fdt_ticks. */
-#define EMU_FDT_1     6000u  /* TEMP widened (was 5834): give the det jitter room; optimize back down after proving 10/10 */
-#define EMU_FDT_0     6000u  /* TEMP widened (was 5532) */
+/* Reply FDT (frame delay time), in 64 MHz CPU cycles from the carrier-locked final reader edge. TIM17 fires
+ * shortly before the calibrated transmit point; the raw and DMA paths then align the first modulation edge. */
+#define EMU_FDT_1     5834u
+#define EMU_FDT_0     5532u
 #define EMU_FDT_TICKS EMU_FDT_1
-#define EMU_FDT_ARR   (EMU_FDT_0 - 90u)   /* TIM17 fires before the SHORTER FDT; busy-wait extends to s_fdt_ticks */
+#define EMU_FDT_ARR   (EMU_FDT_0 - 600u)  /* enter early; the TX path still phase-pins the first edge */
 /* BASEPRI level that masks the USB ISR (pri 5) but not the reply path (EXTI4/TIM17/DMA1_Ch2 all at pri 4). Raised
  * across the FDT-critical reply-staging window (recv-return -> module -> send -> arm) so a USB interrupt can't
  * preempt it and blow the turnaround past the FDT. FreeRTOS-safe (= configMAX_SYSCALL level), unlike __disable_irq. */
@@ -1455,97 +1474,88 @@ static int reader_xcv(const uint8_t *tx, int tx_bits, const uint8_t *par, uint8_
 #define EMU_SAMP_CYC  26u   /* one 2.462 MHz capture sample = 64e6/2.462e6 = 26 CPU cycles @64 MHz */
 #define CMD_GOTO_SENSE 0xCD /* put the passive target into the sense (idle) state, waiting for REQA */
 
-/* Subcarrier bit-bang timing in 64 MHz CPU cycles: fc/16 = 847.5 kHz -> half-period 64e6/(2*847.5e3) =
- * 37.76 cyc. Generate exactly 4 periods = 302 cyc per half-bit with per-half-period durations rounded to the
- * 37.76 grid (s_subc_dur below), and make the idle half-bit 302 too so a full bit is exactly 1 etu (604 cyc =
- * 128 fc). Cleaner edges on-grid = better detection margin. */
+/* Subcarrier timing in 64 MHz CPU cycles: fc/16 = 847.5 kHz. Fractional accumulation keeps both the raw and
+ * DMA paths at 302 + 22/339 cycles per half-bit without allowing the rounded intervals to drift. */
 #define EMU_SUBC_HALF 38u
-#define EMU_HALF_ETU  302u                               /* one modulated/idle half-bit = 4 * fc/16 exactly @64MHz */
+#define EMU_HALF_ETU  302u                               /* integer part of one modulated/idle half-bit @64 MHz */
+#define EMU_ETU       (2u * EMU_HALF_ETU)                /* legal fc/128 FDT step */
+#define EMU_HALF_FRAC_NUM 22u                            /* exact half-bit: 102400/339 = 302 + 22/339 cycles */
+#define EMU_HALF_FRAC_DEN 339u
 #define EMU_MOSI_HI  (GPIOB->BSRR = (1u << 5))           /* PB5 = MOSI = load-modulation gate */
 #define EMU_MOSI_LO  (GPIOB->BSRR = (1u << (5 + 16)))
+#define EMU_RX_SETTLE 2600u                              /* 40.6 us, before the reader's next-frame FDT */
+#define EMU_ACTIVE_US 1000u                              /* spans a poller's roughly 520 us WUPA retry interval */
+#define EMU_NOISE_US 20000u                              /* longer than a complete poller's WUPA retry train */
+#define EMU_WAKE_LOOKBACK 128u                           /* 52 us of margin before the edge-woken task runs */
+#define EMU_WAKE_GRACE_US 1000u                          /* finish an edge-woken frame before recv times out */
 
 static bool s_emu_up;                 /* HF_EMU configured (recv/send guard) */
+static bool s_emu_starting;           /* setup owns resources but is not ready to receive yet */
+static bool s_emu_clock_owned;        /* setup configured or selected the emulation PLL */
 static void mosi_as_output_low(void);   /* fwd decl (defined with the TX code) */
-static void emu_clk_boost(void);        /* fwd decl: 32->64 MHz for the FDT-critical emu path */
-static void emu_clk_restore(void);      /* fwd decl: back to 32 MHz on teardown */
+static void emu_rx_disable(void);       /* SCLK low disables transparent-mode reception during our reply */
+static void emu_rx_enable(void);        /* SCLK high re-enables transparent-mode reception */
+static int emu_clk_boost(void);         /* fwd decl: 32->64 MHz for the FDT-critical emu path */
+static int emu_clk_restore(void);       /* fwd decl: back to 32 MHz on teardown */
+static uint32_t carrier_lock(uint32_t last_edge);
 static void mosi_as_spi(void);          /* fwd decl (defined with the TX code) */
 static void emu_tx_pat_init(void);      /* fwd decl: DMA-TX edge-pattern precompute */
 static void emu_tx_dma_setup(void);     /* fwd decl: DMA-TX timer/DMA config */
 static uint32_t s_emu_rx_cyc;         /* DWT cycles at RXE - the reply is timed to the FDT from here */
 static volatile uint32_t s_fdt_ticks = EMU_FDT_TICKS;   /* reply FDT (CPU cyc from the last reader edge) */
-static volatile uint32_t s_fdt_arr = EMU_FDT_ARR;       /* TIM17 fire point: earlier for DMA (build runs in the ISR) */
+static volatile uint32_t s_fdt_arr = EMU_FDT_ARR;       /* TIM17 fire point before the calibrated transmit time */
 static UBaseType_t s_emu_base_prio;   /* task priority while idle-polling */
 static volatile TickType_t s_last_frame_tick;   /* tick of the last real decoded reader frame; the reader-gone
                                                  * stop-key yield only engages once this is >200 ms stale */
 static TaskHandle_t s_emu_task;       /* task running hal_rfid_hf_emu_recv (notified from the EXTI wake ISR) */
+static volatile int s_emu_waiting;    /* only the first edge of an idle wait needs a deferred task notification */
 static volatile uint32_t s_last_edge_cyc;   /* DWT time of the most recent MISO edge (real-time gap detect) */
 /* Reply staged for the HW-timer FDT: the recv/module path STAGES here; TIM17 (armed per-edge in the EXTI ISR)
  * fires the bit-bang at last_edge + FDT, independent of task scheduling, so TX has no jitter. */
 static uint8_t          s_tx_bits[EMU_FIFO];
 static volatile int     s_tx_nbits;
 static volatile int     s_tx_armed;      /* 1 = a reply is staged and waiting for the FDT timer to fire it */
-/* CRYPTO reply flag (auth at / nested nt / encrypted READ). The module pre-encodes the reply (Crypto1 must run in
- * module context - its LUTs are PIC/GOT-relative, so the firmware ISR can't call back into module code) and hands
- * the encoded buffer to hf_emu_send_stream. That path arms late (crypto + encode after recv), so this flag makes it
- * (a) bypass the FDT deadline guard, (b) always bit-bang (content changes -> no DMA edge-cache), and (c) re-trigger
- * the one-pulse TIM17, which the fast anticoll replies never need. Cleared after the reply fires. */
+static volatile int     s_tx_force_raw;  /* first use: transmit now, then populate the DMA edge cache */
+static volatile int     s_tx_dma_pending;
+static const uint8_t   *s_tx_dma_key;
+/* Crypto replies (auth at / nested nt / encrypted READ) are pre-encoded in module context. These flags select the
+ * one-shot DMA scratch rather than the static reply cache and are cleared after the reply fires. */
 static volatile int      s_tx_crypto;
+static volatile int      s_tx_crypto_dma;
 static volatile int     s_fdt_locked;    /* 1 = frame ended + reply staged: freeze the FDT timer (ignore edges) */
-static volatile uint32_t s_tx_end_cyc;   /* DWT time our DMA reply finishes; recv ignores MISO until then (our own
-                                          * load-mod shows on the demod and would be mis-decoded as a bogus command) */
+enum { EMU_SPEC_NONE, EMU_SPEC_ARMED, EMU_SPEC_FIRED };
+static volatile int     s_tx_spec_state;
+static volatile uint32_t s_tx_end_cyc;   /* DWT time RX may resume after a reply and demodulator settling */
 /* Small reply cache: the select sequence alternates ts_atqa/ts_uid/ts_sak/ts_nt (a different pointer each
  * frame), so a single-entry cache thrashed. Cache each by pointer -> pre-decoded air-bits, so a repeat is a
  * short memcpy into s_tx_bits instead of the symbol->bit loop on the FDT-critical path. */
 #define SEND_CACHE_N 6
 static struct { const uint8_t *ptr; int n; uint8_t bits[EMU_FIFO]; } s_send_cache[SEND_CACHE_N];
 static uint8_t          s_send_cache_rr;  /* round-robin evict index */
-static volatile uint32_t s_dbg_edges;   /* TEMP: EXTI MISO edges this session (chip demod alive?) */
-static uint32_t s_dbg_rxframes, s_dbg_txcount, s_dbg_txmiss;   /* TEMP: recv frames + TX replies + dropped-late */
-static uint8_t  s_dbg_cmdlog[40][3]; static int s_dbg_cmdn, s_dbg_sendn; static uint32_t s_dbg_txmiss_ta=0xFFFFFFFF, s_dbg_txmiss_tamax;    /* TEMP: (m, rx0, rx1) of every decoded command */
-static volatile int s_diag_gmaxi, s_diag_gnp, s_diag_gdet, s_diag_gdec; static volatile uint8_t s_diag_gseq[24];   /* TEMP DIAG: grid snapshot of the last non-WUPA frame (anticoll mis-decode) */
-static volatile int s_diag_gpcn; static volatile uint16_t s_diag_gpc[24];   /* TEMP DIAG: snapshot of the anticoll pause centres */
-static volatile int s_diag_trn; static volatile uint16_t s_diag_tr[28];      /* TEMP DIAG: raw edge positions of the anticoll frame */
-static volatile int s_diag_wtrn, s_diag_winit; static volatile uint16_t s_diag_wtr[28];   /* TEMP DIAG: WUPA control edge stream */
-/* With auto anti-collision off the passive-target state stays IDLE, so the chip does not hardware-time
- * the reply - it transmits when we issue TRANSMIT. We therefore delay TRANSMIT to the ISO14443-A frame
- * delay time ourselves. ~86 us = 2765 cyc @32 MHz from the reader's last bit; RXE fires a little after
- * that bit, so this offset is tuned against the reader on the bench. */
-#define EMU_FDT_WAIT  2900u   /* ~92us target FDT (1252 carrier periods) */
 #define EMU_RING   8192u      /* ~3.3 ms transparent-demod capture ring @2.46 MHz */
 #define EMU_MAXTR  2048       /* edges held while framing one reader command */
-#define EMU_NPAUS  256        /* reader 100% ASK pause centres in one command */
 static uint8_t *s_emu_ring;   /* transparent-demod capture ring - heap, live for the HF_EMU session */
-/* BMP TX self-diagnostic buffer (read over SWD). s_bmp_want selects which reply length to latch (19 = ATQA). */
-uint8_t  s_bmp_cap[512];
-volatile int s_bmp_ready;
-volatile int s_bmp_nbits;
-volatile int s_bmp_want = 19;
-volatile uint32_t s_edge_dwt[48];   /* TEMP: reader modulation-edge DWT timestamps (carrier-referenced) */
-volatile int s_edge_n; static int s_edge_logged, s_bmp_logged;
+volatile uint32_t s_edge_dwt[24];   /* reader modulation-edge DWT timestamps used for carrier phase-lock */
+volatile int s_edge_n;
 volatile int s_phase_off = 66;      /* runtime reply-phase offset (poke via SWD for interleaved A-B sweeps) */
 volatile int s_carrier_en = 1;
 volatile int s_use_dma_tx = 1;   /* 0=busy-wait TX, 1=DMA TX (poke via SWD to A-B) */
-volatile int s_diag_noguard = 0; /* TEMP DIAG: 1 = never drop a reply on the FDT deadline (test recv-vs-deadline) */
 volatile int s_txskip = 600;    /* self-TX MISO-skip margin in cycles (theoretically sound; no measured effect on anticoll) */
 volatile int s_ptmod = 0x0F;    /* REG_PT_MOD load-mod depth: sweep 0x0F..0x08 all keep ATQA 8/8, none fix anticoll */
 volatile int s_rxc1 = 0x12;     /* TEMP DIAG: REG_RX_CONF1 (HPF zero for post-TX baseline recovery). 0x12=h80, 0x14=h200, 0x1A=z600k */
 volatile int s_rxc4 = 0x00;     /* TEMP DIAG: REG_RX_CONF4 (2nd/3rd-stage gain / digitizer) */
 volatile int s_rxc2 = 0x2D;     /* TEMP DIAG: REG_RX_CONF2. bit5 sqm_dyn (squelch, fires 18.88us after our TX!), bit3 agc_en. 0x0D=no squelch, 0x25=no AGC, 0x05=neither */
 volatile int s_emu_env = 1;     /* TEMP DIAG: 0=424kHz correlator (baseline), 1=sniff-style envelope demod (no phase-sign inversion) */
-volatile int s_rxc3 = 0x78;     /* TEMP DIAG: REG_RX_CONF3 first-stage gain for the envelope variant (0x78 mid, 0xF8 boost) */
+volatile int s_rxc3 = 0x78;     /* TEMP DIAG: REG_RX_CONF3 first-stage gain for the envelope variant */
 volatile int s_rxc3b = 0xD8;    /* TEMP DIAG: REG_RX_CONF3 for the correlator (baseline) path - sweep low to keep demod linear during TX */
-volatile int s_rx_reset = 0;    /* TEMP: 1 = fast Reset-RX-Gain demod reset after each TX (exit+re-enter transparent) */
-volatile int s_emu_stream = 0;
-volatile int s_stream_targ = 0;
-volatile int s_stream_tx = 0;
-volatile int s_stream_cont = 1;  /* TEMP: continuous-clock RX stream test */
-
 static void emu_edge_cache_free(void);    /* fwd decls: DMA edge cache (defined with the TX code) */
 static void emu_edge_cache_alloc(void);
+static int emu_early_stream_commit(int frame_len);
+static int emu_early_stream_pending(void);
 static void emu_free(void)
 {
-    vPortFree(s_emu_ring); vPortFree(s_tr); vPortFree(s_seq); vPortFree(s_paus);
-    s_emu_ring = 0; s_tr = 0; s_seq = 0; s_paus = 0;
+    vPortFree(s_emu_ring); vPortFree(s_tr); vPortFree(s_seq);
+    s_emu_ring = 0; s_tr = 0; s_seq = 0;
     emu_edge_cache_free();
 }
 
@@ -1566,10 +1576,21 @@ static void emu_isr_kill(void)
     TIM1->CR1 = 0; TIM1->DIER = 0;                       /* stop the DMA TX timer */
     DMA1_Channel2->CCR = 0; DMA1_Channel3->CCR = 0;
     NVIC_DisableIRQ(DMA1_Channel2_IRQn);
-    s_tx_armed = 0; s_fdt_locked = 0;
+    EXTI->PR1 = (1u << 4);
+    TIM17->SR = 0; TIM1->SR = 0;
+    DMA1->IFCR = DMA_IFCR_CGIF2 | DMA_IFCR_CGIF3;
+    NVIC_ClearPendingIRQ(EXTI4_IRQn);
+    NVIC_ClearPendingIRQ(EXTI0_IRQn);
+    NVIC_ClearPendingIRQ(TIM1_TRG_COM_TIM17_IRQn);
+    NVIC_ClearPendingIRQ(DMA1_Channel2_IRQn);
+    s_tx_armed = 0; s_tx_force_raw = 0; s_tx_dma_pending = 0; s_tx_dma_key = 0;
+    s_tx_crypto = 0; s_tx_crypto_dma = 0; s_fdt_locked = 0; s_tx_spec_state = EMU_SPEC_NONE;
+    s_grp_byte_ready = 0; s_grp_byte_ctx = 0; s_grp_callback_active = 0;
+    emu_early_stream_cancel();
+    s_emu_waiting = 0;
     s_emu_task = 0;                                      /* the EXTI/EXTI0 ISRs gate every notify on this */
     dma_cap_stop();
-    __set_BASEPRI(0);                                    /* never leave the USB ISR masked */
+    EMU_MOSI_LO;
     s_hf_dirty = 1;                                      /* force a full re-init on the next set_mode(HF_EMU) */
 }
 
@@ -1584,67 +1605,39 @@ void rfid_emu_task_deleted(void *tcb)
 
 static void emu_teardown(void)
 {
-    if (!s_emu_up) return;
-    vTaskPrioritySet(NULL, s_emu_base_prio);            /* never leave boosted */
+    if (!s_emu_up && !s_emu_starting) return;
+    if (xTaskGetCurrentTaskHandle() == s_emu_task)
+        vTaskPrioritySet(NULL, s_emu_base_prio);        /* restore only the app task's saved priority */
     emu_isr_kill();                                     /* stop all emu ISRs/DMA + NULL s_emu_task (register-only) */
-    emu_clk_restore();                                  /* back to 32 MHz before SPI/reg ops resume */
-    SPI1->CR1 |= SPI_CR1_SPE;                           /* ensure SPI enabled before the teardown cmd */
-    GPIOA->MODER = (GPIOA->MODER & ~GPIO_MODER_MODE5) | (2u << GPIO_MODER_MODE5_Pos);  /* SCK PA5 -> AF */
-    miso_as_spi();
-    mosi_as_spi();                                      /* restore MOSI to SPI AF (send leaves it a GPIO) */
-    direct_cmd(CMD_STOP);                               /* leave transparent mode */
+    __set_BASEPRI(0);                                   /* normal task context: release the reply-path USB mask */
+    if (s_emu_clock_owned) {
+        configASSERT(emu_clk_restore() == 0);           /* back to 32 MHz before SPI/reg ops resume */
+        s_emu_clock_owned = false;
+    }
+    fz_power_tickless_block(false);
+    if (s_spi_up) {
+        SPI1->CR1 |= SPI_CR1_SPE;                       /* ensure SPI enabled before the teardown cmd */
+        GPIOA->MODER = (GPIOA->MODER & ~GPIO_MODER_MODE5) | (2u << GPIO_MODER_MODE5_Pos);  /* SCK PA5 -> AF */
+        miso_as_spi();
+        mosi_as_spi();                                  /* restore MOSI to SPI AF (send leaves it a GPIO) */
+        CS_PORT->BSRR = (1u << CS_PIN);
+        CS_PORT->MODER = (CS_PORT->MODER & ~GPIO_MODER_MODE4) | (1u << GPIO_MODER_MODE4_Pos);
+        direct_cmd(CMD_STOP);                           /* leave transparent mode */
+    }
     emu_free();
     s_emu_up = false;
-    fantasi_log(LOG_INFO, "emu session: edges=%lu rxframes=%lu tx=%lu txmiss=%lu",
-                (unsigned long)s_dbg_edges, (unsigned long)s_dbg_rxframes,
-                (unsigned long)s_dbg_txcount, (unsigned long)s_dbg_txmiss);
-    fantasi_log(LOG_INFO, "emu apptask stack free min=%u B",   /* TEMP: app-task stack headroom (overflow hunt) */
-                (unsigned)(uxTaskGetStackHighWaterMark(NULL) * 4u));
-    if (s_dbg_txmiss) fantasi_log(LOG_INFO, "emu txmiss ta_min=%lu ta_max=%lu", (unsigned long)s_dbg_txmiss_ta, (unsigned long)s_dbg_txmiss_tamax);
-    for (int i = 0; i < s_dbg_cmdn; i += 10) {   /* TEMP: every decoded command (m:rx0 rx1) */
-        char b[128]; int o = 0;
-        for (int j = i; j < i + 10 && j < s_dbg_cmdn; j++)
-            o += snprintf(b + o, sizeof b - o, "%d:%02X%02X ",
-                          s_dbg_cmdlog[j][0], s_dbg_cmdlog[j][1], s_dbg_cmdlog[j][2]);
-        fantasi_log(LOG_INFO, "emu cmds %s", b);
-    }
-    /* BMP/self TX diagnostic: the MISO demod of the last reply we sent. Count edges overall (is my load-mod even
-     * visible on MISO?) and per ~1-etu window (23 samples @2.462MHz) to see the Manchester envelope + where it
-     * stops. Nonzero per-window edges = subcarrier present that etu; a run of zeros = my modulation dropped. */
-    /* Reader modulation-edge spacing in CPU cycles: the Miller pauses are carrier-referenced, so these deltas
-     * measure the reader's bit grid against my 64 MHz clock. 1 etu = 128 fc; at exactly 64 MHz that is 604.13 cyc,
-     * a half-etu 302. If the observed deltas differ, my subcarrier/bit-rate is mistuned vs the actual carrier. */
-    for (int w = 0; w < s_edge_n - 1; w += 12) {
-        char b[128]; int o = 0;
-        for (int j = w; j < w + 12 && j < s_edge_n - 1; j++)
-            o += snprintf(b + o, sizeof b - o, "%lu ", (unsigned long)(s_edge_dwt[j+1] - s_edge_dwt[j]));
-        fantasi_log(LOG_INFO, "emu EDGEdt %s", b);
-    }
-    if (s_bmp_ready) {
-        int tot = 0; for (int i = 1; i < 512; i++) tot += (s_bmp_cap[i] != s_bmp_cap[i-1]);
-        fantasi_log(LOG_INFO, "emu TXcap nbits=%d edges=%d", s_bmp_nbits, tot);
-        for (int w = 0; w < 512; w += 230) {         /* 10 windows of 23 samples each per log line */
-            char b[96]; int o = 0;
-            for (int k = w; k < w + 230 && k + 23 <= 512; k += 23) {
-                int e = 0; for (int i = k + 1; i < k + 23; i++) e += (s_bmp_cap[i] != s_bmp_cap[i-1]);
-                o += snprintf(b + o, sizeof b - o, "%2d ", e);
-            }
-            fantasi_log(LOG_INFO, "emu TXwin %s", b);
-        }
-    }
+    s_emu_starting = false;
 }
 
-/* Target-mode NFC-A listener front-end for transparent-mode emulation. Mirrors the Flipper's ISO15693
- * listener + stock furi_hal_nfc_iso14443a_common_init: the correlator demod (not the sniff's wideband
- * envelope, which does not survive target mode), OOK, and passive target mode (om_targ_nfca | targ)
- * so that in transparent mode MOSI load-modulates the reader's field. Stays in transparent mode: recv
- * reads the reader off the MISO demod, send bit-bangs the reply. */
+/* Target-mode NFC-A front-end for transparent emulation. It uses the envelope demodulator on PB4/MISO for
+ * reader frames and PB5/MOSI for load modulation, and stays in transparent mode until teardown. */
 static void emu_config(void)
 {
     direct_cmd(CMD_STOP);
     direct_cmd(CMD_SET_DEFAULT);                        /* clean RESET: clear all reader-mode state from st25_init,
                                                          * so this is a from-scratch furi_hal_nfc_init, not a
                                                          * reconfigure on top of the reader chain */
+    mask_all_irqs();                                    /* SET_DEFAULT restored the unmasked reset state */
     vTaskDelay(pdMS_TO_TICKS(1));
     reg_set(REG_IO_CONF2, IO_CONF2_drv_lvl);            /* io_drv_lvl (MISO/IRQ drive strength) */
     reg_set(REG_OP_CONTROL, OP_CONTROL_en);             /* turn the oscillator back on (SET_DEFAULT cleared it) */
@@ -1655,7 +1648,7 @@ static void emu_config(void)
 
     /* --- MEASURE_VDD -> sup3V (furi_hal_nfc_init). The oscillator is already up (st25_init). Set the supply
      * mode so the internal regulators bias the AFE for the real 3.3V rail - the working listener does this and
-     * the demod does not reach PA2 without a correctly biased front-end. Emu-only: the shared reader init is
+     * the demod does not reach PB4/MISO without a correctly biased front-end. Emu-only: the shared reader init is
      * untouched. --- */
     reg_write(REG_REGULATOR_CTRL,
               (uint8_t)((reg_read(REG_REGULATOR_CTRL) & ~REGCTRL_mpsv_mask) | REGCTRL_mpsv_vdd));
@@ -1717,32 +1710,14 @@ static void emu_config(void)
      * MODE=88 on official fw). tr_am_ook = tr_am cleared. OP_CONTROL = en|rx_en|en_fd_auto_efd (0xC3). The
      * merged furi code + the live register dump both use om_targ_nfca(=om_iso14443a, 0x08)|targ. --- */
     reg_clear(REG_MODE, MODE_om_mask | MODE_tr_am);
-    if (s_emu_stream == 1) {
-        /* Sub-carrier stream as a target (om=1110|targ, undocumented): the chip generates the reply subcarrier
-         * from its own carrier-locked clock (kills the CPU-async-phase drift that capped transparent at ~25%),
-         * and streams the digitized RX to the FIFO. scf=fc/16 (848 kHz 14443-A subcarrier), scp=8 pulses/report
-         * (1 etu), stx=fc/16 TX period. */
-        reg_set(REG_MODE, MODE_om_subc_stream | (s_stream_targ ? MODE_targ : 0));   /* 0xF0 or 0x70 */
-        reg_write(REG_STREAM, STREAM_scf_fc16 | STREAM_scp_8 | STREAM_stx_fc16);
-    } else {
-        reg_set(REG_MODE, MODE_om_iso14443a | MODE_targ);   /* 0x88 transparent target */
-        /* Undefined-behavior test: enable the chip's stream subcarrier generator (scf=fc/16, stx=fc/16) while in
-         * transparent target mode. In transparent mode MOSI gates the load-mod; with the subcarrier gen armed the
-         * gate should emit the chip's own carrier-locked 848 kHz (EMU_CHIP_SUBC=1 holds MOSI high per half-bit),
-         * fixing the CPU-async-phase 25% cap while the MISO demod still carries the RX. */
-        reg_write(REG_STREAM, STREAM_scf_fc16 | STREAM_scp_8 | STREAM_stx_fc16);
-    }
+    reg_set(REG_MODE, MODE_om_iso14443a | MODE_targ);   /* 0x88 transparent target */
+    reg_write(REG_STREAM, STREAM_scf_fc16 | STREAM_scp_8 | STREAM_stx_fc16);
     reg_clear(REG_OP_CONTROL, OP_CONTROL_tx_en);        /* target: no field of our own */
     reg_set(REG_OP_CONTROL, OP_CONTROL_en | OP_CONTROL_rx_en | OP_CONTROL_en_fd_auto);   /* 0xC3 */
     reg_set(REG_AUX_MOD, 0x30);                         /* lm_ext | lm_dri: keep the load-mod driver enabled */
 
-    /* Mask all chip IRQs (0x16-0x19 = 0xFF). The ST25R3916 IRQ pin (= our PA2) normally signals interrupts;
-     * furi masks them all so, in transparent mode, the pin is free to carry the demod. Without this the chip
-     * may drive PA2 as the interrupt line, not the demod (edges_tot=0). */
-    reg_write(REG_IRQ_MASK_MAIN + 0, 0xFF);
-    reg_write(REG_IRQ_MASK_MAIN + 1, 0xFF);
-    reg_write(REG_IRQ_MASK_MAIN + 2, 0xFF);
-    reg_write(REG_IRQ_MASK_MAIN + 3, 0xFF);
+    /* Chip IRQs were masked immediately after SET_DEFAULT so the shared PA2
+     * IRQ/RFID_PULL pin remains deasserted. Transparent RX arrives on PB4/MISO. */
     /* NOTE: the working ISO15693 listener does not issue RESET_RX_GAIN / CLEAR_FIFO / UNMASK_RECEIVE before
      * transparent - RESET_RX_GAIN loads manual gain, which fights the AGC (agc_en in RXC2). Match the listener:
      * config, then CMD_TRANSPARENT_MODE + bus release (in emu_setup), nothing else. */
@@ -1755,27 +1730,9 @@ static void emu_config(void)
     direct_cmd(CMD_ADJUST_REGULATORS);
     vTaskDelay(pdMS_TO_TICKS(6));
 
-    /* TEMP: dump the same register set the official-fw FAP dumped, to diff directly.
-     * Official (working) TARGET: IOC1=07 IOC2=04 OP=C3 MODE=88 AUX=00 RX1=12 RX2=2D RX3=D8
-     * ANTA=82 ANTB=82 TXDRV=70 PTMOD=0F FTHACT=11 FTHDEA=00 REGUL=00 PT=50 AUXD=12. */
-    fantasi_log(LOG_INFO, "emu A IOC1=%02X IOC2=%02X OP=%02X MODE=%02X AUX=%02X RX1=%02X RX2=%02X RX3=%02X",
-                reg_read(REG_IO_CONF1), reg_read(REG_IO_CONF2), reg_read(REG_OP_CONTROL), reg_read(REG_MODE),
-                reg_read(REG_AUX), reg_read(REG_RX_CONF1), reg_read(REG_RX_CONF2), reg_read(REG_RX_CONF3));
-    fantasi_log(LOG_INFO, "emu B ANTA=%02X ANTB=%02X TXDRV=%02X PTMOD=%02X FTHA=%02X FTHD=%02X REGUL=%02X PT=%02X AUXD=%02X",
-                reg_read(REG_ANT_TUNE_A), reg_read(REG_ANT_TUNE_B), reg_read(REG_TX_DRIVER), reg_read(REG_PT_MOD),
-                reg_read(REG_FIELD_THR_ACTV), reg_read(REG_FIELD_THR_DEACTV), reg_read(REG_REGULATOR_CTRL),
-                reg_read(REG_PASSIVE_TARGET), reg_read(REG_AUX_DISPLAY));
-
     CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;     /* DWT cycle counter for the FDT delay */
     DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
 }
-
-static int s_emu_dbg;    /* TEMP (port bring-up): count of decoded reader frames logged, removed when working */
-static int s_emu_dbg2;   /* TEMP: count of TX turnaround measurements logged */
-static uint32_t s_dbg_notice, s_dbg_decode, s_dbg_bl, s_dbg_p0; static int s_dbg_gbt;
-static volatile uint32_t s_dbg_decode2;   /* TEMP: max backlog seen since last edge */
-static uint32_t s_snap_it, s_snap_bl;     /* TEMP: iters + max-backlog snapshot at gap-fire */
-static volatile uint32_t s_dbg_maxit; static uint32_t s_snap_mit;   /* TEMP: slowest loop iteration */
 
 /* MISO-edge WAKE for recv. The demod is still decoded from the jitter-free level-DMA (unchanged) and the FDT
  * reference is still the accurate atomic DMA back-date - EXTI line 4 (PB4/MISO) is used only to wake recv from
@@ -1789,6 +1746,11 @@ void EXTI4_IRQHandler(void)
                                                     * the timestamp carries only the fixed HW entry latency and the
                                                     * deterministic reply start (emu_tx_raw) tracks the reader grid. */
     EXTI->PR1 = (1u << 4);                          /* clear the line-4 pending flag */
+    if (s_edge_n < 24) s_edge_dwt[s_edge_n++] = s_last_edge_cyc;
+    if (!s_fdt_locked && s_tx_spec_state == EMU_SPEC_ARMED) {
+        s_tx_armed = 0;
+        s_tx_spec_state = EMU_SPEC_NONE;
+    }
     /* HW-timer FDT: (re)arm TIM17 to fire ~FDT after this edge. Intra-frame edges keep resetting it (all < FDT
      * apart), so it only fires once the frame has ended. OPM auto-stops after firing; CNT=0 + CEN restarts it.
      * But once a frame has ended and a reply is staged (s_fdt_locked=1), do not reset it here: post-frame demod
@@ -1796,34 +1758,33 @@ void EXTI4_IRQHandler(void)
      * re-triggered crypto at/READ reply) would fire ~FDT after the last noise edge instead of after the real
      * frame. recv clears s_fdt_locked per new frame. */
     if (!s_fdt_locked) {
+        TIM17->CR1 &= ~TIM_CR1_CEN;
+        TIM17->SR = ~TIM_SR_UIF;
+        NVIC_ClearPendingIRQ(TIM1_TRG_COM_TIM17_IRQn);
+        TIM17->ARR = s_fdt_arr;
         TIM17->CNT = 0;
         TIM17->CR1 |= TIM_CR1_CEN;
     }
-    if (s_edge_n < 48) s_edge_dwt[s_edge_n++] = s_last_edge_cyc;   /* TEMP: measure reader bit-rate vs my CPU clock */
-    s_dbg_edges++;                                  /* TEMP: is the chip demod reaching MISO this session? */
-    s_dbg_bl = 0;                                   /* TEMP: blocks-since-last-edge (reset on every edge) */
-    s_dbg_notice = 0; s_dbg_decode2 = 0; s_dbg_maxit = 0;   /* TEMP: iters/backlog/max-iter since last edge */
     /* Defer the recv WAKE to EXTI0 (pri 5, syscall-safe): this handler runs above the FreeRTOS ceiling so it must
      * not call vTaskNotifyGiveFromISR here. NVIC_SetPendingIRQ runs EXTI0 the moment this returns. */
-    if (s_emu_task) NVIC_SetPendingIRQ(EXTI0_IRQn);
+    if (s_emu_task && s_emu_waiting) NVIC_SetPendingIRQ(EXTI0_IRQn);
 }
 
 /* Deferred recv-wake, pended by EXTI4. Priority 5 (== FreeRTOS syscall ceiling), so the notify is legal here.
  * Not wired to any real EXTI line - only ever run via NVIC_SetPendingIRQ from EXTI4. */
 void EXTI0_IRQHandler(void)
 {
-    if (s_emu_task) {
+    if (s_emu_task && s_emu_waiting) {
+        s_emu_waiting = 0;
         BaseType_t hp = pdFALSE;
         vTaskNotifyGiveFromISR(s_emu_task, &hp);
         portYIELD_FROM_ISR(hp);
     }
 }
 
-/* Release the SPI bus so the ST25R3916 drives its transparent-mode demod onto the pins without the STM32
- * SPI peripheral contending - furi_hal_spi_bus_handle_deinit, confirmed part of the working listener setup.
- * SCK(PA5) + MISO(PB4) -> analog (Hi-Z, released from the SPI AF); SPE off. MOSI(PB5) stays a GPIO output
- * (load-mod gate, set by the caller); the demod is read on PA2 (IRQ), configured as input by the caller.
- * No SPI op (reg/direct_cmd/fifo helpers) may run until emu_teardown re-acquires the bus (pins->AF, SPE on). */
+/* Release the SPI bus so the ST25R3916 drives its transparent-mode demod onto PB4/MISO without the STM32
+ * peripheral contending. SCK(PA5) and MISO(PB4) become inputs and SPE is disabled; MOSI(PB5) remains the
+ * load-modulation output. No SPI operation may run until emu_teardown re-acquires the bus. */
 static void emu_bus_release(void)
 {
     SPI1->CR1 &= ~SPI_CR1_SPE;                         /* disable the SPI peripheral */
@@ -1837,15 +1798,33 @@ static void emu_bus_release(void)
     GPIOE->PUPDR = (GPIOE->PUPDR & ~GPIO_PUPDR_PUPD4) | (1u << GPIO_PUPDR_PUPD4_Pos);   /* pull-up */
 }
 
-/* Boost SYSCLK from the 32 MHz HSE to 64 MHz (HSE /2 *8 /2 through the main PLL) for the FDT-critical emu path:
- * at 64 MHz the recv detect + mfc_emu dispatch (~4600 cyc of work) take ~72 us < the 87 us anticoll FDT, so the
- * reply stages before the HW-timer fires. HSE stays running, so CPU2/BLE (which uses HSE for the radio) is
- * undisturbed. USB is on the separate HSI48 domain. Flash goes to 3 WS first (needed 54-64 MHz). Tickless idle
- * is off, so keeping the 1 kHz FreeRTOS tick is just a SysTick reload update. Reversed by emu_clk_restore. */
-static void emu_clk_boost(void)
+/* Boost SYSCLK from the 32 MHz HSE to 64 MHz (HSE /2 *8 /2 through the main PLL) for the FDT-critical emu path.
+ * CPU2 shares SYSCLK on STM32WB, so when it is running it performs both clock transitions through SHCI. */
+#define EMU_HSEM_COREID_CPU1 0x04u
+#define EMU_HSEM_RCC_SEM     3
+
+static void emu_rcc_lock(void)
 {
+    RCC->AHB3ENR |= RCC_AHB3ENR_HSEMEN;
+    (void)RCC->AHB3ENR;
+    while (HSEM->RLR[EMU_HSEM_RCC_SEM] !=
+           (HSEM_RLR_LOCK_Msk | (EMU_HSEM_COREID_CPU1 << HSEM_RLR_COREID_Pos))) { }
+}
+
+static void emu_rcc_unlock(void)
+{
+    HSEM->R[EMU_HSEM_RCC_SEM] = EMU_HSEM_COREID_CPU1 << HSEM_R_COREID_Pos;
+}
+
+static int emu_clk_boost(void)
+{
+    fz_power_tickless_block(true);
     FLASH->ACR = (FLASH->ACR & ~FLASH_ACR_LATENCY) | FLASH_ACR_LATENCY_3WS;
     while ((FLASH->ACR & FLASH_ACR_LATENCY) != FLASH_ACR_LATENCY_3WS) { }
+
+    emu_rcc_lock();
+    RCC->CR &= ~RCC_CR_PLLON;
+    while (RCC->CR & RCC_CR_PLLRDY) { }
     RCC->PLLCFGR = (3U << RCC_PLLCFGR_PLLSRC_Pos)      /* src = HSE 32 MHz */
                  | (1U << RCC_PLLCFGR_PLLM_Pos)        /* M = /2  -> 16 MHz PLL input */
                  | (8U << RCC_PLLCFGR_PLLN_Pos)        /* N = x8  -> 128 MHz VCO */
@@ -1853,149 +1832,75 @@ static void emu_clk_boost(void)
                  | RCC_PLLCFGR_PLLREN;
     RCC->CR |= RCC_CR_PLLON;
     while ((RCC->CR & RCC_CR_PLLRDY) == 0) { }
-    RCC->CFGR = (RCC->CFGR & ~RCC_CFGR_SW) | (3U << RCC_CFGR_SW_Pos);           /* SYSCLK <- PLL */
-    while (((RCC->CFGR & RCC_CFGR_SWS) >> RCC_CFGR_SWS_Pos) != 3U) { }
+    emu_rcc_unlock();
+
+    if (ble_cpu2_running()) {
+        /* Wireless stacks before 1.20 can return an invalid status for this
+         * command. The RCC status below is authoritative. */
+        (void)ble_cpu2_set_system_clock(BLE_SYSCLK_HSE_TO_PLL);
+    } else {
+        emu_rcc_lock();
+        RCC->CFGR = (RCC->CFGR & ~RCC_CFGR_SW) | (3U << RCC_CFGR_SW_Pos);       /* SYSCLK <- PLL */
+        emu_rcc_unlock();
+    }
+    if (((RCC->CFGR & RCC_CFGR_SWS) >> RCC_CFGR_SWS_Pos) != 3U) return -1;
     SystemCoreClock = 64000000u;
     SysTick->LOAD = (64000000u / configTICK_RATE_HZ) - 1u;   /* keep the 1 kHz tick (tickless off) */
     SysTick->VAL  = 0;
     s_cap_arr = 25u;                                  /* 64e6/(25+1) = 2.462 MHz sample rate (same as 32 MHz path) */
+    return 0;
 }
 
 /* Restore SYSCLK to the 32 MHz HSE (undo emu_clk_boost) when emulation ends. */
-static void emu_clk_restore(void)
+static int emu_clk_restore(void)
 {
-    RCC->CFGR = (RCC->CFGR & ~RCC_CFGR_SW) | (2U << RCC_CFGR_SW_Pos);           /* SYSCLK <- HSE */
-    while (((RCC->CFGR & RCC_CFGR_SWS) >> RCC_CFGR_SWS_Pos) != 2U) { }
-    RCC->CR &= ~RCC_CR_PLLON;
+    if (((RCC->CFGR & RCC_CFGR_SWS) >> RCC_CFGR_SWS_Pos) == 3U) {
+        if (ble_cpu2_running()) {
+            /* Keep PLL running until CPU1 has verified that CPU2 selected HSE. */
+            (void)ble_cpu2_set_system_clock(BLE_SYSCLK_PLL_ON_TO_HSE);
+        } else {
+            emu_rcc_lock();
+            RCC->CFGR = (RCC->CFGR & ~RCC_CFGR_SW) | (2U << RCC_CFGR_SW_Pos);   /* SYSCLK <- HSE */
+            emu_rcc_unlock();
+        }
+    }
+    if (((RCC->CFGR & RCC_CFGR_SWS) >> RCC_CFGR_SWS_Pos) != 2U) return -1;
+    if (RCC->CR & RCC_CR_PLLON) {
+        emu_rcc_lock();
+        RCC->CR &= ~RCC_CR_PLLON;
+        while (RCC->CR & RCC_CR_PLLRDY) { }
+        emu_rcc_unlock();
+    }
     FLASH->ACR = (FLASH->ACR & ~FLASH_ACR_LATENCY) | FLASH_ACR_LATENCY_1WS;
+    while ((FLASH->ACR & FLASH_ACR_LATENCY) != FLASH_ACR_LATENCY_1WS) { }
     SystemCoreClock = 32000000u;
     SysTick->LOAD = (32000000u / configTICK_RATE_HZ) - 1u;
     SysTick->VAL  = 0;
     s_cap_arr = CAP_ARR;
-}
-
-/* TEMP DIAGNOSTIC: in subcarrier-stream target mode the chip streams the digitized RX into the FIFO. Drain it
- * and log the first runs of non-idle bytes so we learn the RX stream format for a reader command (WUPA/anticoll).
- * SPI stays usable in stream mode (unlike transparent), so plain FIFO reads work. */
-static void emu_stream_probe(void)
-{
-    /* Unmask IRQs so the STATUS regs latch RXE etc. (emu_config masked them all for transparent). */
-    reg_write(REG_IRQ_MASK_MAIN + 0, 0x00);
-    reg_write(REG_IRQ_MASK_MAIN + 1, 0x00);
-    reg_write(REG_IRQ_MASK_MAIN + 2, 0x00);
-    reg_write(REG_IRQ_MASK_MAIN + 3, 0x00);
-    direct_cmd(CMD_CLEAR_FIFO);
-    direct_cmd(CMD_UNMASK_RECEIVE);
-    (void)get_irq();
-    fantasi_log(LOG_INFO, "emu STRX cfg MODE=%02X OP=%02X STREAM=%02X",
-                reg_read(REG_MODE), reg_read(REG_OP_CONTROL), reg_read(REG_STREAM));
-    int fdseen = 0;
-    /* TX EMISSION TEST (s_stream_tx): on field-detect, stream a subcarrier burst to the FIFO and transmit, so PM3's
-     * trace shows whether the chip emits a carrier-locked subcarrier from stream mode as a target. */
-    if (s_stream_tx) {
-        uint8_t pat[24]; for (int i = 0; i < 24; i++) pat[i] = 0x0F;   /* Manchester-ish: 4 on / 4 off per byte */
-        int fired = 0; int fd_prev = 0;
-        TickType_t te = xTaskGetTickCount();
-        while ((xTaskGetTickCount() - te) < pdMS_TO_TICKS(15000) && fired < 2000) {
-            int fd = (reg_read(REG_AUX_DISPLAY) & 0x40) ? 1 : 0;
-            if (fd) fdseen++;
-            if (fd && !fd_prev) {   /* field just came on: blast bursts for a while */
-                for (int k = 0; k < 400; k++) {
-                    direct_cmd(CMD_CLEAR_FIFO);
-                    reg_write(REG_NUM_TX_BYTES2, (uint8_t)((24*8) & 0xFF));
-                    reg_write(REG_NUM_TX_BYTES1, (uint8_t)(((24*8) >> 8) & 0xFF));
-                    fifo_write(pat, 24);
-                    direct_cmd(CMD_TRANSMIT_NO_CRC);
-                    fired++;
-                }
-            }
-            fd_prev = fd;
-        }
-        fantasi_log(LOG_INFO, "emu STTX fired=%d fdseen=%d MODE=%02X", fired, fdseen, reg_read(REG_MODE));
-        return;
-    }
-    /* Continuous-stream RX test: ignore the framed byte-count; keep clocking the FIFO read and look for non-idle
-     * runs. In stream mode the digitized RX may be a continuous clocked stream, not a byte-counted frame. */
-    if (s_stream_cont) {
-        /* Capture the raw continuous stream. Determine the steady idle value, then log windows that contain any
-         * byte differing from idle (the reader command shows as envelope transitions - do not filter 0x00/0xFF!). */
-        uint32_t total = 0; int logged = 0;
-        uint8_t idle = 0xFF; int idleset = 0;
-        uint8_t win[64]; int wpos = 0; int since_change = 1<<30;
-        TickType_t te = xTaskGetTickCount();
-        while ((xTaskGetTickCount() - te) < pdMS_TO_TICKS(15000) && logged < 12) {
-            if (reg_read(REG_AUX_DISPLAY) & 0x40) fdseen++;
-            uint8_t tmp[48]; fifo_read(tmp, 48); total += 48;
-            if (!idleset) {   /* idle = most common of the first batch */
-                int c00=0,cFF=0; for (int i=0;i<48;i++){ if(tmp[i]==0)c00++; else if(tmp[i]==0xFF)cFF++; }
-                idle = (c00>=cFF)?0x00:0xFF; idleset = 1;
-            }
-            for (int i = 0; i < 48; i++) {
-                uint8_t b = tmp[i];
-                win[wpos % 64] = b; wpos++;
-                if (b != idle) {
-                    if (since_change > 32 && logged < 12) {   /* a fresh burst of activity: log the window around it */
-                        char s[180]; int o = 0;
-                        int start = wpos - 8; if (start < 0) start = 0;
-                        for (int j = 0; j < 56 && o < 170; j++) {
-                            /* read forward from here as the stream continues */
-                        }
-                        (void)start;
-                        /* dump the next 56 bytes fresh so we get the whole command */
-                        uint8_t cmd[56]; fifo_read(cmd, 56); total += 56;
-                        o = 0; o += snprintf(s+o, sizeof s-o, "%02X ", b);
-                        for (int j = 0; j < 56 && o < 174; j++) o += snprintf(s+o, sizeof s-o, "%02X", cmd[j]);
-                        fantasi_log(LOG_INFO, "emu STCONT idle=%02X %s", idle, s);
-                        logged++;
-                    }
-                    since_change = 0;
-                } else since_change++;
-            }
-        }
-        fantasi_log(LOG_INFO, "emu STCONT done total=%lu logged=%d fdseen=%d idle=%02X", (unsigned long)total, logged, fdseen, idle);
-        return;
-    }
-    uint32_t total = 0; int logged = 0, rxe = 0;
-    TickType_t t0 = xTaskGetTickCount();
-    while ((xTaskGetTickCount() - t0) < pdMS_TO_TICKS(15000) && logged < 12) {
-        if (reg_read(REG_AUX_DISPLAY) & 0x40) fdseen++;
-        uint32_t irq = get_irq();
-        if (irq & IRQ_RXE) {
-            rxe++;
-            uint8_t st[2]; reg_read_burst(REG_FIFO_STATUS1, st, 2);
-            int n = (int)((uint32_t)st[0] | (((uint32_t)(st[1] & FIFO2_b_mask) >> 6) << 8));
-            total += (uint32_t)n;
-            if (n > 0 && logged < 12) {
-                if (n > 32) n = 32;
-                uint8_t tmp[32]; fifo_read(tmp, n);
-                char s[100]; int o = 0;
-                for (int j = 0; j < n && o < 90; j++) o += snprintf(s + o, sizeof s - o, "%02X", tmp[j]);
-                fantasi_log(LOG_INFO, "emu STRXE irq=%08lX n=%d %s", (unsigned long)irq, n, s);
-                logged++;
-            }
-            direct_cmd(CMD_CLEAR_FIFO);
-        }
-    }
-    fantasi_log(LOG_INFO, "emu STRX done rxe=%d total=%lu logged=%d fdseen=%d", rxe, (unsigned long)total, logged, fdseen);
+    fz_power_tickless_block(false);
+    return 0;
 }
 
 static int emu_setup(void)
 {
-    s_emu_dbg = 0;
-    s_dbg_edges = 0; s_dbg_rxframes = 0; s_dbg_txcount = 0; s_dbg_txmiss = 0; s_dbg_sendn = 0; s_dbg_txmiss_ta = 0xFFFFFFFF; s_dbg_txmiss_tamax = 0;   /* NOTE: s_dbg_cmdn not reset - persistent ring survives session cycles for BMP read */
-    for (int _e = 0; _e < SEND_CACHE_N; _e++) s_send_cache[_e].ptr = 0;   /* TEMP: per-session counters */
+    s_emu_base_prio = uxTaskPriorityGet(NULL);
+    s_emu_task = xTaskGetCurrentTaskHandle();
+    s_emu_waiting = 0;
+    s_emu_starting = true;
+    s_emu_clock_owned = false;
+    s_edge_n = 0; s_tx_end_cyc = 0; s_tx_crypto = 0; s_tx_crypto_dma = 0;
+    s_tx_spec_state = EMU_SPEC_NONE;
+    s_tx_force_raw = 0; s_tx_dma_pending = 0; s_tx_dma_key = 0;
+    for (int e = 0; e < SEND_CACHE_N; e++) s_send_cache[e].ptr = 0;
     s_emu_ring = pvPortMalloc(EMU_RING);
     s_tr       = pvPortMalloc(EMU_MAXTR * sizeof *s_tr);
     s_seq      = pvPortMalloc(160);
-    s_paus     = pvPortMalloc(EMU_NPAUS * sizeof *s_paus);
-    if (!s_emu_ring || !s_tr || !s_seq || !s_paus) { emu_free(); return -1; }
-
-    emu_config();                                       /* transparent-target (MODE=88) correlator demod, OR stream target */
-    if (s_emu_stream) {                                 /* TEMP: probe the subcarrier-stream RX format, then end the session */
-        emu_stream_probe();
-        emu_free(); s_emu_up = false;
+    if (!s_emu_ring || !s_tr || !s_seq) {
+        emu_free(); s_emu_task = 0; s_emu_starting = false;
         return -1;
     }
+
+    emu_config();                                       /* transparent target using the PB4 envelope demodulator */
     direct_cmd(CMD_TRANSPARENT_MODE);                   /* enter transparent: chip's raw AFE drives the pins */
     mosi_as_output_low();                               /* PB5 = load-mod gate, idle low (for TX) */
     emu_bus_release();                                  /* furi transparent pin config: SCK/MISO/CS input+pullup */
@@ -2007,7 +1912,8 @@ static int emu_setup(void)
     vTaskDelay(pdMS_TO_TICKS(1));                       /* settle after transparent entry (as the sniff does) */
     /* Boost to 64 MHz now - after all the SPI/reg config (which ran at 32 MHz) and before the capture timer is
      * armed, so TIM2 (s_cap_arr=25) and TIM17 come up on the 64 MHz clock. All emu DWT constants are 64 MHz. */
-    emu_clk_boost();
+    s_emu_clock_owned = true;
+    if (emu_clk_boost() != 0) return -1;
     dma_circ_arm(s_emu_ring, EMU_RING);
     dma_cap_go();                                       /* free-running capture across recv/send */
 
@@ -2020,20 +1926,21 @@ static int emu_setup(void)
     EXTI->FTSR1 |= (1u << 4);
     EXTI->PR1   =  (1u << 4);
     EXTI->IMR1 |=  (1u << 4);
-    NVIC_SetPriority(EXTI4_IRQn, 4);               /* above USB (5): the last-edge phase anchor is preemption-free */
+    NVIC_SetPriority(EXTI4_IRQn, 3);               /* a new reader edge cancels/restarts a pending FDT before TIM17 */
+    NVIC_ClearPendingIRQ(EXTI4_IRQn);
     NVIC_EnableIRQ(EXTI4_IRQn);
     NVIC_SetPriority(EXTI0_IRQn, 5);               /* deferred recv-wake (syscall-safe); pended by EXTI4 only */
+    NVIC_ClearPendingIRQ(EXTI0_IRQn);
     NVIC_EnableIRQ(EXTI0_IRQn);
 
-    /* HW-timer FDT (TIM17): one-pulse, 32 MHz, fires EMU_FDT_TICKS after the last MISO edge (see the EXTI ISR
-     * arming + TIM17 ISR). URS=1 so the per-edge software re-arm (CNT=0) never spuriously raises the update IRQ -
+    /* HW-timer FDT (TIM17): one-pulse at 64 MHz, fires shortly before the reply time after the last MISO edge.
+     * URS=1 so the per-edge software re-arm (CNT=0) never spuriously raises the update IRQ -
      * only a real overflow (frame end + FDT) does. Free during HF emu: TIM1 is LF-only, TIM2 drives the capture. */
     RCC->APB2ENR |= RCC_APB2ENR_TIM17EN;
     (void)RCC->APB2ENR;
     TIM17->CR1  = TIM_CR1_OPM | TIM_CR1_URS;            /* one-pulse; only overflow generates update event */
-    TIM17->PSC  = 0;                                    /* 32 MHz tick */
-    TIM17->ARR  = s_fdt_arr;                             /* fire before the shorter FDT; emu_tx_raw's busy-wait then
-                                                         * extends to the command-specific s_fdt_ticks (1236/1172 fc) */
+    TIM17->PSC  = 0;                                    /* 64 MHz tick */
+    TIM17->ARR  = s_fdt_arr;                             /* fire shortly before the calibrated transmit point */
     TIM17->EGR  = TIM_EGR_UG;                           /* load PSC/ARR (URS -> no IRQ) */
     TIM17->SR   = 0;
     TIM17->DIER = TIM_DIER_UIE;                         /* update interrupt */
@@ -2041,36 +1948,18 @@ static int emu_setup(void)
                                                          * ISR in flight instead of waiting for it, so the reply's
                                                          * subcarrier start doesn't jitter against the reader's grid.
                                                          * Safe at pri 4 - this ISR makes no FreeRTOS syscall. */
+    NVIC_ClearPendingIRQ(TIM1_TRG_COM_TIM17_IRQn);
     NVIC_EnableIRQ(TIM1_TRG_COM_TIM17_IRQn);
     s_tx_armed = 0; s_fdt_locked = 0;
 
     emu_tx_pat_init();        /* precompute the per-half-bit edge patterns */
     emu_tx_dma_setup();
-    s_fdt_arr = EMU_FDT_ARR;   /* edges are pre-built (cache) so the fire is instant - keep the tight FDT-90 point */
+    s_fdt_arr = EMU_FDT_ARR;   /* enter early enough to program DMA, then phase-pin the first edge exactly */
     if (s_use_dma_tx) emu_edge_cache_alloc();   /* build DMA edges once/reply, pointer-swap on repeats (build-free hot path) */
 
-    s_emu_base_prio = uxTaskPriorityGet(NULL);
     s_emu_up = true;
+    s_emu_starting = false;
     return 0;
-}
-
-/* Reader 100% ASK pause centres from the current edge list (a pause is a wide LOW run; polarity is
- * s_tr_init ^ (i & 1) == 0), exactly how sniff_decode isolates the reader direction. */
-__attribute__((optimize("O2")))
-static int emu_reader_pauses(uint16_t *paus, int cap)
-{
-    int np = 0, init = s_tr_init;
-    for (int i = 1; i < s_ntr && np < cap; i++)
-        if (s_tr[i] - s_tr[i-1] >= 5 && (init ^ (i & 1)) == 0)
-            paus[np++] = (uint16_t)((s_tr[i-1] + s_tr[i]) / 2);
-    /* Keep only the last contiguous frame: a pause-to-pause span >= FRAME_GAP is a between-frame gap, so any
-     * pauses before it belong to a previous/stray frame (the sniff does this with find_cut). Without this a
-     * stale leading edge gets lumped into the current command and miller_decode misframes it. */
-    int start = 0;
-    for (int i = 1; i < np; i++)
-        if (paus[i] - paus[i-1] >= FRAME_GAP) start = i;
-    if (start > 0) { for (int i = start; i < np; i++) paus[i - start] = paus[i]; np -= start; }
-    return np;
 }
 
 /* Software carrier recovery (workaround for no MCU_CLK). The reply's subcarrier is CPU-timed and must land in the
@@ -2080,6 +1969,7 @@ static int emu_reader_pauses(uint16_t *paus, int cap)
  * subcarrier-period (fc/16 = 75.5 cyc) spacing. So the sub-period deviation of each same-type edge from the last
  * edge is that edge's jitter minus the last edge's jitter; averaging them yields -jitter(last_edge), i.e. it
  * cancels the last edge's individual jitter and returns the true carrier-referenced instant. */
+__attribute__((optimize("O2")))
 static uint32_t carrier_lock(uint32_t last_edge)
 {
     if (!s_carrier_en) return last_edge;   /* runtime toggle (poke via SWD) for interleaved A-B-A */
@@ -2096,14 +1986,38 @@ static uint32_t carrier_lock(uint32_t last_edge)
     return last_edge + (int32_t)((sum / cnt) / 2);     /* half-cyc -> cyc, jitter-averaged */
 }
 
+static int emu_fdt_anchor_lock(void)
+{
+    uint32_t pm = __get_PRIMASK();
+    __disable_irq();
+    if (EXTI->PR1 & (1u << 4)) {
+        if (!pm) __enable_irq();
+        return 0;
+    }
+    uint32_t last_edge = s_last_edge_cyc;
+    uint32_t rx_cyc = carrier_lock(last_edge);
+    if (EXTI->PR1 & (1u << 4)) {
+        if (!pm) __enable_irq();
+        return 0;
+    }
+    s_emu_rx_cyc = rx_cyc;
+    s_fdt_locked = 1;
+    s_edge_n = 0;
+    if (!pm) __enable_irq();
+    return 1;
+}
+
 /* Receive one reader command by capturing the transparent-mode demod off MISO and Miller-decoding it
  * (reusing the sniff DSP). Scans the free-running ring for a command framed by >= FRAME_GAP of trailing
  * silence, records the frame-end DWT (the FDT reference), decodes into rx[]/rx_par[]. rx_par[i] is the
  * raw received parity bit (a Crypto1 frame legitimately violates odd parity). Returns byte count, 0 idle. */
-int hal_rfid_hf_emu_recv(uint8_t *rx, uint8_t *rx_par, int cap, uint32_t timeout_ms)
+static int emu_recv(uint8_t *rx, uint8_t *rx_par, int cap, uint32_t timeout_ms)
 {
     if (s_mode != RFID_HF_EMU || !rx || cap <= 0 || !s_emu_up) return RFID_ERR_UNSUPP;
+    emu_early_stream_cancel();
     __set_BASEPRI(0);   /* clear any reply-staging USB mask left by a prior command that didn't reply (see emu_tx_arm) */
+    if (!s_tx_armed)
+        s_fdt_locked = 0;   /* a new receive call confirms the prior command will not stage a reply */
     /* Run + block at high priority so the EXTI notify schedules us the instant a frame's first edge arrives
      * (at base priority the USB task, idle+2, runs first and the frame buffers, adding detection lag that
      * blows the FDT). The idle block still yields the CPU (USB runs while we're blocked), and recv returns
@@ -2119,8 +2033,7 @@ int hal_rfid_hf_emu_recv(uint8_t *rx, uint8_t *rx_par, int cap, uint32_t timeout
     uint32_t active_until = DWT->CYCCNT;    /* busy-poll (no block) until this DWT time; 0-length => block now */
     uint32_t active_open_since = DWT->CYCCNT;   /* DWT when the active window last OPENED; a real frame decodes and
                                                 * lapses within a few ms, so "open >5 ms" == noise (not a live scan) */
-    int warmed = 0;                         /* per-frame: has the decode-path I-cache been warmed yet */
-    uint32_t prevtop = DWT->CYCCNT;
+    uint32_t wake_grace_until = DWT->CYCCNT;
 
     for (;;) {
         /* Reader-gone stop-key yield (HAL-side, so it can manage BASEPRI - the module can't). While a reader is
@@ -2142,22 +2055,31 @@ int hal_rfid_hf_emu_recv(uint8_t *rx, uint8_t *rx_par, int cap, uint32_t timeout
          *    with no noise). During a live exchange this is false (tick fresh) and the window lapses <8 ms between
          *    commands, so neither trigger fires -> the exchange (and the READ FDT) is untouched. */
         int emu_idle       = (int32_t)(DWT->CYCCNT - active_until) >= 0;
-        int emu_noisestuck = (int32_t)(DWT->CYCCNT - active_open_since) > (int32_t)(8u * 1000u * 64u);
+        int emu_noisestuck = (int32_t)(DWT->CYCCNT - active_open_since) > (int32_t)(EMU_NOISE_US * 64u);
         int emu_rdrgone    = (xTaskGetTickCount() - s_last_frame_tick) > pdMS_TO_TICKS(200);
         if (emu_noisestuck || (emu_rdrgone && emu_idle)) {
-            vTaskPrioritySet(NULL, s_emu_base_prio);
-            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(5));
-            vTaskPrioritySet(NULL, configMAX_PRIORITIES - 1);
-            uint32_t wpr = EMU_RING - DMA1_Channel1->CNDTR;
-            wr_hi = 0; last_wpos = wpr;
-            read_abs = (wpr >= 200u) ? (wpr - 200u) : 0u;
-            wp0 = read_abs; pos = 0; s_ntr = 0; warmed = 0;
-            miller_inc_reset();
-            s_lvl = (s_emu_ring[read_abs % EMU_RING] >> s_cap_shift) & 1; s_tr_init = s_lvl;
-            active_until = DWT->CYCCNT + 500u * 64u;
+            s_edge_n = 0;                              /* discard phase samples from the abandoned window */
+            __set_BASEPRI(0);
+            if (emu_noisestuck) vTaskPrioritySet(NULL, s_emu_base_prio);
+            s_emu_waiting = 1;
+            __DMB();
+            uint32_t woke = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(5));
+            s_emu_waiting = 0;
+            if (emu_noisestuck) vTaskPrioritySet(NULL, configMAX_PRIORITIES - 1);
+            if (woke) {
+                uint32_t wpr = EMU_RING - DMA1_Channel1->CNDTR;
+                wr_hi = (wpr < EMU_WAKE_LOOKBACK) ? EMU_RING : 0;
+                last_wpos = wpr;
+                read_abs = wr_hi + wpr - EMU_WAKE_LOOKBACK;
+                pos = 0; s_ntr = 0;
+                miller_inc_reset();
+                s_lvl = (s_emu_ring[read_abs % EMU_RING] >> s_cap_shift) & 1; s_tr_init = s_lvl;
+                active_until = DWT->CYCCNT + EMU_ACTIVE_US * 64u;
+                wake_grace_until = DWT->CYCCNT + EMU_WAKE_GRACE_US * 64u;
+            } else {
+                active_until = DWT->CYCCNT;
+            }
         }
-        { uint32_t nt = DWT->CYCCNT, d = nt - prevtop; prevtop = nt;
-          if (d > s_dbg_maxit) s_dbg_maxit = d; }   /* TEMP: slowest single loop iteration since last edge */
         /* USB-preemption guard for the active-frame window: while we're busy-polling a frame in (edges flowing,
          * active_until still in the future) mask the USB ISR (pri 5) so neither the gap detection drain nor the
          * reply dispatch is preempted (that preemption jitter would push the UID/SAK turnaround past the FDT).
@@ -2167,61 +2089,14 @@ int hal_rfid_hf_emu_recv(uint8_t *rx, uint8_t *rx_par, int cap, uint32_t timeout
          * task, so a held mask would stall USB for the entire idle wait). arm clears it on the reply path. */
         if (s_use_dma_tx)
             __set_BASEPRI((int32_t)(DWT->CYCCNT - active_until) < 0 ? (uint32_t)EMU_MASK_USB : 0u);
-        if ((xTaskGetTickCount() - t0) >= pdMS_TO_TICKS(timeout_ms ? timeout_ms : 100)) {
-            __set_BASEPRI(0);                           /* reader-gone path runs fantasi_log diag: never masked */
+        if ((xTaskGetTickCount() - t0) >= pdMS_TO_TICKS(timeout_ms ? timeout_ms : 100) &&
+            (int32_t)(DWT->CYCCNT - wake_grace_until) >= 0) {
+            __set_BASEPRI(0);
             vTaskPrioritySet(NULL, s_emu_base_prio);    /* must drop to base: the app polls its stop key at our
                                                          * priority, and the lower-priority CLI task can't deliver
                                                          * the keystroke if we return still boosted -> the app
                                                          * never stops -> clean exit fails -> USB stranded. */
-            (void)s_edge_logged;   /* recv-idle logging removed: fantasi_log there (~7000 cyc) is too slow for
-                                    * the recv-return path. */
-            /* TEMP DIAG: dump the persistent decoded-command ring, but only after several consecutive idle
-             * timeouts (reader gone) so it never delays an active anticoll decode. */
-            { static uint32_t s_diag_lastcmdn; static int s_diag_idle;
-              if (s_dbg_cmdn == s_diag_lastcmdn) s_diag_idle++; else { s_diag_idle = 0; s_diag_lastcmdn = s_dbg_cmdn; }
-              if (s_diag_idle == 3 && s_dbg_cmdn) {
-                  int total = (int)s_dbg_cmdn, show = total < 12 ? total : 12;
-                  char b[160]; int o = 0;
-                  for (int k = total - show; k < total; k++) {
-                      int ci = k % 40;
-                      o += snprintf(b + o, sizeof b - o, "%d:%02X%02X ",
-                                    s_dbg_cmdlog[ci][0], s_dbg_cmdlog[ci][1], s_dbg_cmdlog[ci][2]);
-                  }
-                  fantasi_log(LOG_INFO, "emu RING(n=%d) %s", total, b);
-                  fantasi_log(LOG_INFO, "emu TX tx=%lu miss=%lu ta_max=%lu arr=%lu ac_det=%d ac_dec=%d",
-                              (unsigned long)s_dbg_txcount, (unsigned long)s_dbg_txmiss,
-                              (unsigned long)s_dbg_txmiss_tamax, (unsigned long)s_fdt_arr, s_diag_gdet, s_diag_gdec);
-                  char g[128]; int go = 0;
-                  for (int _s = 0; _s < 24; _s++) go += snprintf(g + go, sizeof g - go, "%d", s_diag_gseq[_s]);
-                  fantasi_log(LOG_INFO, "emu GRID maxi=%d np=%d seq=%s", s_diag_gmaxi, s_diag_gnp, g);
-                  char pc[160]; int po = 0;
-                  for (int _s = 1; _s < s_diag_gpcn && _s < 20; _s++)
-                      po += snprintf(pc + po, sizeof pc - po, "%d ", s_diag_gpc[_s] - s_diag_gpc[_s-1]);
-                  fantasi_log(LOG_INFO, "emu PCDELTA(n=%d) %s", s_diag_gpcn, pc);
-                  char td[180]; int to = 0;
-                  for (int _s = 1; _s < s_diag_trn && _s < 26; _s++)
-                      to += snprintf(td + to, sizeof td - to, "%d ", s_diag_tr[_s] - s_diag_tr[_s-1]);
-                  fantasi_log(LOG_INFO, "emu TREDGE(n=%d,init=%d) %s", s_diag_trn, s_tr_init, td);
-                  char wd[180]; int wo = 0;
-                  for (int _s = 1; _s < s_diag_wtrn && _s < 26; _s++)
-                      wo += snprintf(wd + wo, sizeof wd - wo, "%d ", s_diag_wtr[_s] - s_diag_wtr[_s-1]);
-                  fantasi_log(LOG_INFO, "emu WUPAedge(n=%d,init=%d) %s", s_diag_wtrn, s_diag_winit, wd);
-              }
-            }
-            if (s_bmp_ready && !s_bmp_logged) {          /* TEMP: my TX modulation envelope on MISO (subcarrier edges
-                                                          * per ~1-etu window). Shows if the reply is a full clean
-                                                          * Manchester frame or truncates/droops. Read live via CDC. */
-                s_bmp_logged = 1;
-                fantasi_log(LOG_INFO, "emu TXcap nbits=%d", s_bmp_nbits);
-                for (int w = 0; w + 230 <= 512; w += 230) {
-                    char b[96]; int o = 0;
-                    for (int k = w; k < w + 230 && k + 23 <= 512; k += 23) {
-                        int e = 0; for (int i = k + 1; i < k + 23; i++) e += (s_bmp_cap[i] != s_bmp_cap[i-1]);
-                        o += snprintf(b + o, sizeof b - o, "%2d ", e);
-                    }
-                    fantasi_log(LOG_INFO, "emu TXwin %s", b);
-                }
-            }
+            emu_early_stream_cancel();
             return 0;                                   /* timeout: return so the app can poll its stop key */
         }
 
@@ -2231,14 +2106,14 @@ int hal_rfid_hf_emu_recv(uint8_t *rx, uint8_t *rx_par, int cap, uint32_t timeout
         /* While our own DMA reply is on the field, the demod feeds it back onto MISO - skip those samples so we
          * don't decode our reply as a bogus reader command. Keep read_abs at the head and reset the frame state. */
         int32_t txrem = (int32_t)(DWT->CYCCNT - s_tx_end_cyc);
-        if (s_txskip && txrem < 0 && txrem > -20000) {   /* A/B: s_txskip=0 disables the self-TX skip entirely */
+        if (s_txskip && ((TIM1->CR1 & TIM_CR1_CEN) ||
+                         (txrem < 0 && txrem > -20000))) {
+            s_edge_n = 0;                                /* discard self-TX/ringing edges before carrier_lock */
             read_abs = wr_hi + wp; s_ntr = 0; pos = 0; miller_inc_reset();
             s_lvl = (s_emu_ring[(wr_hi + wp) % EMU_RING] >> s_cap_shift) & 1; s_tr_init = s_lvl;
             active_until = DWT->CYCCNT; continue;
         }
         uint32_t backlog = (wr_hi + wp) - read_abs;
-        s_dbg_notice++;                                 /* TEMP: loop iters since last edge */
-        if (backlog > s_dbg_decode2) s_dbg_decode2 = backlog;   /* TEMP: max backlog since last edge */
 
         /* Hybrid real-time frame-end: the EXTI ISR timestamps every MISO edge into s_last_edge_cyc, so when no
          * edge has arrived for FRAME_GAP the frame ended ~33 us ago - known immediately, not after the level-DMA
@@ -2248,6 +2123,19 @@ int hal_rfid_hf_emu_recv(uint8_t *rx, uint8_t *rx_par, int cap, uint32_t timeout
          * Miller pauses within a frame, so it won't false-fire mid-frame yet cuts the wait vs FRAME_GAP=81. */
         int gap_by_time = (s_ntr >= 4) &&
                           ((int32_t)(DWT->CYCCNT - s_last_edge_cyc) >= (int32_t)(52u * EMU_SAMP_CYC));
+
+        /* The edge timer can report frame end before the polling loop has
+         * consumed the capture DMA's final samples. Drain that stable tail
+         * before grouping bytes, or the last encrypted AUTH byte is lost. */
+        if (gap_by_time && backlog) {
+            uint32_t take = backlog > 4096u ? 4096u : backlog;
+            uint32_t rp = read_abs % EMU_RING, first = EMU_RING - rp;
+            if (first > take) first = take;
+            scan_span(s_emu_ring + rp, (int)first, &pos);
+            if (take > first) scan_span(s_emu_ring, (int)(take - first), &pos);
+            read_abs += take;
+            miller_inc_feed();
+        }
 
         /* Detect + decode first, before the idle/scan below. s_tr already holds the whole frame (the during-frame
          * scans filled it in the ~52 samples before the gap), so on gap_by_time we go straight to decode+reply -
@@ -2259,42 +2147,37 @@ int hal_rfid_hf_emu_recv(uint8_t *rx, uint8_t *rx_par, int cap, uint32_t timeout
              * no fast-path needed and multi-byte replies now fit the FDT window. */
             if (s_mp_np >= 4) {
                 /* Reference = the deterministic hardware last-edge time from the EXTI ISR (no scan-lag jitter). */
-                s_emu_rx_cyc = carrier_lock(s_last_edge_cyc);
-                s_edge_n = 0;   /* fresh edges for the next frame (carrier_lock must not use stale timestamps) */
-                s_fdt_locked = 1;   /* freeze the FDT timer at last-real-edge + FDT (ignore spurious edges) */
-                s_dbg_p0 = DWT->CYCCNT;                     /* TEMP: DWT at detection (for app_path) */
-                s_dbg_gbt = s_dbg_bl;                       /* TEMP: snapshot blocks-since-last-edge at gap-fire */
-                s_snap_it = s_dbg_notice; s_snap_bl = s_dbg_decode2; s_snap_mit = s_dbg_maxit;
-                uint32_t dc0 = DWT->CYCCNT;
+                if (!emu_fdt_anchor_lock()) continue;
                 uint32_t par = 0;
                 int m = miller_inc_finish(rx, &par);
-                s_dbg_decode = DWT->CYCCNT - dc0;           /* TEMP */
-                if (m > 0 && rx[0] != 0x52 && rx[0] != 0x26) {   /* keep only the cheap det/dec numbers off the copies */
-                    s_diag_gdet = (int)(s_dbg_p0 - s_emu_rx_cyc); s_diag_gdec = (int)s_dbg_decode;
+                int early_committed = 0;
+                if (m > 0) {
+                    int short_frame = s_grp_n == 0 && s_grp_nb >= 6 && s_grp_nb <= 7;
+                    int last_bit = short_frame ? ((rx[0] >> 6) & 1)
+                                               : (((par >> (m - 1)) & 1) ? __builtin_parity(rx[m - 1])
+                                                                         : !__builtin_parity(rx[m - 1]));
+                    s_fdt_ticks = last_bit ? EMU_FDT_1 : EMU_FDT_0;
+                    if (emu_early_stream_pending()) {
+                        if (s_use_dma_tx) __set_BASEPRI(EMU_MASK_USB);
+                        early_committed = emu_early_stream_commit(m);
+                    }
                 }
                 if (m > 0) {
-                    s_dbg_ret = DWT->CYCCNT;               /* TEMP: DWT at recv return (split app path) */
-                    s_dbg_m = m; s_dbg_bb[0]=rx[0]; s_dbg_bb[1]=m>1?rx[1]:0;
-                    s_dbg_bb[2]=m>2?rx[2]:0; s_dbg_bb[3]=m>3?rx[3]:0;   /* TEMP: what recv delivered */
-                    s_dbg_rxframes++;                       /* TEMP: a reader frame decoded this session */
                     s_last_frame_tick = xTaskGetTickCount();   /* reader live: keep the stop-key yield disengaged */
-                    { int _ci = s_dbg_cmdn % 40; s_dbg_cmdlog[_ci][0]=(uint8_t)m;
-                        s_dbg_cmdlog[_ci][1]=rx[0]; s_dbg_cmdlog[_ci][2]=(m>1?rx[1]:0); s_dbg_cmdn++; }
-                    /* Reply FDT from the reader's last transmitted bit (physical): 1 -> 1236 fc, 0 -> 1172 fc. A 1-byte
-                     * frame is a 7-bit short frame (no parity), last bit = bit 6; a standard frame's last bit is the
-                     * odd-parity bit of the last byte = !parity(byte). Frame-length + parity only, no command identity. */
-                    s_fdt_ticks = ((m == 1) ? ((rx[0] >> 6) & 1) : !__builtin_parity(rx[m-1])) ? EMU_FDT_1 : EMU_FDT_0;
                     if (rx_par)
                         for (int i = 0; i < m && i < cap; i++)
                             rx_par[i] = (uint8_t)(((par >> i) & 1) ? __builtin_parity(rx[i])
                                                                    : !__builtin_parity(rx[i]));
+                    if (!early_committed && s_use_dma_tx)
+                        __set_BASEPRI(EMU_MASK_USB);   /* keep ordinary module dispatch through reply staging */
                     s_ntr = 0; pos = 0; miller_inc_reset();  /* ready for the next frame */
-                    if (s_use_dma_tx) __set_BASEPRI(EMU_MASK_USB);   /* atomic reply-staging: mask USB (not the reply
-                                                                      * ISRs) through the arm; emu_tx_arm clears it. */
                     return m;
                 }
             }
+            s_fdt_locked = 0;
+            s_edge_n = 0;
             s_ntr = 0; pos = 0; miller_inc_reset();          /* gap fired, no valid frame: reset, keep listening */
+            read_abs = wr_hi + wp;
             continue;
         }
 
@@ -2302,46 +2185,65 @@ int hal_rfid_hf_emu_recv(uint8_t *rx, uint8_t *rx_par, int cap, uint32_t timeout
             /* Within an active window (a frame is arriving): busy-poll, don't block - blocking per edge thrashes
              * ~50 context switches/frame and puts the reply ~300 us late. Otherwise idle: drop to base so USB/
              * watchdog run, block until the frame's first edge wakes us via EXTI (~1 us) or a 2 ms stop-key cap,
-             * then boost + open a 500 us active window so the rest of the frame is scanned uninterrupted. */
+             * then boost + open an active window so the rest of the frame is scanned uninterrupted. */
             if ((int32_t)(DWT->CYCCNT - active_until) < 0) { continue; }   /* active: tight spin, no yield -
                                                          * taskYIELD would hand off to furi timer/USB and add
                                                          * 100s-of-us to `notice`; bounded by active_until */
             /* Idle: block at high priority (no drop-to-base) so the EXTI notify preempts USB and schedules us
              * within ~1 us of the frame's first edge. The block yields the CPU while we wait, so USB still runs.
              * (The stop key is serviced by the reader-gone edge-woken base wait at the top of this loop.) */
-            s_dbg_bl++;                                   /* TEMP: count blocks since frame start */
-            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(2));
-            active_until = DWT->CYCCNT + 500u * 64u;
+            s_edge_n = 0;                                 /* next EXTI edge starts a fresh carrier phase sample */
+            __set_BASEPRI(0);
+            s_emu_waiting = 1;
+            __DMB();
+            uint32_t woke = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(2));
+            s_emu_waiting = 0;
+            if (!woke) {
+                active_until = DWT->CYCCNT;
+                continue;
+            }
+            active_until = DWT->CYCCNT + EMU_ACTIVE_US * 64u;
+            wake_grace_until = DWT->CYCCNT + EMU_WAKE_GRACE_US * 64u;
             /* Resync the scan window to a small lookback before now: while we slept the DMA filled the ring, so
              * scanning from the stale read_abs would chew through 100s of samples of pre-frame silence before
              * reaching the frame. Start ~200 samples before the
              * current write pos (covers the wake latency to catch the frame's first edge) and reset the decoder.
-             * The atomic FDT reference stays valid: wp0 == read_abs, pos & s_tr[] are relative to it. */
+             * The atomic FDT reference stays valid because pos and s_tr[] are relative to read_abs. */
             uint32_t wpr = EMU_RING - DMA1_Channel1->CNDTR;
-            wr_hi = 0; last_wpos = wpr;
-            read_abs = (wpr >= 200u) ? (wpr - 200u) : 0u;
+            wr_hi = (wpr < EMU_WAKE_LOOKBACK) ? EMU_RING : 0;
+            last_wpos = wpr;
+            read_abs = wr_hi + wpr - EMU_WAKE_LOOKBACK;
             /* Skip any leading low baseline (the demod droop our own load-mod leaves behind): anchor the frame on
              * the carrier-ON level so s_tr_init = 1. A stray low first sample here flips the pause-parity of the
              * whole following frame - the reader's short (~6-sample) Miller pauses get read as the long carrier-on
              * gaps between them. Cap the skip so a fully
              * quiet window can't run us into the frame body. */
-            wp0 = read_abs; pos = 0; s_ntr = 0; warmed = 0;   /* re-warm the decode cache for the new frame */
+            pos = 0; s_ntr = 0;
             miller_inc_reset();                          /* re-scanning from the lookback: rebuild the grid too */
             s_lvl = (s_emu_ring[read_abs % EMU_RING] >> s_cap_shift) & 1; s_tr_init = s_lvl;
             continue;
         }
-        active_until = DWT->CYCCNT + 500u * 64u;         /* samples flowing: stay in the active window */
+        active_until = DWT->CYCCNT + EMU_ACTIVE_US * 64u;   /* samples flowing: stay in the active window */
         if (backlog > 9 * EMU_RING / 10) {              /* fell behind: skip to head, drop the frame */
+            s_edge_n = 0;
             read_abs = wr_hi + wp; s_ntr = 0; pos = 0; miller_inc_reset();
             s_lvl = (s_emu_ring[read_abs % EMU_RING] >> s_cap_shift) & 1; s_tr_init = s_lvl;
             continue;
         }
-        /* On the real-time gap don't scan the trailing silence: s_tr already holds the whole frame (captured by
-         * the during-frame scans in the ~FRAME_GAP before gap_by_time fired). Otherwise scan the new samples
-         * (hold back 16). */
-        uint32_t take = gap_by_time ? 0u : (backlog > 16u ? backlog - 16u : 0u);
-        if (take > 4096) take = 4096;
-        if (take) {
+        /* Hold back a short DMA tail while the frame is active. Refresh the
+         * producer after each bounded quantum so samples captured during
+         * scan/feed are consumed without another full outer-loop pass. */
+        uint32_t budget = gap_by_time ? 0u : 2048u;
+        while (budget) {
+            uint32_t wp_scan = EMU_RING - DMA1_Channel1->CNDTR;
+            if (wp_scan < last_wpos) wr_hi += EMU_RING;
+            last_wpos = wp_scan;
+            uint32_t live = (wr_hi + wp_scan) - read_abs;
+            if (live <= 16u) break;
+            uint32_t take = live - 16u;
+            if (take > 128u) take = 128u;
+            if (take > budget) take = budget;
+            int full_quantum = take == 128u;
             uint32_t rp = read_abs % EMU_RING, first = EMU_RING - rp;
             if (first > take) first = take;
             scan_span(s_emu_ring + rp, (int)first, &pos);
@@ -2349,54 +2251,111 @@ int hal_rfid_hf_emu_recv(uint8_t *rx, uint8_t *rx_par, int cap, uint32_t timeout
             read_abs += take;
             miller_inc_feed();                           /* PIPELINE: fold the new pauses into the grid now, so
                                                           * frame-end only needs the byte-grouping (fits the FDT) */
+            budget -= take;
+            if (s_mp_np >= 4 &&
+                (int32_t)(DWT->CYCCNT - s_last_edge_cyc) >= (int32_t)(52u * EMU_SAMP_CYC))
+                break;
+            if (!full_quantum) break;
         }
 
         /* Re-check the gap right here (not only at the loop top): a frame-processing iteration is ~1700 cyc, so
          * deferring the gap-fire to the next top-of-loop adds a whole iteration to `det`.
          * With the pipeline the grid is already built, so this is just the cheap byte-grouping + reply. */
         if (s_mp_np >= 4 && (int32_t)(DWT->CYCCNT - s_last_edge_cyc) >= (int32_t)(52u * EMU_SAMP_CYC)) {
-            s_emu_rx_cyc = carrier_lock(s_last_edge_cyc);
-            s_edge_n = 0;   /* fresh edges for the next frame (carrier_lock must not use stale timestamps) */
-            s_fdt_locked = 1;   /* freeze the FDT timer at last-real-edge + FDT (ignore spurious edges) */
-            s_dbg_p0 = DWT->CYCCNT;
-            uint32_t dc0 = DWT->CYCCNT, par = 0;
+            /* scan/feed may span the final reader edges. Refresh the DMA head
+             * before the final drain; the loop-top snapshot can be stale. */
+            uint32_t wp_tail = EMU_RING - DMA1_Channel1->CNDTR;
+            if (wp_tail < last_wpos) wr_hi += EMU_RING;
+            last_wpos = wp_tail;
+            uint32_t tail = (wr_hi + wp_tail) - read_abs;
+            if (tail) {
+                uint32_t rp = read_abs % EMU_RING, first = EMU_RING - rp;
+                if (first > tail) first = tail;
+                scan_span(s_emu_ring + rp, (int)first, &pos);
+                if (tail > first) scan_span(s_emu_ring, (int)(tail - first), &pos);
+                read_abs += tail;
+                miller_inc_feed();
+            }
+            if (!emu_fdt_anchor_lock()) continue;
+            uint32_t par = 0;
             int m = miller_inc_finish(rx, &par);
-            s_dbg_decode = DWT->CYCCNT - dc0;
-            if (m > 0 && rx[0] != 0x52 && rx[0] != 0x26) {
-                s_diag_gdet = (int)(s_dbg_p0 - s_emu_rx_cyc); s_diag_gdec = (int)s_dbg_decode;
+            int early_committed = 0;
+            if (m > 0) {
+                int short_frame = s_grp_n == 0 && s_grp_nb >= 6 && s_grp_nb <= 7;
+                int last_bit = short_frame ? ((rx[0] >> 6) & 1)
+                                           : (((par >> (m - 1)) & 1) ? __builtin_parity(rx[m - 1])
+                                                                     : !__builtin_parity(rx[m - 1]));
+                s_fdt_ticks = last_bit ? EMU_FDT_1 : EMU_FDT_0;
+                if (emu_early_stream_pending()) {
+                    if (s_use_dma_tx) __set_BASEPRI(EMU_MASK_USB);
+                    early_committed = emu_early_stream_commit(m);
+                }
             }
             if (m > 0) {
-                s_dbg_ret = DWT->CYCCNT;
-                s_dbg_m = m; s_dbg_bb[0]=rx[0]; s_dbg_bb[1]=m>1?rx[1]:0;
-                s_dbg_rxframes++;
                 s_last_frame_tick = xTaskGetTickCount();   /* reader live: keep the stop-key yield disengaged */
-                { int _ci = s_dbg_cmdn % 40; s_dbg_cmdlog[_ci][0]=(uint8_t)m;
-                    s_dbg_cmdlog[_ci][1]=rx[0]; s_dbg_cmdlog[_ci][2]=(m>1?rx[1]:0); s_dbg_cmdn++; }
                 if (rx_par)
                     for (int i = 0; i < m && i < cap; i++)
                         rx_par[i] = (uint8_t)(((par >> i) & 1) ? __builtin_parity(rx[i]) : !__builtin_parity(rx[i]));
+                if (!early_committed && s_use_dma_tx)
+                    __set_BASEPRI(EMU_MASK_USB);   /* keep ordinary module dispatch through reply staging */
                 s_ntr = 0; pos = 0; miller_inc_reset();
-                if (s_use_dma_tx) __set_BASEPRI(EMU_MASK_USB);   /* atomic reply-staging (see the gap_by_time return) */
                 return m;
             }
+            s_fdt_locked = 0;
+            s_edge_n = 0;
             s_ntr = 0; pos = 0; miller_inc_reset();
+            read_abs = wr_hi + wp_tail;
         }
 
-        (void)warmed;
     }
 }
 
-/* In transparent mode PB5 (MOSI) is a plain GPIO that gates the load modulation. Switch it between the
- * SPI alternate function (framing-engine RX) and a GPIO output (bit-bang TX). */
+int hal_rfid_hf_emu_recv(uint8_t *rx, uint8_t *rx_par, int cap, uint32_t timeout_ms)
+{
+    s_grp_byte_ready = 0;
+    s_grp_byte_ctx = 0;
+    return emu_recv(rx, rx_par, cap, timeout_ms);
+}
+
+int hal_rfid_hf_emu_recv_progress(uint8_t *rx, uint8_t *rx_par, int cap, uint32_t timeout_ms,
+                                  void (*data_ready)(void *ctx, int index, uint8_t raw, int bits), void *ctx)
+{
+    s_grp_byte_ready = data_ready;
+    s_grp_byte_ctx = ctx;
+    int rc = emu_recv(rx, rx_par, cap, timeout_ms);
+    s_grp_byte_ready = 0;
+    s_grp_byte_ctx = 0;
+    return rc;
+}
+
+/* In transparent mode PB5/MOSI is a GPIO load-modulation gate. It returns to the SPI alternate function only
+ * during teardown. */
 static void mosi_as_output_low(void)
 { EMU_MOSI_LO; GPIOB->MODER = (GPIOB->MODER & ~GPIO_MODER_MODE5) | (1u << GPIO_MODER_MODE5_Pos); }
 static void mosi_as_spi(void)
 { GPIOB->MODER = (GPIOB->MODER & ~GPIO_MODER_MODE5) | (2u << GPIO_MODER_MODE5_Pos); }
 
+/* In transparent mode SCLK is the ST25R3916 receiver enable. CS remains high,
+ * so changing SCLK here cannot clock an SPI command or leave transparent mode. */
+static void emu_rx_disable(void)
+{
+    GPIOA->BSRR = (1u << (5 + 16));
+    GPIOA->MODER = (GPIOA->MODER & ~GPIO_MODER_MODE5) | (1u << GPIO_MODER_MODE5_Pos);
+}
+
+static void emu_rx_enable(void)
+{
+    GPIOA->BSRR = (1u << 5);
+    GPIOA->MODER = (GPIOA->MODER & ~GPIO_MODER_MODE5) | (1u << GPIO_MODER_MODE5_Pos);
+}
+
 /* Emit one half-bit on MOSI: `on` = load-modulate an 847 kHz subcarrier (4 periods), else idle low. `*t`
  * is the running DWT deadline - each edge busy-waits to it so the timing self-corrects. */
-static void emu_tx_half(uint32_t *t, int on)
+static void emu_tx_half(uint32_t *t, int on, unsigned *frac)
 {
+    *frac += EMU_HALF_FRAC_NUM;
+    int extra = 0;
+    if (*frac >= EMU_HALF_FRAC_DEN) { *frac -= EMU_HALF_FRAC_DEN; extra = 1; }
     if (on) {
         /* 8 half-periods on the 18.875-cyc grid, summing to exactly 151 (= 4 periods of fc/16). Keeps every
          * subcarrier edge aligned to the FPGA's 16-tick window instead of drifting 0.6%/period. */
@@ -2407,34 +2366,31 @@ static void emu_tx_half(uint32_t *t, int on)
          * toggle which drifts against the reader's crystal. */
         (void)s_subc_dur;
         EMU_MOSI_HI;
-        *t += EMU_HALF_ETU;
+        *t += EMU_HALF_ETU + (uint32_t)extra;
         while ((int32_t)(DWT->CYCCNT - *t) < 0) { }
         EMU_MOSI_LO;
 #else
         for (int e = 0; e < 8; e++) {
             if (e & 1) EMU_MOSI_LO; else EMU_MOSI_HI;   /* set at the start of the sub-period so the subcarrier
                                                          * edge is not delayed into the FPGA correlation window */
-            *t += s_subc_dur[e];
+            *t += s_subc_dur[e] + (e == 2 ? extra : 0);
             while ((int32_t)(DWT->CYCCNT - *t) < 0) { }
         }
         EMU_MOSI_LO;                                     /* end the half-bit low */
 #endif
     } else {
-        *t += EMU_HALF_ETU;
+        *t += EMU_HALF_ETU + (uint32_t)extra;
         while ((int32_t)(DWT->CYCCNT - *t) < 0) { }
         EMU_MOSI_LO;
     }
 }
 
-/* The raw Manchester load-modulation bit-bang (interrupts off, DWT-timed). Runs in the TIM17 ISR at the
- * FDT instant. `bits` includes the start bit (SOF); LSB-first, 1 = subcarrier in the first half-bit. */
-/* ---- Jitter-free DMA subcarrier TX (stock DigitalSignal technique). TIM1 (free during HF emu) generates the
+/* Jitter-free DMA subcarrier TX. TIM1 (free during HF emu) generates the
  * fc/16 load-mod edges on MOSI/PB5 via two DMA channels triggered by TIM1_UP: DMA1_Ch2 -> TIM1->ARR (next edge
  * duration), DMA1_Ch3 -> GPIOB->BSRR (next MOSI level). No CPU per edge => zero inter-edge jitter and the CPU is
- * free during the reply, so recv can catch the next reader command instead of being frozen in a busy-wait. The
- * MISO capture (TIM2/DMA1_Ch1) keeps running for RX; MOSI edges don't hit the PB4 EXTI. ---- */
-/* Longest reply is an 18-byte encrypted READ = 1 start + 18*(8+1) + stop = 164 air-bits, each expanded to
- * up to 9 DMA segments (8 subcarrier "on" + 1 "off" half) => ~1476 edges + sentinel. Sized to hold it whole.
+ * free during the reply. The raw DWT-timed path handles a static reply's first use while its DMA cache is built. */
+/* Longest reply is an 18-byte encrypted READ: 1 start + 18*(8+1) = 163 air bits; the stop symbol is not sent.
+ * Each air bit expands to 9 DMA segments, for 1468 entries including the sentinel. Sized to hold it whole.
  * ATQA/UID/SAK/auth replies are far shorter. */
 #define TXD_MAX   1536
 #define MOSI_SET  (1u << 5)
@@ -2446,6 +2402,16 @@ static void emu_tx_half(uint32_t *t, int on)
 static uint32_t *s_txd_arr;    /* per-segment TIM1 period (ticks-1) */
 static uint32_t *s_txd_bsrr;   /* per-segment MOSI BSRR (set/reset) */
 static volatile int s_txd_n;
+static struct {
+    uint8_t (*next)(void *ctx);
+    void *ctx;
+    uint8_t prefix_raw;
+    uint8_t request[32];
+    int *result;
+    int active, prearmed, static_reply, short_frame;
+    int frame_len, request_len, request_min_len, nbits, n;
+    unsigned frac;
+} s_early_stream;
 /* Edge-array cache: build the DMA edges once per reply (keyed by the module's reply pointer), then pointer-swap
  * on repeats so the FDT-critical arm/fire never rebuilds. Heap-allocated in emu_setup, freed on teardown. */
 #define EC_N 5
@@ -2492,6 +2458,14 @@ static void emu_dma_prep(const uint8_t *key, int nbits)
     s_txd_n = emu_tx_build_to(s_txd_arr, s_txd_bsrr, s_tx_bits, nbits);   /* fallback: global scratch */
     s_txd_arr_p = s_txd_arr; s_txd_bsrr_p = s_txd_bsrr;
 }
+
+static int emu_dma_cached(const uint8_t *key)
+{
+    if (!key || !s_ec_buf) return 0;
+    for (int i = 0; i < EC_N; i++)
+        if (s_ec_ptr[i] == key) return 1;
+    return 0;
+}
 static uint32_t s_pat_arr[2][8], s_pat_bsrr[2][8];   /* precomputed per-half-bit segment patterns */
 
 static void emu_tx_pat_init(void)
@@ -2501,30 +2475,38 @@ static void emu_tx_pat_init(void)
     s_pat_arr[0][0] = EMU_HALF_ETU - 1u; s_pat_bsrr[0][0] = MOSI_RST;   /* idle half-bit = 1 low segment */
 }
 
+static int emu_tx_append_bit(uint32_t *da, uint32_t *db, int n, int b, unsigned *frac)
+{
+    for (int half = 0; half < 2; half++) {
+        int on = (half == 0) ? b : !b;
+        *frac += EMU_HALF_FRAC_NUM;
+        int extra = 0;
+        if (*frac >= EMU_HALF_FRAC_DEN) { *frac -= EMU_HALF_FRAC_DEN; extra = 1; }
+        if (on) {
+            __builtin_memcpy(&da[n], s_pat_arr[1], 8 * sizeof(uint32_t));
+            __builtin_memcpy(&db[n], s_pat_bsrr[1], 8 * sizeof(uint32_t));
+            da[n + 2] += (uint32_t)extra;
+            n += 8;
+        } else {
+            da[n] = s_pat_arr[0][0] + (uint32_t)extra;
+            db[n] = s_pat_bsrr[0][0];
+            n++;
+        }
+    }
+    return n;
+}
+
 /* Expand the Manchester air-bits into edge arrays: each half-bit is modulated (8 subcarrier segments) or idle
  * (1 low segment), exactly like emu_tx_half. Appends a long-low sentinel; the DMA-TC ISR stops the timer on it. */
 __attribute__((optimize("O2")))
 static int emu_tx_build_to(uint32_t *da, uint32_t *db, const uint8_t *bits, int nbits)
 {
-    int n = 0;
-    for (int i = 0; i < nbits && n + 20 < TXD_MAX; i++) {
-        int b = (bits[i >> 3] >> (i & 7)) & 1;
-        for (int half = 0; half < 2; half++) {
-            int on = (half == 0) ? b : !b;
-            if (on) {   /* 8 subcarrier segments */
-                __builtin_memcpy(&da[n], s_pat_arr[1],  8 * sizeof(uint32_t));
-                __builtin_memcpy(&db[n], s_pat_bsrr[1], 8 * sizeof(uint32_t));
-                n += 8;
-            } else {    /* idle half-bit = 1 low segment */
-                da[n] = s_pat_arr[0][0]; db[n] = s_pat_bsrr[0][0]; n++;
-            }
-        }
-    }
+    int n = 0; unsigned frac = 0;
+    for (int i = 0; i < nbits && n + 20 < TXD_MAX; i++)
+        n = emu_tx_append_bit(da, db, n, (bits[i >> 3] >> (i & 7)) & 1, &frac);
     da[n] = 0xFFFFu; db[n] = MOSI_RST; n++;   /* sentinel */
     return n;
 }
-static int emu_tx_build(const uint8_t *bits, int nbits)   /* legacy: build into the global scratch */
-{ return emu_tx_build_to(s_txd_arr, s_txd_bsrr, bits, nbits); }
 
 static void emu_tx_dma_setup(void)
 {
@@ -2536,7 +2518,9 @@ static void emu_tx_dma_setup(void)
     DMAMUX1_Channel2->CCR = 0x19u;                    /* DMA1_Ch3 <- TIM1_UP */
     DMA1_Channel2->CPAR = (uint32_t)(uintptr_t)&TIM1->ARR;
     DMA1_Channel3->CPAR = (uint32_t)(uintptr_t)&GPIOB->BSRR;
+    DMA1->IFCR = DMA_IFCR_CGIF2 | DMA_IFCR_CGIF3;
     NVIC_SetPriority(DMA1_Channel2_IRQn, 4);
+    NVIC_ClearPendingIRQ(DMA1_Channel2_IRQn);
     NVIC_EnableIRQ(DMA1_Channel2_IRQn);
 }
 
@@ -2553,17 +2537,18 @@ static void emu_tx_dma_fire(void)
     DMA1->IFCR = DMA_IFCR_CTCIF2 | DMA_IFCR_CGIF2;
     DMA1_Channel2->CMAR = (uint32_t)(uintptr_t)&da[1];  DMA1_Channel2->CNDTR = (uint32_t)(n - 1);
     DMA1_Channel3->CMAR = (uint32_t)(uintptr_t)&db[1];  DMA1_Channel3->CNDTR = (uint32_t)(n - 1);
-    DMA1_Channel2->CCR = DMA_CCR_MINC | DMA_CCR_DIR | DMA_CCR_PSIZE_1 | DMA_CCR_MSIZE_1 | DMA_CCR_TCIE | DMA_CCR_EN;
-    DMA1_Channel3->CCR = DMA_CCR_MINC | DMA_CCR_DIR | DMA_CCR_PSIZE_1 | DMA_CCR_MSIZE_1 | DMA_CCR_EN;
+    DMA1_Channel2->CCR = DMA_CCR_MINC | DMA_CCR_DIR | DMA_CCR_PSIZE_1 | DMA_CCR_MSIZE_1 |
+                         DMA_CCR_PL_1 | DMA_CCR_TCIE | DMA_CCR_EN;
+    DMA1_Channel3->CCR = DMA_CCR_MINC | DMA_CCR_DIR | DMA_CCR_PSIZE_1 | DMA_CCR_MSIZE_1 |
+                         DMA_CCR_PL | DMA_CCR_EN;
     TIM1->ARR = da[0]; TIM1->CNT = 0;
     uint32_t t = s_emu_rx_cyc + s_fdt_ticks + (uint32_t)s_phase_off;   /* start the first edge at the exact FDT */
+    while ((int32_t)(DWT->CYCCNT - t) > 0) t += EMU_ETU;
     while ((int32_t)(DWT->CYCCNT - t) < 0) { }
-    s_tx_end_cyc = DWT->CYCCNT + (uint32_t)s_tx_nbits * 604u + 2600u;  /* skip our reply and the demod's recovery ringing
-                                                                        * so recv isn't churning on it when the reader's
-                                                                        * next frame arrives (lowers the anticoll's det) */
+    s_tx_end_cyc = DWT->CYCCNT + (uint32_t)s_tx_nbits * 604u +
+                   ((uint32_t)s_tx_nbits * 2u * EMU_HALF_FRAC_NUM) / EMU_HALF_FRAC_DEN + EMU_RX_SETTLE;
     GPIOB->BSRR = db[0];
     TIM1->CR1 = TIM_CR1_CEN;
-    s_dbg_txcount++;
 }
 
 void DMA1_Channel2_IRQHandler(void)   /* reply done: last (sentinel) period loaded -> stop TIM1, hold MOSI low */
@@ -2573,30 +2558,13 @@ void DMA1_Channel2_IRQHandler(void)   /* reply done: last (sentinel) period load
         TIM1->CR1 = 0;
         DMA1_Channel2->CCR = 0; DMA1_Channel3->CCR = 0;
         GPIOB->BSRR = MOSI_RST;
+        emu_rx_disable();                              /* suppress post-reply demodulator recovery edges */
+        while ((int32_t)(DWT->CYCCNT - s_tx_end_cyc) < 0) { }
+        s_edge_n = 0;
+        emu_rx_enable();
+        s_tx_end_cyc = DWT->CYCCNT + 128u;             /* let recv rebase its DMA window after re-enabling RX */
         EXTI->PR1 = (1u << 4); EXTI->IMR1 |= (1u << 4);   /* reply done: clear + re-arm the MISO wake (masked at fire) */
     }
-}
-
-/* Fast demod reset after our reply: the ST25R3916 AFE demod does not recover from our load-mod in time for the
- * reader's next frame. The chip's own fix is CMD_RESET_RX_GAIN, which needs an
- * SPI command - and per datasheet 4.4.13 any SPI command exits transparent mode. So briefly restore SPI, pulse
- * Reset-RX-Gain (+ clear FIFO + unmask receive), and re-enter transparent. ~10 us, well inside the ~86 us FDT.
- * Runs with IRQ already disabled (called from emu_tx_raw). */
-static void fast_rx_reset(void)
-{
-    /* restore the SPI bus: SCK PA5 AF, MOSI PB5 AF, CS PE4 push-pull output high */
-    GPIOA->MODER = (GPIOA->MODER & ~GPIO_MODER_MODE5) | (2u << GPIO_MODER_MODE5_Pos);
-    GPIOB->MODER = (GPIOB->MODER & ~GPIO_MODER_MODE5) | (2u << GPIO_MODER_MODE5_Pos);
-    CS_PORT->BSRR = (1u << CS_PIN);
-    CS_PORT->MODER = (CS_PORT->MODER & ~GPIO_MODER_MODE4) | (1u << GPIO_MODER_MODE4_Pos);
-    SPI1->CR1 |= SPI_CR1_SPE;
-    direct_cmd(CMD_RESET_RX_GAIN);      /* clears the squelch/AGC gain state our TX excited (exits transparent) */
-    direct_cmd(CMD_CLEAR_FIFO);
-    direct_cmd(CMD_UNMASK_RECEIVE);     /* re-start the RX decoders/digitizer clean */
-    direct_cmd(CMD_TRANSPARENT_MODE);   /* re-enter transparent (demod -> MISO again) on this frame's rising CS */
-    SPI1->CR1 &= ~SPI_CR1_SPE;
-    mosi_as_output_low();               /* MOSI back to GPIO idle-low load-mod gate */
-    emu_bus_release();                  /* SCK/MISO/CS input+pullup - the AFE drives the pins again */
 }
 
 static void emu_tx_raw(const uint8_t *bits, int nbits)
@@ -2611,66 +2579,92 @@ static void emu_tx_raw(const uint8_t *bits, int nbits)
     /* A crypto reply arms after the FDT target (recv-return + the mandatory nr-feed/ar-advance + the pre-drain
      * exceed the ~1270-cp window), so `t` is already in the past. Left as-is, every emu_tx_half busy-wait below is
      * instantly satisfied and the subcarrier collapses into a sub-bit garbage blip. Snap `t` forward in whole
-     * half-ETU steps (302 cyc = 4*fc/16, preserves subcarrier phase) until it's just ahead of now: the reply is
-     * then well-formed (correct half-bit widths) at the earliest phase-consistent slot - later FDT, decodable. */
-    while ((int32_t)(DWT->CYCCNT - t) > 0) t += EMU_HALF_ETU;
+     * ETU steps (604 cyc = 8*fc/16, preserves the legal fc/128 FDT lattice) until it is just ahead of now: the
+     * reply is then well-formed at the earliest phase-consistent slot - later FDT, but still decodable. */
+    while ((int32_t)(DWT->CYCCNT - t) > 0) t += EMU_ETU;
     while ((int32_t)(DWT->CYCCNT - t) < 0) { }
+    unsigned frac = 0;
     for (int i = 0; i < nbits; i++) {
         int b = (bits[i >> 3] >> (i & 7)) & 1;
-        emu_tx_half(&t,  b);                             /* first half-bit  */
-        emu_tx_half(&t, !b);                             /* second half-bit */
+        emu_tx_half(&t,  b, &frac);                      /* first half-bit  */
+        emu_tx_half(&t, !b, &frac);                      /* second half-bit */
     }
     EMU_MOSI_LO;
-    /* The demod reflects our own load-mod onto MISO; the concurrent recv() (already listening for the next reader
-     * frame, we preempted it via TIM17) would otherwise decode that feedback as a bogus command and swallow the
-     * reader's follow-up (e.g. the anticoll after ATQA). Gate recv off MISO for a short settle past TX end - well
-     * inside the reader's FDT (~5834 cyc) before its next frame. Mirrors the DMA path's s_tx_end_cyc. */
-    if (s_rx_reset) fast_rx_reset();            /* TEMP: reset the demod so the reader's next frame decodes */
-    s_tx_end_cyc = DWT->CYCCNT + (uint32_t)s_txskip;
+    emu_rx_disable();                                  /* suppress post-reply demodulator recovery edges */
+    s_tx_end_cyc = DWT->CYCCNT + EMU_RX_SETTLE;
+    while ((int32_t)(DWT->CYCCNT - s_tx_end_cyc) < 0) { }
+    s_edge_n = 0;
+    emu_rx_enable();
+    s_tx_end_cyc = DWT->CYCCNT + 128u;                 /* let recv discard the disabled-RX interval */
     if (!pm) __enable_irq();
-    s_dbg_txcount++;                             /* TEMP */
-    /* BMP self-diagnostic (non-perturbing: runs after the bit-bang): snapshot the ST25R3916's own demod of the
-     * reply we just sent, so a halt+read over SWD shows whether my load-mod is a clean full-frame fc/16 Manchester
-     * envelope or truncates/droops. The capture DMA has been filling s_emu_ring off MISO the whole time. */
-    if (!s_bmp_ready) {
-        uint32_t wp = EMU_RING - DMA1_Channel1->CNDTR;
-        for (int i = 0; i < 512; i++) {
-            int idx = (int)wp - 520 + i; if (idx < 0) idx += EMU_RING;
-            s_bmp_cap[i] = (uint8_t)((s_emu_ring[idx] >> s_cap_shift) & 1);
-        }
-        s_bmp_nbits = nbits; s_bmp_ready = 1;    /* latch one frame; GDB clears s_bmp_ready to re-arm */
-    }
 }
 
 /* Arm a reply for the HW-timer FDT: the air-bits are already in s_tx_bits (built in-place by the senders, no
  * copy - the copy was on the FDT-critical path). TIM17 (armed per-edge in the EXTI ISR) fires emu_tx_raw at
  * last_edge + FDT. Publishing order: nbits before the armed flag (ISR reads armed first). */
-static int emu_tx_arm(int nbits)
+static int emu_tx_arm(int nbits, bool keep_basepri)
 {
-    if (nbits <= 0 || nbits > EMU_FIFO * 8) { __set_BASEPRI(0); return RFID_ERR_UNSUPP; }
-    /* NOTE: the DMA edge-array build moved off this critical path into emu_tx_dma_fire (the TIM17 ISR builds it
-     * before busy-waiting to the FDT), so arming is now as fast as the busy-wait path and stages within the guard. */
-    uint32_t ta = DWT->CYCCNT - s_emu_rx_cyc;   /* TEMP: turnaround, frame-end -> stage */
-    /* DEADLINE GUARD: TIM17 fires at last_edge + (FDT-90). If we only finished staging after that, the reply
-     * missed this frame's window - dropping it (vs leaving it armed) is essential: a stale armed reply would
-     * fire on the next frame's TIM17, one frame behind, desyncing the whole anticollision. The reader simply
-     * retries; by then the send-cache is warm and the reply stages in time. */
-    if ((int32_t)ta >= (int32_t)(s_fdt_ticks - 90u)) {   /* armed after the fire point (FDT-90): missed this frame */
-        s_dbg_txmiss++;
-        if ((int32_t)ta < (int32_t)s_dbg_txmiss_ta) s_dbg_txmiss_ta = ta;   /* TEMP: min missed ta (no hot-path log) */
-        if ((int32_t)ta > (int32_t)s_dbg_txmiss_tamax) s_dbg_txmiss_tamax = ta;
-        /* Crypto replies (at/READ/nested nt) arm slower than the 5910 one-pulse window (gap + decode + the mandatory
-         * nr-feed/ar-advance crypto + the in-module encode), so they always miss it - but hf_emu_send_stream
-         * re-triggers TIM17 and emu_tx_raw snaps its timebase forward, so the reply still goes out. Never drop a
-         * crypto reply on this guard. Non-streaming (WUPA/anticoll) still drops-and-retries if it stages late. */
-        if (!s_diag_noguard && !s_tx_crypto) { __set_BASEPRI(0); return RFID_ERR_UNSUPP; }
+    if (nbits <= 0 || nbits > EMU_FIFO * 8) {
+        if (!keep_basepri) __set_BASEPRI(0);
+        return RFID_ERR_UNSUPP;
     }
+    /* Static edges are already cached and dynamic ciphertext uses the one-shot DMA scratch, so arming only
+     * publishes the prepared reply to the timer ISR. */
+    int late = (int32_t)(DWT->CYCCNT - s_emu_rx_cyc) >= (int32_t)(s_fdt_ticks - 90u);
+    uint32_t pm = __get_PRIMASK();
+    __disable_irq();
     s_tx_nbits = nbits;
     __asm volatile("" ::: "memory");            /* publish bits before arming */
     s_tx_armed = 1;
-    __set_BASEPRI(0);   /* armed: the pri-4 TIM17 fires the reply from here, USB may resume */
-    (void)ta;   /* staging log removed: fantasi_log on the reply hot path costs ~7756 cyc */
+    /* If the one-pulse timer already expired, fire this reply now rather than
+     * leaving it armed for the next reader frame. */
+    if (late || !(TIM17->CR1 & TIM_CR1_CEN) || (TIM17->SR & TIM_SR_UIF)) {
+        TIM17->CNT = TIM17->ARR - 1u;
+        TIM17->CR1 |= TIM_CR1_CEN;
+    }
+    if (!pm) __enable_irq();
+    if (!keep_basepri)
+        __set_BASEPRI(0);   /* armed: the pri-4 TIM17 fires the reply from here, USB may resume */
     return 0;
+}
+
+static void emu_early_static_prearm(int nbits)
+{
+    if (!s_early_stream.short_frame) return;
+    uint32_t fdt = (s_early_stream.prefix_raw >> 6) & 1u ? EMU_FDT_1 : EMU_FDT_0;
+    uint32_t pm = __get_PRIMASK();
+    uint32_t last_edge = 0, rx_cyc = 0;
+    int stable = 0;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        last_edge = s_last_edge_cyc;
+        rx_cyc = carrier_lock(last_edge);
+        __disable_irq();
+        if (last_edge == s_last_edge_cyc && !(EXTI->PR1 & (1u << 4))) {
+            stable = 1;
+            break;
+        }
+        if (!pm) __enable_irq();
+    }
+    if (!stable) return;
+    int bad_nbits = nbits <= 0 || nbits > EMU_FIFO * 8;
+    int tx_armed = s_tx_armed;
+    int owned = s_tx_spec_state != EMU_SPEC_NONE;
+    if (!bad_nbits && !tx_armed && !owned && s_mp_maxi <= 7) {
+        uint32_t timer_running = TIM17->CR1 & TIM_CR1_CEN;
+        uint32_t timer_pending = TIM17->SR & TIM_SR_UIF;
+        s_emu_rx_cyc = rx_cyc;
+        s_fdt_ticks = fdt;
+        s_tx_nbits = nbits;
+        s_tx_spec_state = EMU_SPEC_ARMED;
+        __DMB();
+        s_tx_armed = 1;
+        s_early_stream.prearmed = 1;
+        if (!timer_running && !timer_pending) {
+            TIM17->CNT = TIM17->ARR - 1u;
+            TIM17->CR1 |= TIM_CR1_CEN;
+        }
+    }
+    if (!pm) __enable_irq();
 }
 
 /* TIM17 fires FDT cycles after the last reader edge (frame end). If a reply is staged, load-modulate it
@@ -2682,11 +2676,18 @@ void TIM1_TRG_COM_TIM17_IRQHandler(void)
     TIM17->SR = ~TIM_SR_UIF;                     /* clear update flag */
     if (s_tx_armed) {
         s_tx_armed = 0;
-        if (s_tx_crypto) {                       /* CRYPTO reply (at/READ/nested nt): always bit-bang - its content
-                                                  * changes every auth, so the DMA edge-cache would be stale. */
+        if (s_tx_spec_state == EMU_SPEC_ARMED) {
+            s_tx_spec_state = EMU_SPEC_FIRED;
+        }
+        if (s_tx_crypto && s_tx_crypto_dma) {
+            emu_tx_dma_fire();                    /* dynamic ciphertext was expanded into the DMA scratch array */
+        } else if (s_tx_crypto || s_tx_force_raw) {   /* A static reply's first use is sent directly, then cached
+                                                       * outside its FDT-critical staging path. */
             uint32_t im = EXTI->IMR1 & (1u << 4);
             EXTI->IMR1 &= ~(1u << 4);
             emu_tx_raw(s_tx_bits, s_tx_nbits);
+            if (s_tx_dma_pending && s_tx_dma_key && s_ec_buf)
+                emu_dma_prep(s_tx_dma_key, s_tx_nbits);
             EXTI->PR1 = (1u << 4);
             EXTI->IMR1 |= im;
         } else if (s_use_dma_tx) {
@@ -2698,9 +2699,13 @@ void TIM1_TRG_COM_TIM17_IRQHandler(void)
             EXTI->PR1 = (1u << 4);
             EXTI->IMR1 |= im;
         }
+        s_tx_force_raw = 0;
+        s_tx_dma_pending = 0;
+        s_tx_dma_key = 0;
+        s_tx_crypto = 0;
+        s_tx_crypto_dma = 0;
+        s_fdt_locked = 0;                        /* reply sent: the next reader frame may re-arm the timer */
     }
-    s_tx_crypto = 0;                             /* consumed: the next reply is a normal (fast) one unless re-flagged */
-    s_fdt_locked = 0;                            /* reply sent (or no reply): let the next frame re-arm the timer */
 }
 
 /* Load-modulate a pre-encoded tag reply. `tosend` = iso14a_tag_encode: [0]=template, [1]=start bit, then
@@ -2709,12 +2714,41 @@ void TIM1_TRG_COM_TIM17_IRQHandler(void)
 int hal_rfid_hf_emu_send(const uint8_t *tosend, int len)
 {
     if (s_mode != RFID_HF_EMU || !tosend || len < 3 || !s_emu_up) return RFID_ERR_UNSUPP;
+    if (s_grp_callback_active && !s_use_dma_tx) return RFID_ERR_UNSUPP;
     for (int e = 0; e < SEND_CACHE_N; e++) {                  /* cache hit: memcpy the pre-decoded bits */
         if (s_send_cache[e].ptr == tosend) {
             int nb = (s_send_cache[e].n + 7) / 8;
             for (int i = 0; i < nb; i++) s_tx_bits[i] = s_send_cache[e].bits[i];
-            if (s_use_dma_tx) emu_dma_prep(tosend, s_send_cache[e].n);   /* edge-cache hit -> pointer swap, no build */
-            return emu_tx_arm(s_send_cache[e].n);
+            if (s_grp_callback_active && s_use_dma_tx) {
+                emu_dma_prep(tosend, s_send_cache[e].n);
+                if (s_txd_n < 2) return RFID_ERR_UNSUPP;
+                s_early_stream.next = 0;
+                s_early_stream.ctx = 0;
+                s_early_stream.result = 0;
+                s_early_stream.prefix_raw = 0;
+                for (int b = 0; b < 7; b++)
+                    if (s_seq[b + 1] == 2) s_early_stream.prefix_raw |= (uint8_t)(1u << b);
+                s_early_stream.prearmed = 0;
+                s_early_stream.static_reply = 1;
+                s_early_stream.short_frame = s_grp_nb < 8;
+                s_early_stream.frame_len = s_grp_n + 1;
+                s_early_stream.request_len = 0;
+                s_early_stream.request_min_len = 0;
+                s_early_stream.nbits = s_send_cache[e].n;
+                s_early_stream.active = 1;
+                emu_early_static_prearm(s_send_cache[e].n);
+                return 0;
+            }
+            if (s_use_dma_tx && emu_dma_cached(tosend))
+                emu_dma_prep(tosend, s_send_cache[e].n);       /* edge-cache hit -> pointer swap, no build */
+            else if (s_use_dma_tx) {
+                s_tx_force_raw = 1;
+                s_tx_dma_pending = 1;
+                s_tx_dma_key = tosend;
+            }
+            int rc = emu_tx_arm(s_send_cache[e].n, false);
+            if (rc != 0) { s_tx_force_raw = 0; s_tx_dma_pending = 0; s_tx_dma_key = 0; }
+            return rc;
         }
     }
     int n = 0;                                               /* miss: decode symbols -> air-bits in place */
@@ -2727,28 +2761,249 @@ int hal_rfid_hf_emu_send(const uint8_t *tosend, int len)
     int e = s_send_cache_rr; s_send_cache_rr = (uint8_t)((e + 1) % SEND_CACHE_N);   /* store round-robin */
     s_send_cache[e].ptr = tosend; s_send_cache[e].n = n;
     for (int i = 0; i < (n + 7) / 8; i++) s_send_cache[e].bits[i] = s_tx_bits[i];
-    if (s_use_dma_tx) emu_dma_prep(tosend, n);               /* miss: build+cache the edges (first use only) */
-    return emu_tx_arm(n);
+    if (s_grp_callback_active && s_use_dma_tx) {
+        emu_dma_prep(tosend, n);
+        if (s_txd_n < 2) return RFID_ERR_UNSUPP;
+        s_early_stream.next = 0;
+        s_early_stream.ctx = 0;
+        s_early_stream.result = 0;
+        s_early_stream.prefix_raw = 0;
+        for (int b = 0; b < 7; b++)
+            if (s_seq[b + 1] == 2) s_early_stream.prefix_raw |= (uint8_t)(1u << b);
+        s_early_stream.prearmed = 0;
+        s_early_stream.static_reply = 1;
+        s_early_stream.short_frame = s_grp_nb < 8;
+        s_early_stream.frame_len = s_grp_n + 1;
+        s_early_stream.request_len = 0;
+        s_early_stream.request_min_len = 0;
+        s_early_stream.nbits = n;
+        s_early_stream.active = 1;
+        emu_early_static_prearm(n);
+        return 0;
+    }
+    if (s_use_dma_tx) {
+        s_tx_force_raw = 1;
+        s_tx_dma_pending = 1;
+        s_tx_dma_key = tosend;
+    }
+    int rc = emu_tx_arm(n, false);
+    if (rc != 0) { s_tx_force_raw = 0; s_tx_dma_pending = 0; s_tx_dma_key = 0; }
+    return rc;
 }
 
-/* CRYPTO reply (auth at / nested nt / encrypted READ). Same wire format as hf_emu_send (iso14a_tag_encode buffer:
- * template, start bit, 8 data + 1 parity per byte, SEC_F stop) but the module pre-encodes it fresh every auth (the
- * ciphertext changes each time). It cannot be a HAL->module callback: Crypto1's LUTs are PIC/GOT-relative and the
- * firmware ISR runs with the wrong r9, so a callback reads garbage and the reply truncates. So the module encrypts +
- * encodes in its own context and hands us the finished buffer; we decode it to air-bits (no pointer cache - content
- * differs every call) and fire it. The reply arms late (crypto + encode run after recv), so unlike a fast anticoll
- * reply it (a) bypasses the FDT guard via s_tx_crypto, and (b) re-triggers the one-pulse TIM17 which already fired
- * empty. emu_tx_raw then snaps its timebase to the earliest phase-consistent slot >= now (FDT ~1.8-2.1 kcp), well
- * inside the reader's auth FWT. */
-/* Streaming crypto reply (auth at / nested nt / encrypted READ). The PM3/Chameleon implement the callback form
- * (hf_emu_send_stream) so they can overlap the per-symbol producer with TX for a low FDT. The Flipper's reply is
- * CPU-bit-banged - computing a symbol mid-transmission smears the subcarrier - so it cannot overlap and does not
- * define the callback (it weak-defaults to UNSUPP, so the module falls back to this buffer form). The module
- * pre-encodes the whole reply with its own tight in-place loop (iso14a_tag_encode format: template[0], start bit,
- * then 8 data + 1 parity per byte as SEC_D/SEC_E, then SEC_F) in module context - Crypto1 LUTs resolve there - and
- * hands us the finished buffer. We decode it to air-bits (start bit kept as bit 0; template[0] skipped) and fire it
- * via the crypto-reply path. Never pointer-cached: the ciphertext differs every auth. This tight-loop decode keeps
- * the READ FDT low (~3.4 kcp) vs a 164-call per-symbol drain (~6.5 kcp). */
+/* Pull a small generic tag-symbol head, arm the existing FDT/DMA path, then fill the remaining descriptors while
+ * that head is waiting or already on air. Every Manchester air bit expands to nine descriptors, independent of
+ * its value, so the final DMA length and sentinel location are known before the producer is advanced. */
+__attribute__((optimize("O2")))
+static int emu_send_stream(uint8_t (*next)(void *ctx), void *ctx, int nsymbols,
+                           const uint8_t *request, int request_len, int request_min_len,
+                           int *result)
+{
+    if (result) *result = 0;
+    if (s_mode != RFID_HF_EMU || !s_emu_up || !s_use_dma_tx || !next || nsymbols < 3 ||
+        nsymbols > EMU_FIFO * 8 + 1 || nsymbols > (TXD_MAX - 1) / 9 + 1 ||
+        !s_txd_arr || !s_txd_bsrr)
+        return RFID_ERR_UNSUPP;
+    int nbits = nsymbols - 1;                 /* transmit start + data/parity; consume the final stop symbol */
+    int total = nbits * 9 + 1;
+
+    if (s_grp_callback_active && s_early_stream.active) emu_early_stream_cancel();
+    __set_BASEPRI(EMU_MASK_USB);
+    unsigned frac = 0;
+    int n = 0;
+    for (int i = 0; i < 2; i++)
+        n = emu_tx_append_bit(s_txd_arr, s_txd_bsrr, n, next(ctx) == EMU_SEC_D, &frac);
+    s_txd_arr[total - 1] = 0xFFFFu;
+    s_txd_bsrr[total - 1] = MOSI_RST;
+    s_txd_arr_p = s_txd_arr;
+    s_txd_bsrr_p = s_txd_bsrr;
+    s_txd_n = total;
+    s_tx_crypto = 1;
+    s_tx_crypto_dma = 1;
+    __DMB();
+
+    /* Keep only a short head until the completed request is validated. Once
+     * committed, the producer stays ahead of the DMA while the reply is on air. */
+    if (s_grp_callback_active) {
+        s_early_stream.next = next;
+        s_early_stream.ctx = ctx;
+        s_early_stream.result = result;
+        s_early_stream.prefix_raw = 0;
+        s_early_stream.prearmed = 0;
+        s_early_stream.static_reply = 0;
+        s_early_stream.short_frame = 0;
+        s_early_stream.frame_len = request ? request_len : s_grp_n + 1;
+        s_early_stream.request_len = request ? request_len : 0;
+        s_early_stream.request_min_len = request ? request_min_len : 0;
+        for (int i = 0; i < s_early_stream.request_len; i++)
+            s_early_stream.request[i] = request[i];
+        s_early_stream.nbits = nbits;
+        s_early_stream.n = n;
+        s_early_stream.frac = frac;
+        s_early_stream.active = 1;
+        return 0;
+    }
+
+    /* Keep the USB/SysTick priority mask inherited from recv until the tail is complete. TIM17 and the TX DMA
+     * run at priority 4, so transmission can start while this task continues producing future descriptors. */
+    (void)emu_tx_arm(nbits, true);
+    for (int i = 2; i < nbits; i++) {
+        n = emu_tx_append_bit(s_txd_arr, s_txd_bsrr, n, next(ctx) == EMU_SEC_D, &frac);
+        __DMB();
+    }
+    (void)next(ctx);                            /* stop symbol is framing, not an additional Manchester air bit */
+    __DMB();
+    __set_BASEPRI(0);
+    return 0;
+}
+
+int hal_rfid_hf_emu_send_stream(uint8_t (*next)(void *ctx), void *ctx, int nsymbols)
+{
+    return emu_send_stream(next, ctx, nsymbols, 0, 0, 0, 0);
+}
+
+int hal_rfid_hf_emu_send_stream_match(uint8_t (*next)(void *ctx), void *ctx, int nsymbols,
+                                      const uint8_t *request, int request_len, int request_min_len,
+                                      int *result)
+{
+    if (!result) return RFID_ERR_UNSUPP;
+    *result = 0;
+    if (!s_grp_callback_active || !request || request_min_len <= 0 ||
+        request_min_len > request_len ||
+        request_len > (int)sizeof s_early_stream.request)
+        return RFID_ERR_UNSUPP;
+    return emu_send_stream(next, ctx, nsymbols, request, request_len, request_min_len, result);
+}
+
+static int emu_early_stream_commit(int frame_len)
+{
+    if (!s_early_stream.active) return 0;
+    int short_frame = s_grp_n == 0 && s_grp_nb >= 6 && s_grp_nb <= 7;
+    int request_match = s_early_stream.request_len == 0;
+    if (frame_len >= s_early_stream.request_min_len &&
+        frame_len <= s_early_stream.request_len) {
+        request_match = 1;
+        for (int i = 0; i < frame_len; i++)
+            if (s_early_stream.request[i] != s_grp_out[i]) {
+                request_match = 0;
+                break;
+            }
+    }
+    int frame_len_match = s_early_stream.request_len ?
+                          (frame_len >= s_early_stream.request_min_len &&
+                           frame_len <= s_early_stream.request_len) :
+                          s_early_stream.frame_len == frame_len;
+    if (!frame_len_match ||
+        !request_match ||
+        s_early_stream.short_frame != short_frame ||
+        (short_frame && s_early_stream.prefix_raw != s_grp_out[0])) {
+        emu_early_stream_cancel();
+        return 0;
+    }
+    uint8_t (*next)(void *) = s_early_stream.next;
+    void *ctx = s_early_stream.ctx;
+    int nbits = s_early_stream.nbits;
+    int n = s_early_stream.n;
+    unsigned frac = s_early_stream.frac;
+    int prearmed = s_early_stream.prearmed;
+    int static_reply = s_early_stream.static_reply;
+    int *result = s_early_stream.result;
+
+    s_early_stream.active = 0;
+    s_early_stream.prearmed = 0;
+    s_early_stream.result = 0;
+    if (prearmed) {
+        uint32_t pm = __get_PRIMASK();
+        __disable_irq();
+        int owned = s_tx_spec_state;
+        if (owned == EMU_SPEC_ARMED || owned == EMU_SPEC_FIRED)
+            s_tx_spec_state = EMU_SPEC_NONE;
+        if (!pm) __enable_irq();
+        if (owned == EMU_SPEC_ARMED || owned == EMU_SPEC_FIRED) {
+            if (result) *result = 1;
+            __set_BASEPRI(0);
+            return 1;
+        }
+    } else {
+    }
+    if (emu_tx_arm(nbits, true) != 0) {
+        s_tx_crypto = 0;
+        s_tx_crypto_dma = 0;
+        __set_BASEPRI(0);
+        return 0;
+    }
+    if (static_reply) {
+        if (result) *result = 1;
+        __set_BASEPRI(0);
+        return 1;
+    }
+    for (int i = 2; i < nbits; i++) {
+        n = emu_tx_append_bit(s_txd_arr, s_txd_bsrr, n, next(ctx) == EMU_SEC_D, &frac);
+        __DMB();
+    }
+    (void)next(ctx);
+    __DMB();
+    if (result) *result = 1;
+    __set_BASEPRI(0);
+    return 1;
+}
+
+static int emu_early_stream_pending(void)
+{
+    return s_early_stream.active;
+}
+
+static void emu_early_stream_cancel(void)
+{
+    if (!s_early_stream.active) return;
+    int static_reply = s_early_stream.static_reply;
+    int prearmed = s_early_stream.prearmed;
+    s_early_stream.active = 0;
+    s_early_stream.prearmed = 0;
+    s_early_stream.result = 0;
+    s_early_stream.request_len = 0;
+    s_early_stream.request_min_len = 0;
+    if (prearmed) {
+        uint32_t pm = __get_PRIMASK();
+        __disable_irq();
+        if (s_tx_spec_state == EMU_SPEC_ARMED) {
+            s_tx_armed = 0;
+        }
+        s_tx_spec_state = EMU_SPEC_NONE;
+        if (!pm) __enable_irq();
+    }
+    if (!static_reply) {
+        s_tx_crypto = 0;
+        s_tx_crypto_dma = 0;
+    }
+}
+
+int hal_rfid_hf_emu_prepare(const uint8_t *tosend, int len)
+{
+    if (s_mode != RFID_HF_EMU || !s_emu_up || !s_use_dma_tx || !s_ec_buf ||
+        !tosend || len < 3)
+        return RFID_ERR_UNSUPP;
+    for (int e = 0; e < SEND_CACHE_N; e++)
+        if (s_send_cache[e].ptr == tosend) return 0;
+
+    int n = 0;
+    for (int i = 1; i < len && n < EMU_FIFO * 8; i++) {
+        if (tosend[i] == EMU_SEC_F) break;
+        if ((n & 7) == 0) s_tx_bits[n >> 3] = 0;
+        if (tosend[i] == EMU_SEC_D) s_tx_bits[n >> 3] |= (uint8_t)(1u << (n & 7));
+        n++;
+    }
+    int e = s_send_cache_rr;
+    s_send_cache_rr = (uint8_t)((e + 1) % SEND_CACHE_N);
+    s_send_cache[e].ptr = tosend;
+    s_send_cache[e].n = n;
+    for (int i = 0; i < (n + 7) / 8; i++) s_send_cache[e].bits[i] = s_tx_bits[i];
+    emu_dma_prep(tosend, n);
+    return s_txd_n >= 2 ? 0 : RFID_ERR_UNSUPP;
+}
+
+/* Dynamic Crypto1 replies arrive as a complete encoded symbol buffer. Decode them into air bits and expand them
+ * into the one-shot DMA scratch; ciphertext changes on every authentication and cannot use the static cache. */
 int hal_rfid_hf_emu_send_stream_buf(const uint8_t *tosend, int len)
 {
     if (s_mode != RFID_HF_EMU || !tosend || len <= 3 || len > EMU_FIFO * 8 || !s_emu_up)
@@ -2760,18 +3015,17 @@ int hal_rfid_hf_emu_send_stream_buf(const uint8_t *tosend, int len)
         if (tosend[i] == EMU_SEC_D) s_tx_bits[n >> 3] |= (uint8_t)(1u << (n & 7));
         n++;
     }
-    s_tx_crypto = 1;                             /* bypass the FDT guard, bit-bang, re-trigger (see the flag decl) */
-    s_fdt_ticks = EMU_FDT_0;                     /* aim for the normal tag FDT; the re-base absorbs the late arm */
-    int rc = emu_tx_arm(n);
-    if (rc == 0) {
-        /* Re-trigger the one-pulse TIM17: for a multi-byte reader frame the arm lands after the 5910 window already
-         * fired empty, so force a fresh fire now. Touch only CNT/CEN (never ARR - a stale ARR would make the next
-         * frame's per-edge re-arm fire every 2 ticks). */
-        TIM17->CNT  = TIM17->ARR - 1u;
-        TIM17->CR1 |= TIM_CR1_CEN;
-    } else {
+    if (s_use_dma_tx) emu_dma_prep(NULL, n);      /* ciphertext is one-shot, so use the uncached DMA scratch */
+    uint32_t pm = __get_PRIMASK();
+    __disable_irq();
+    s_tx_crypto_dma = s_use_dma_tx && s_txd_n >= 2;
+    s_tx_crypto = 1;                             /* select the dynamic DMA scratch and allow a late timer retrigger */
+    int rc = emu_tx_arm(n, false);
+    if (rc != 0) {
         s_tx_crypto = 0;
+        s_tx_crypto_dma = 0;
     }
+    if (!pm) __enable_irq();
     return rc;
 }
 
@@ -2798,8 +3052,7 @@ int hal_rfid_set_mode(rfid_mode_t mode)
     if (s_mode == RFID_HF_READER) {
         reader_teardown();                            /* exit transparent, field off, free capture scratch */
         spi_deinit();
-    } else if (s_mode == RFID_HF_EMU) {
-        if (s_spi_up) direct_cmd(CMD_STOP);            /* leave transparent mode if a recv was interrupted */
+    } else if (s_mode == RFID_HF_EMU || s_emu_starting || s_emu_up) {
         emu_teardown();
         spi_deinit();
     } else if (s_mode == RFID_LF_READER) {
@@ -2817,10 +3070,13 @@ int hal_rfid_set_mode(rfid_mode_t mode)
         return 0;
 
     case RFID_HF_EMU:
+        s_mode = RFID_HF_EMU;                          /* make interrupted setup visible to RFID_OFF cleanup */
         spi_init();
-        if (st25_init() != 0) return -1;               /* same known-good ISO14443-A analog RX chain */
-        if (emu_setup() != 0) { spi_deinit(); return -1; }
-        s_mode = RFID_HF_EMU;
+        if (st25_init() != 0) { spi_deinit(); s_mode = RFID_OFF; return -1; }
+        if (emu_setup() != 0) {
+            emu_teardown(); spi_deinit(); s_mode = RFID_OFF;
+            return -1;
+        }
         return 0;
 
     case RFID_LF_READER:

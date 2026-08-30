@@ -1,0 +1,414 @@
+diff --git a/src/device/usbd.c b/src/device/usbd.c
+index 0e3afc975..072cdc57e 100644
+--- a/src/device/usbd.c
++++ b/src/device/usbd.c
+@@ -410,6 +410,27 @@ void usbd_control_set_request(tusb_control_request_t const *request);
+ void usbd_control_set_complete_callback( usbd_control_xfer_cb_t fp );
+ bool usbd_control_xfer_cb (uint8_t rhport, uint8_t ep_addr, xfer_result_t event, uint32_t xferred_bytes);
+ 
++#if CFG_TUSB_MCU == OPT_MCU_NRF5X
++bool fantasi_nrf_status_take(uint8_t* ep_addr);
++
++bool fantasi_usbd_setup_queued(void) {
++  taskENTER_CRITICAL();
++  bool const queued = _usbd_queued_setup != 0;
++  taskEXIT_CRITICAL();
++  return queued;
++}
++
++static void nrf_status_complete(void) {
++  uint8_t ep_addr;
++  if (!fantasi_nrf_status_take(&ep_addr)) return;
++
++  uint8_t const ep_dir = tu_edpt_dir(ep_addr);
++  _usbd_dev.ep_status[0][ep_dir].busy = 0;
++  _usbd_dev.ep_status[0][ep_dir].claimed = 0;
++  usbd_control_xfer_cb(0, ep_addr, XFER_RESULT_SUCCESS, 0);
++}
++#endif
++
+ 
+ //--------------------------------------------------------------------+
+ // Debug
+@@ -612,6 +633,9 @@ void tud_task_ext(uint32_t timeout_ms, bool in_isr) {
+ 
+   // Loop until there is no more events in the queue
+   while (1) {
++#if CFG_TUSB_MCU == OPT_MCU_NRF5X
++    nrf_status_complete();
++#endif
+     dcd_event_t event;
+     if (!osal_queue_receive(_usbd_q, &event, timeout_ms)) return;
+ 
+@@ -624,6 +648,10 @@ void tud_task_ext(uint32_t timeout_ms, bool in_isr) {
+     TU_LOG_USBD("USBD %s ", event.event_id < DCD_EVENT_COUNT ? _usbd_event_str[event.event_id] : "CORRUPTED");
+ #endif
+ 
++#if CFG_TUSB_MCU == OPT_MCU_NRF5X
++    nrf_status_complete();
++#endif
++
+     switch (event.event_id) {
+       case DCD_EVENT_BUS_RESET:
+         TU_LOG_USBD(": %s Speed\r\n", tu_str_speed[event.bus_reset.speed]);
+@@ -754,6 +782,10 @@ void tud_task_ext(uint32_t timeout_ms, bool in_isr) {
+         break;
+     }
+ 
++#if CFG_TUSB_MCU == OPT_MCU_NRF5X
++    nrf_status_complete();
++#endif
++
+ #if CFG_TUSB_OS != OPT_OS_NONE && CFG_TUSB_OS != OPT_OS_PICO
+     // return if there is no more events, for application to run other background
+     if (osal_queue_empty(_usbd_q)) return;
+diff --git a/src/device/usbd_control.c b/src/device/usbd_control.c
+index b1fd357aa..c2de455f7 100644
+--- a/src/device/usbd_control.c
++++ b/src/device/usbd_control.c
+@@ -148,6 +148,12 @@ void usbd_control_set_complete_callback(usbd_control_xfer_cb_t fp) {
+   _ctrl_xfer.complete_cb = fp;
+ }
+ 
++#if CFG_TUSB_MCU == OPT_MCU_NRF5X
++bool usbd_control_xfer_is_status(uint8_t ep_addr) {
++  return tu_edpt_dir(ep_addr) != _ctrl_xfer.request.bmRequestType_bit.direction;
++}
++#endif
++
+ // for dcd_set_address where DCD is responsible for status response
+ void usbd_control_set_request(tusb_control_request_t const* request) {
+   _ctrl_xfer.request = (*request);
+diff --git a/src/portable/nordic/nrf5x/dcd_nrf5x.c b/src/portable/nordic/nrf5x/dcd_nrf5x.c
+index 7d7e11e10..70c12027e 100644
+--- a/src/portable/nordic/nrf5x/dcd_nrf5x.c
++++ b/src/portable/nordic/nrf5x/dcd_nrf5x.c
+@@ -94,6 +94,24 @@ enum {
+   EP_CBI_COUNT = 8  // Control Bulk Interrupt endpoints count
+ };
+ 
++enum {
++  EP0_STATUS_NONE,
++  EP0_STATUS_WAIT_OUT,
++  EP0_STATUS_WAIT_IN,
++  EP0_STATUS_READY_OUT,
++  EP0_STATUS_READY_IN,
++};
++
++enum {
++  DMA_PENDING_IN_SHIFT = 0,
++  DMA_PENDING_OUT_SHIFT = EP_CBI_COUNT + 1,
++  DMA_PENDING_EP0_RCVOUT = 1u << (2 * (EP_CBI_COUNT + 1)),
++  DMA_PENDING_COUNT = 2 * (EP_CBI_COUNT + 1) + 1,
++};
++
++#define DMA_PENDING_IN(_ep)  (1u << (DMA_PENDING_IN_SHIFT + (_ep)))
++#define DMA_PENDING_OUT(_ep) (1u << (DMA_PENDING_OUT_SHIFT + (_ep)))
++
+ // Transfer Descriptor
+ typedef struct {
+   uint8_t* buffer;
+@@ -120,9 +138,13 @@ static struct {
+ 
+   // nRF can only carry one DMA at a time, this is used to guard the access to EasyDMA
+   atomic_flag dma_running;
++  atomic_uint_least32_t dma_pending;
++  uint8_t dma_cursor;
+ 
+   // Track whether sof has been manually enabled
+   bool sof_enabled;
++
++  volatile uint8_t ep0_status_state;
+ } _dcd;
+ 
+ /*------------------------------------------------------------------*/
+@@ -136,6 +158,8 @@ TU_ATTR_ALWAYS_INLINE static inline bool is_in_isr(void) {
+ 
+ // helper to start DMA
+ static void start_dma(volatile uint32_t* reg_startep) {
++  bool const no_dma = (reg_startep == &NRF_USBD->TASKS_EP0STATUS) ||
++                      (reg_startep == &NRF_USBD->TASKS_EP0RCVOUT);
+   (*reg_startep) = 1;
+   __ISB();
+   __DSB();
+@@ -143,22 +167,69 @@ static void start_dma(volatile uint32_t* reg_startep) {
+   // TASKS_EP0STATUS, TASKS_EP0RCVOUT seem to need EasyDMA to be available
+   // However these don't trigger any DMA transfer and got ENDED event subsequently
+   // Therefore dma_pending is corrected right away
+-  if ((reg_startep == &NRF_USBD->TASKS_EP0STATUS) || (reg_startep == &NRF_USBD->TASKS_EP0RCVOUT)) {
++  if (no_dma) {
+     atomic_flag_clear(&_dcd.dma_running);
+   }
+ }
+ 
+-static void edpt_dma_start(volatile uint32_t* reg_startep) {
+-  if (atomic_flag_test_and_set(&_dcd.dma_running)) {
+-    usbd_defer_func((osal_task_func_t)(uintptr_t ) edpt_dma_start, (void*) (uintptr_t) reg_startep, is_in_isr());
+-  } else {
+-    start_dma(reg_startep);
++static bool xact_out_dma_locked(uint8_t epnum);
++
++static void dma_service_pending(void) {
++  for (;;) {
++    if (atomic_flag_test_and_set(&_dcd.dma_running)) return;
++
++    uint8_t const status = _dcd.ep0_status_state;
++    if (status == EP0_STATUS_WAIT_OUT || status == EP0_STATUS_WAIT_IN) {
++      start_dma(&NRF_USBD->TASKS_EP0STATUS);
++      _dcd.ep0_status_state = status == EP0_STATUS_WAIT_IN ?
++                              EP0_STATUS_READY_IN : EP0_STATUS_READY_OUT;
++      continue;
++    }
++
++    uint32_t const pending = atomic_load(&_dcd.dma_pending);
++    if (!pending) {
++      atomic_flag_clear(&_dcd.dma_running);
++      if (atomic_load(&_dcd.dma_pending) ||
++          _dcd.ep0_status_state == EP0_STATUS_WAIT_OUT ||
++          _dcd.ep0_status_state == EP0_STATUS_WAIT_IN) {
++        continue;
++      }
++      return;
++    }
++
++    unsigned index = _dcd.dma_cursor;
++    uint32_t bit;
++    do {
++      bit = 1u << index;
++      if (pending & bit) break;
++      if (++index == DMA_PENDING_COUNT) index = 0;
++    } while (index != _dcd.dma_cursor);
++    _dcd.dma_cursor = (uint8_t)(index + 1);
++    if (_dcd.dma_cursor == DMA_PENDING_COUNT) _dcd.dma_cursor = 0;
++    (void) atomic_fetch_and(&_dcd.dma_pending, ~bit);
++    if (index < EP_CBI_COUNT + 1) {
++      start_dma(index == EP_ISO_NUM ? &NRF_USBD->TASKS_STARTISOIN :
++                                     &NRF_USBD->TASKS_STARTEPIN[index]);
++      return;
++    }
++    if (index < 2 * (EP_CBI_COUNT + 1)) {
++      if (xact_out_dma_locked((uint8_t)(index - DMA_PENDING_OUT_SHIFT))) return;
++      continue;
++    }
++
++    start_dma(&NRF_USBD->TASKS_EP0RCVOUT);
+   }
+ }
+ 
++static void dma_schedule(uint32_t bit) {
++  (void) atomic_fetch_or(&_dcd.dma_pending, bit);
++  dma_service_pending();
++}
++
+ // DMA is complete
+ static void edpt_dma_end(void) {
+   atomic_flag_clear(&_dcd.dma_running);
++  dma_service_pending();
+ }
+ 
+ // helper getting td
+@@ -166,30 +237,38 @@ static inline xfer_td_t* get_td(uint8_t epnum, uint8_t dir) {
+   return &_dcd.xfer[epnum][dir];
+ }
+ 
+-static void xact_out_dma(uint8_t epnum);
++bool fantasi_nrf_status_take(uint8_t* ep_addr) {
++  if (!ep_addr) return false;
+ 
+-// Function wraps xact_out_dma which wants uint8_t while usbd_defer_func wants void (*)(void *)
+-static void xact_out_dma_wrapper(void* epnum) {
+-  xact_out_dma((uint8_t) ((uintptr_t) epnum));
++  bool const irq_enabled = NVIC_GetEnableIRQ(USBD_IRQn) != 0;
++  if (irq_enabled) NVIC_DisableIRQ(USBD_IRQn);
++  uint8_t const state = _dcd.ep0_status_state;
++  bool const ready = state == EP0_STATUS_READY_OUT || state == EP0_STATUS_READY_IN;
++  if (ready) {
++    *ep_addr = (state == EP0_STATUS_READY_IN) ? TUSB_DIR_IN_MASK : 0;
++    _dcd.ep0_status_state = EP0_STATUS_NONE;
++  }
++  if (irq_enabled) NVIC_EnableIRQ(USBD_IRQn);
++  return ready;
+ }
+ 
+ // Start DMA to move data from Endpoint -> RAM
+-static void xact_out_dma(uint8_t epnum) {
++static bool xact_out_dma_locked(uint8_t epnum) {
+   xfer_td_t* xfer = get_td(epnum, TUSB_DIR_OUT);
+   uint32_t xact_len;
+ 
+-  // DMA can't be active during read of SIZE.EPOUT or SIZE.ISOOUT, so try to lock,
+-  // If already running defer call regardless if it was called from ISR or task,
+-  if (atomic_flag_test_and_set(&_dcd.dma_running)) {
+-    usbd_defer_func((osal_task_func_t) xact_out_dma_wrapper, (void*) (uint32_t) epnum, is_in_isr());
+-    return;
++  if (epnum == 0 && !xfer->started) {
++    atomic_flag_clear(&_dcd.dma_running);
++    return false;
+   }
++
+   if (epnum == EP_ISO_NUM) {
+     xact_len = NRF_USBD->SIZE.ISOOUT;
+     // If ZERO bit is set, ignore ISOOUT length
+     if (xact_len & USBD_SIZE_ISOOUT_ZERO_Msk) {
+       xact_len = 0;
+       atomic_flag_clear(&_dcd.dma_running);
++      return false;
+     } else {
+       if (xfer->started) {
+         // Trigger DMA move data from Endpoint -> SRAM
+@@ -197,8 +276,10 @@ static void xact_out_dma(uint8_t epnum) {
+         NRF_USBD->ISOOUT.MAXCNT = xact_len;
+ 
+         start_dma(&NRF_USBD->TASKS_STARTISOOUT);
++        return true;
+       } else {
+         atomic_flag_clear(&_dcd.dma_running);
++        return false;
+       }
+     }
+   } else {
+@@ -210,9 +291,14 @@ static void xact_out_dma(uint8_t epnum) {
+     NRF_USBD->EPOUT[epnum].MAXCNT = xact_len;
+ 
+     start_dma(&NRF_USBD->TASKS_STARTEPOUT[epnum]);
++    return true;
+   }
+ }
+ 
++static void xact_out_dma(uint8_t epnum) {
++  dma_schedule(DMA_PENDING_OUT(epnum));
++}
++
+ // Prepare for a CBI transaction IN, call at the start
+ // it start DMA to transfer data from RAM -> Endpoint
+ static void xact_in_dma(uint8_t epnum) {
+@@ -224,7 +310,7 @@ static void xact_in_dma(uint8_t epnum) {
+   NRF_USBD->EPIN[epnum].PTR = (uint32_t) xfer->buffer;
+   NRF_USBD->EPIN[epnum].MAXCNT = xact_len;
+ 
+-  edpt_dma_start(&NRF_USBD->TASKS_STARTEPIN[epnum]);
++  dma_schedule(DMA_PENDING_IN(epnum));
+ }
+ 
+ //--------------------------------------------------------------------+
+@@ -363,6 +449,8 @@ void dcd_edpt_close_all(uint8_t rhport) {
+ 
+   // disable all non-control (bulk + interrupt) endpoints
+   for (uint8_t ep = 1; ep < EP_CBI_COUNT; ep++) {
++    (void) atomic_fetch_and(&_dcd.dma_pending,
++                           ~(DMA_PENDING_IN(ep) | DMA_PENDING_OUT(ep)));
+     NRF_USBD->INTENCLR = TU_BIT(USBD_INTEN_ENDEPOUT0_Pos + ep) | TU_BIT(USBD_INTEN_ENDEPIN0_Pos + ep);
+ 
+     NRF_USBD->TASKS_STARTEPIN[ep] = 0;
+@@ -379,6 +467,9 @@ void dcd_edpt_close_all(uint8_t rhport) {
+   NRF_USBD->TASKS_STARTISOOUT = 0;
+ 
+   tu_memclr(_dcd.xfer[EP_ISO_NUM], 2 * sizeof(xfer_td_t));
++  (void) atomic_fetch_and(&_dcd.dma_pending,
++                         ~(DMA_PENDING_IN(EP_ISO_NUM) |
++                           DMA_PENDING_OUT(EP_ISO_NUM)));
+ 
+   // de-activate all non-control
+   NRF_USBD->EPOUTEN = 1UL;
+@@ -392,6 +483,9 @@ void dcd_edpt_close(uint8_t rhport, uint8_t ep_addr) {
+ 
+   uint8_t const epnum = tu_edpt_number(ep_addr);
+   uint8_t const dir = tu_edpt_dir(ep_addr);
++  uint32_t const pending = dir == TUSB_DIR_IN ?
++                           DMA_PENDING_IN(epnum) : DMA_PENDING_OUT(epnum);
++  (void) atomic_fetch_and(&_dcd.dma_pending, ~pending);
+ 
+   if (epnum != EP_ISO_NUM) {
+     // CBI
+@@ -437,20 +531,45 @@ bool dcd_edpt_xfer(uint8_t rhport, uint8_t ep_addr, uint8_t* buffer, uint16_t to
+   xfer->total_len = total_bytes;
+   xfer->actual_len = 0;
+ 
+-  // Control endpoint with zero-length packet and opposite direction to 1st request byte --> status stage
+-  bool const control_status = (epnum == 0 && total_bytes == 0 && dir != tu_edpt_dir(NRF_USBD->BMREQUESTTYPE));
++  extern bool usbd_control_xfer_is_status(uint8_t ep_addr);
++  extern bool fantasi_usbd_setup_queued(void);
++
++  // Control endpoint with zero-length packet opposite to the saved request direction --> status stage
++  bool const control_status = epnum == 0 && total_bytes == 0 &&
++                              usbd_control_xfer_is_status(ep_addr);
+ 
+   if (control_status) {
+-    // The nRF doesn't interrupt on status transmit so we queue up a success response.
+-    dcd_event_xfer_complete(0, ep_addr, 0, XFER_RESULT_SUCCESS, is_in_isr());
++    bool const in_isr = is_in_isr();
++    bool const irq_enabled = !in_isr && NVIC_GetEnableIRQ(USBD_IRQn) != 0;
++    if (irq_enabled) NVIC_DisableIRQ(USBD_IRQn);
++
++    if ((!in_isr && fantasi_usbd_setup_queued()) || NRF_USBD->EVENTS_EP0SETUP) {
++      if (irq_enabled) NVIC_EnableIRQ(USBD_IRQn);
++      return true;
++    }
++
++    if (_dcd.ep0_status_state != EP0_STATUS_NONE) {
++      if (irq_enabled) NVIC_EnableIRQ(USBD_IRQn);
++      return true;
++    }
+ 
+-    // Status Phase also requires EasyDMA has to be available as well !!!!
+-    edpt_dma_start(&NRF_USBD->TASKS_EP0STATUS);
++    uint8_t const wait_state = dir == TUSB_DIR_IN ?
++                               EP0_STATUS_WAIT_IN : EP0_STATUS_WAIT_OUT;
++    _dcd.ep0_status_state = wait_state;
++    dma_service_pending();
++
++    if (NRF_USBD->EVENTS_EP0SETUP &&
++        (_dcd.ep0_status_state == EP0_STATUS_WAIT_OUT ||
++         _dcd.ep0_status_state == EP0_STATUS_WAIT_IN)) {
++      _dcd.ep0_status_state = EP0_STATUS_NONE;
++    }
++    if (irq_enabled) NVIC_EnableIRQ(USBD_IRQn);
++    return true;
+   } else if (dir == TUSB_DIR_OUT) {
+     xfer->started = true;
+     if (epnum == 0) {
+       // Accept next Control Out packet. TASKS_EP0RCVOUT also require EasyDMA
+-      edpt_dma_start(&NRF_USBD->TASKS_EP0RCVOUT);
++      dma_schedule(DMA_PENDING_EP0_RCVOUT);
+     } else {
+       // started just set, it could start DMA transfer if interrupt was trigger after this line
+       // code only needs to start transfer (from Endpoint to RAM) when data_received was set
+@@ -661,13 +780,19 @@ void dcd_int_handler(uint8_t rhport) {
+     }
+   }
+ 
+-  // Setup tokens are specific to the Control endpoint.
++  // A new SETUP supersedes pending work for the previous control transfer.
+   if (int_status & USBD_INTEN_EP0SETUP_Msk) {
+     uint8_t const setup[8] = {
+         NRF_USBD->BMREQUESTTYPE, NRF_USBD->BREQUEST, NRF_USBD->WVALUEL, NRF_USBD->WVALUEH,
+         NRF_USBD->WINDEXL, NRF_USBD->WINDEXH, NRF_USBD->WLENGTHL, NRF_USBD->WLENGTHH
+     };
+-
++    (void) atomic_fetch_and(&_dcd.dma_pending,
++                           ~(DMA_PENDING_IN(0) | DMA_PENDING_OUT(0) |
++                             DMA_PENDING_EP0_RCVOUT));
++    if (_dcd.ep0_status_state == EP0_STATUS_WAIT_OUT ||
++        _dcd.ep0_status_state == EP0_STATUS_WAIT_IN) {
++      _dcd.ep0_status_state = EP0_STATUS_NONE;
++    }
+     // nrf5x hw auto handle set address, there is no need to inform usb stack
+     tusb_control_request_t const* request = (tusb_control_request_t const*) setup;
+ 
+@@ -732,7 +857,7 @@ void dcd_int_handler(uint8_t rhport) {
+       if ((epnum != EP_ISO_NUM) && (xact_len == xfer->mps) && (xfer->actual_len < xfer->total_len)) {
+         if (epnum == 0) {
+           // Accept next Control Out packet. TASKS_EP0RCVOUT also require EasyDMA
+-          edpt_dma_start(&NRF_USBD->TASKS_EP0RCVOUT);
++          dma_schedule(DMA_PENDING_EP0_RCVOUT);
+         } else {
+           // nRF auto accept next Bulk/Interrupt OUT packet
+           // nothing to do
+@@ -797,6 +922,7 @@ void dcd_int_handler(uint8_t rhport) {
+       }
+     }
+   }
++
+ }
+ 
+ //--------------------------------------------------------------------+

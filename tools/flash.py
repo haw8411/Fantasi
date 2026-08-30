@@ -116,6 +116,26 @@ def find_all_usb_devices(vid, pid):
     return out
 
 
+def usb_location(usb_dev):
+    """Stable physical (bus, port path) for a sysfs USB device."""
+    try:
+        bus = open(f"{usb_dev}/busnum").read().strip()
+        path = open(f"{usb_dev}/devpath").read().strip()
+    except OSError:
+        return None
+    return bus, path
+
+
+def find_usb_device_at(vid, pid, location):
+    """Find a VID:PID only at a previously recorded physical USB location."""
+    if location is None:
+        return find_usb_device(vid, pid)
+    for usb_dev in find_all_usb_devices(vid, pid):
+        if usb_location(usb_dev) == location:
+            return usb_dev
+    return None
+
+
 def find_cdc_port(usb_dev=None):
     """Find the Fantasi CDC tty under a sysfs USB device node."""
     if usb_dev is None:
@@ -131,6 +151,17 @@ def wait_for_usb(vid, pid, timeout=15):
     """Wait for a USB device to enumerate. Returns sysfs path or None."""
     for _ in range(timeout * 2):
         dev = find_usb_device(vid, pid)
+        if dev:
+            time.sleep(0.3)
+            return dev
+        time.sleep(0.5)
+    return None
+
+
+def wait_for_usb_at(vid, pid, location, timeout=15):
+    """Wait for a USB identity at one physical bus/port location."""
+    for _ in range(timeout * 2):
+        dev = find_usb_device_at(vid, pid, location)
         if dev:
             time.sleep(0.3)
             return dev
@@ -173,6 +204,19 @@ def send_webusb_cmd(cli_bin, cmd):
 # longer one that would contain it. Derived from PLATFORMS so adding a board
 # here is the only place its id needs to live.
 DEVICE_IDS = sorted({cfg["id"] for cfg in PLATFORMS.values()}, key=len, reverse=True)
+
+
+def query_webusb_device_id(cli_bin):
+    """Ask the sole WebUSB Fantasi device for its platform id."""
+    try:
+        r = subprocess.run([cli_bin, "--usb", "-c", "device"],
+                           capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for line in r.stdout.splitlines():
+        if line.strip() in DEVICE_IDS:
+            return line.strip()
+    return None
 
 
 def query_device_id(port):
@@ -613,20 +657,20 @@ def flash_chameleon(hex_path):
     ], check=True)
 
 
-def flash_proxmark3(elf_path):
+def flash_proxmark3(elf_path, dfu_dev):
     flasher = os.path.join(REPO_ROOT, "tools/pm3_flasher.py")
-    dfu_dev = find_usb_device("9ac4", "4b8f")
     if not dfu_dev:
         print("error: PM3 bootloader device not found", file=sys.stderr)
         sys.exit(1)
 
     port = find_cdc_port(dfu_dev)
-    if not port:
-        for tty in sorted(glob.glob("/dev/ttyACM*")):
-            port = tty
+    for _ in range(20):
+        if port:
             break
+        time.sleep(0.1)
+        port = find_cdc_port(dfu_dev)
     if not port:
-        print("error: no serial port found for PM3 flasher", file=sys.stderr)
+        print("error: no serial port found under the selected PM3", file=sys.stderr)
         sys.exit(1)
 
     print(f"Flashing via pm3_flasher on {port}...", flush=True)
@@ -674,23 +718,39 @@ def main():
     # the flasher only has to invoke it and re-resolve the port afterwards.
     # (/apps is created by the firmware on boot, so it needs no host step.)
     fantasi_dev, cdc_port = select_running_device(cfg)
+    resource_target = cdc_port
+    if not fantasi_dev:
+        webusb_devs = find_all_usb_devices(USB_VID, USB_PID)
+        if len(webusb_devs) == 1:
+            cli_bin = ensure_cli()
+            if cli_bin and query_webusb_device_id(cli_bin) == cfg["id"]:
+                fantasi_dev = webusb_devs[0]
+                cdc_port = find_cdc_port(fantasi_dev)
+                resource_target = cdc_port or "--usb"
+    fantasi_location = usb_location(fantasi_dev) if fantasi_dev else None
+    if plat == "proxmark3" and fantasi_dev and fantasi_location is None:
+        sys.exit("error: cannot determine the Fantasi PM3 USB location - refusing to flash")
 
-    if resources and cdc_port:
+    if resources and resource_target:
         cli_bin = ensure_cli()
         if cli_bin:
             print("Syncing resources...")
-            upload_resources(cli_bin, cdc_port, resources)
+            upload_resources(cli_bin, resource_target, resources)
             time.sleep(2)
-            fantasi_dev, cdc_port = select_running_device(cfg)
+            fantasi_dev = find_usb_device_at(USB_VID, USB_PID,
+                                              fantasi_location)
+            cdc_port = find_cdc_port(fantasi_dev) if fantasi_dev else None
         else:
             print("warning: host CLI unavailable, skipping resource sync")
-    elif resources and not cdc_port:
+    elif resources and not resource_target:
         print("warning: device not running Fantasi, skipping resource sync")
 
-    # Step 3: Enter DFU / bootloader mode. The DFU VID:PID is unique per
-    # platform, so a DFU device already present unambiguously identifies the
-    # target - but bail if somehow more than one of them is attached.
+    # Step 3: Enter DFU / bootloader mode. When the runtime device was found,
+    # retain its physical USB location across re-enumeration so another device
+    # with the same bootloader VID:PID cannot be selected.
     dfu_devs = find_all_usb_devices(cfg["dfu_vid"], cfg["dfu_pid"])
+    if fantasi_location:
+        dfu_devs = [d for d in dfu_devs if usb_location(d) == fantasi_location]
     if len(dfu_devs) > 1:
         sys.exit(f"error: {len(dfu_devs)} {plat} DFU devices "
                  f"({cfg['dfu_vid']}:{cfg['dfu_pid']}) connected - refusing to "
@@ -700,7 +760,7 @@ def main():
     # A running Fantasi may be reachable only over WebUSB (vendor mode) with no
     # CDC port - e.g. a switch-mode PM3 a prior CLI session upgraded. Note its
     # presence so we can still enter DFU by sending `dfu` over the vendor pipe.
-    fantasi_present = find_usb_device(USB_VID, USB_PID) is not None
+    fantasi_present = fantasi_dev is not None
 
     # Nothing matched: neither a running Fantasi nor its DFU device is present.
     if not dfu_dev and not cdc_port and not fantasi_present:
@@ -716,7 +776,7 @@ def main():
             print(f"Sending DFU command via {cdc_port} (attempt {attempt + 1})...")
             send_serial_cmd(cdc_port, "dfu")
             print(f"Waiting for DFU device ({cfg['dfu_vid']}:{cfg['dfu_pid']})...")
-            dfu_dev = wait_for_usb(cfg["dfu_vid"], cfg["dfu_pid"])
+            dfu_dev = wait_for_usb_at(cfg["dfu_vid"], cfg["dfu_pid"], fantasi_location)
             if dfu_dev:
                 break
     elif not dfu_dev and fantasi_present:
@@ -726,7 +786,7 @@ def main():
             if cli_bin:
                 send_webusb_cmd(cli_bin, "dfu")
             print(f"Waiting for DFU device ({cfg['dfu_vid']}:{cfg['dfu_pid']})...")
-            dfu_dev = wait_for_usb(cfg["dfu_vid"], cfg["dfu_pid"])
+            dfu_dev = wait_for_usb_at(cfg["dfu_vid"], cfg["dfu_pid"], fantasi_location)
             if dfu_dev:
                 break
 
@@ -747,7 +807,7 @@ def main():
         # not an EOFError traceback.
         if sys.stdin.isatty():
             input("Press enter once the device is in DFU mode... ")
-            dfu_dev = find_usb_device(cfg["dfu_vid"], cfg["dfu_pid"])
+            dfu_dev = find_usb_device_at(cfg["dfu_vid"], cfg["dfu_pid"], fantasi_location)
         if not dfu_dev:
             print(f"error: DFU device {cfg['dfu_vid']}:{cfg['dfu_pid']} still not found",
                   file=sys.stderr)
@@ -761,7 +821,7 @@ def main():
     elif plat == "chameleon":
         flash_chameleon(bin_path)
     elif plat == "proxmark3":
-        flash_proxmark3(bin_path)
+        flash_proxmark3(bin_path, dfu_dev)
     elif plat == "proxmark5":
         flash_proxmark5(bin_path)
     else:

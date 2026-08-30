@@ -99,27 +99,6 @@ static uint32_t card_fat_next(uint32_t clus)
     return (s[i] | (s[i+1] << 8) | (s[i+2] << 16) | ((uint32_t)s[i+3] << 24)) & 0x0FFFFFFF;
 }
 
-/* Read a file's `size` bytes from the card, following its FAT chain from `start`
- * (used to reconcile an internal-subtree file whose data the host wrote into the
- * card scratch). Returns 0 on success. */
-static __attribute__((noinline)) int ext_read_file(uint32_t start, uint32_t size, uint8_t *dst)
-{
-    uint32_t got = 0, clus = start;
-    uint8_t s[BPS];
-    while (got < size && clus >= 2 && clus <= g_pt_max) {
-        for (uint32_t intra = 0; intra < g_sec_per_clus && got < size; intra++) {
-            if (fatrd_ext_read(g_pt_data_lba + (clus - 2u) * g_sec_per_clus + intra, s) != 0)
-                return -1;
-            uint32_t n = size - got; if (n > BPS) n = BPS;
-            memcpy(dst + got, s, n); got += n;
-        }
-        uint32_t nx = card_fat_next(clus);
-        if (nx < 2 || nx >= 0x0FFFFFF8) break;
-        clus = nx;
-    }
-    return got == size ? 0 : -1;
-}
-
 /* Free the card cluster chain starting at `start` (mark each entry 0 in the card
  * FAT). Used after reconciling an internal-subtree file whose data transited the
  * card scratch, so those clusters don't leak as lost clusters on the card. */
@@ -242,7 +221,8 @@ static int s_nnewdir;
  * is part of the existing lazy reconciliation allocation and survives model
  * rebuilds for the duration of one mounted-host view. */
 #define MAX_DIREXT 12
-static struct dirext_s { uint32_t cluster; int16_t dir; } *s_dirext;
+/* owner is 0 for root, otherwise the directory's stable first cluster. */
+static struct dirext_s { uint32_t cluster, owner; } *s_dirext;
 static int s_ndirext;
 
 static uint32_t newdir_cluster_for_path(const char *vpath)
@@ -260,6 +240,21 @@ static bool vpath_at_or_below(const char *candidate, const char *base)
            (candidate[n] == '\0' || candidate[n] == '/');
 }
 
+static bool vpath_rebase_fits(const char *vpath, const char *from,
+                              const char *to)
+{
+    if (!vpath_at_or_below(vpath, from)) return true;
+    return strlen(to) + strlen(vpath + strlen(from)) < VPATH_MAX;
+}
+
+static void vpath_rebase(char *vpath, const char *from, const char *to)
+{
+    if (!vpath_at_or_below(vpath, from)) return;
+    size_t fn = strlen(from), tn = strlen(to);
+    memmove(vpath + tn, vpath + fn, strlen(vpath + fn) + 1);
+    memcpy(vpath, to, tn);
+}
+
 static void newdir_forget(const char *vpath)
 {
     for (int i = 0; i < s_nnewdir; ) {
@@ -275,23 +270,8 @@ static void newdir_forget(const char *vpath)
 
 static void newdir_rename(const char *from, const char *to)
 {
-    size_t fn = strlen(from), tn = strlen(to);
-    for (int i = 0; i < s_nnewdir; i++) {
-        if (!vpath_at_or_below(s_newdir[i].vpath, from)) continue;
-        const char *tail = s_newdir[i].vpath + fn;
-        size_t tailn = strlen(tail);
-        if (tn + tailn >= VPATH_MAX) {
-            memmove(s_newdir + i, s_newdir + i + 1,
-                    (s_nnewdir - i - 1) * sizeof s_newdir[0]);
-            s_nnewdir--;
-            i--;
-            continue;
-        }
-        char rebased[VPATH_MAX];
-        memcpy(rebased, to, tn);
-        memcpy(rebased + tn, tail, tailn + 1);
-        memcpy(s_newdir[i].vpath, rebased, tn + tailn + 1);
-    }
+    for (int i = 0; i < s_nnewdir; i++)
+        vpath_rebase(s_newdir[i].vpath, from, to);
 }
 
 static const char *leaf(const char *vpath)
@@ -319,6 +299,13 @@ static bool vpath_join(char *out, size_t cap, const char *prefix, const char *na
     out[a] = '/';
     memcpy(out + a + 1, name, b + 1);
     return true;
+}
+
+static bool vpath_is_direct_child(const char *vpath, const char *prefix)
+{
+    size_t n = strlen(prefix);
+    return strncmp(vpath, prefix, n) == 0 && vpath[n] == '/' && vpath[n + 1] &&
+           strchr(vpath + n + 1, '/') == NULL;
 }
 
 /* entries an item consumes in a directory: N LFN entries + 1 short entry */
@@ -457,9 +444,11 @@ static void synth_gen(uint8_t s[BPS])
 }
 
 static bool model_ensure(unsigned nd, unsigned nf);   /* (re)allocate model buffers; defined after s_newdir */
-static void tomb_flush(void);                         /* commit deferred deletes; defined near fatrd_read */
+static bool tomb_flush(void);                         /* commit deferred deletes; defined near fatrd_read */
+static bool pending_has(const char *vpath, uint32_t start);
 static void pending_drop(const char *vpath, uint32_t start); /* retire a truly deleted file's staged tail */
 static bool flush_pending(void);                      /* deferred-reconcile sweep; defined in the write section */
+static void pending_snapshot_mark(void);              /* preserve in-flight cluster assignments on rebuild */
 static void stage_free_all(void);                     /* drop all staged sectors; defined in the write section */
 static uint32_t asn_assign(const char *vpath, uint32_t nclus);   /* stable cluster; defined after model_ensure */
 static void asn_put(const char *vpath, uint32_t start, uint32_t nclus);
@@ -534,8 +523,8 @@ static void build_model(void)
 {
     if (s_have_model && s_built_gen == s_fs_gen) return;   /* cache still valid */
 
-    /* Fill from the live FS; if a pass overflows the current capacity, double it
-     * and refill. Converges in one or two passes and fits any FS that fits in heap
+    /* Fill from the live FS; if a pass overflows the current capacity, grow it
+     * and refill. Geometric growth fits any FS that fits in heap
      * (model_ensure returns false on OOM -> callers present a blank drive). */
     unsigned cd = s_cap_dir ? s_cap_dir : INIT_DIRS;
     unsigned cf = s_cap_file ? s_cap_file : INIT_FILES;
@@ -554,7 +543,7 @@ static void build_model(void)
         }
         if (!s_of_dir && !s_of_file) break;
         cd = s_of_dir  ? s_cap_dir  * 2 : s_cap_dir;   /* grow only the dimension that overflowed */
-        cf = s_of_file ? s_cap_file * 2 : s_cap_file;
+        cf = s_of_file ? s_cap_file + s_cap_file / 2 : s_cap_file;
     }
 
     select_geometry();
@@ -620,6 +609,7 @@ static void build_model(void)
         asn_snapshot_mark(s_dir[d].vpath, s_dir[d].start, s_dir[d].nclus);
     for (int i = 0; i < s_nfile; i++)
         asn_snapshot_mark(s_file[i].vpath, s_file[i].start, s_file[i].nclus);
+    pending_snapshot_mark();
     asn_snapshot_prune();
 
     asn_put("/", s_root_start, s_root_nclus);
@@ -710,8 +700,48 @@ static uint32_t chain_next(uint32_t c)
 static void chain_record(uint32_t c, uint32_t next)
 {
     if (!s_fatchain) return;
-    for (int i = 0; i < s_nfatchain; i++) if (s_fatchain[i].clus == c) { s_fatchain[i].next = next; return; }
-    if (s_nfatchain < MAX_FATCHAIN) { s_fatchain[s_nfatchain].clus = c; s_fatchain[s_nfatchain].next = next; s_nfatchain++; }
+    bool needed = next >= 2 && next < 0x0FFFFFF8u && next != c + 1u;
+    for (int i = 0; i < s_nfatchain; i++) if (s_fatchain[i].clus == c) {
+        if (needed) {
+            s_fatchain[i].next = next;
+        } else {
+            memmove(s_fatchain + i, s_fatchain + i + 1,
+                    (s_nfatchain - i - 1) * sizeof s_fatchain[0]);
+            s_nfatchain--;
+        }
+        return;
+    }
+    if (needed && s_nfatchain < MAX_FATCHAIN) {
+        s_fatchain[s_nfatchain].clus = c;
+        s_fatchain[s_nfatchain].next = next;
+        s_nfatchain++;
+    }
+}
+
+static void chain_forget_cluster(uint32_t cluster)
+{
+    for (int i = 0; i < s_nfatchain; ) {
+        if (s_fatchain[i].clus == cluster || s_fatchain[i].next == cluster) {
+            memmove(s_fatchain + i, s_fatchain + i + 1,
+                    (s_nfatchain - i - 1) * sizeof s_fatchain[0]);
+            s_nfatchain--;
+        } else {
+            i++;
+        }
+    }
+}
+
+static uint32_t dirext_owner_key(int owner)
+{
+    if (owner == -1) return 0;
+    return (owner >= 0 && owner < s_ndir) ? s_dir[owner].start : 0xFFFFFFFFu;
+}
+
+static int dirext_owner_index(uint32_t owner)
+{
+    if (!owner) return -1;
+    int d = dir_of_cluster(owner);
+    return (d >= 0 && s_dir[d].start == owner) ? d : -2;
 }
 
 /* Owning directory of cluster c across the model chains and host extensions:
@@ -721,14 +751,18 @@ static int dir_owner(uint32_t c)
     if (cluster_is_root(c)) return -1;
     int d = dir_of_cluster(c);
     if (d >= 0) return d;
-    for (int i = 0; i < s_ndirext; i++) if (s_dirext[i].cluster == c) return s_dirext[i].dir;
+    for (int i = 0; i < s_ndirext; i++)
+        if (s_dirext[i].cluster == c)
+            return dirext_owner_index(s_dirext[i].owner);
     return -2;
 }
 
 static bool dirext_has(uint32_t cluster, int owner)
 {
+    uint32_t key = dirext_owner_key(owner);
+    if (key == 0xFFFFFFFFu) return false;
     for (int i = 0; i < s_ndirext; i++)
-        if (s_dirext[i].cluster == cluster && s_dirext[i].dir == owner)
+        if (s_dirext[i].cluster == cluster && s_dirext[i].owner == key)
             return true;
     return false;
 }
@@ -749,9 +783,14 @@ static bool dirext_next(uint32_t cluster, int owner, uint32_t *next)
  * entry decoding/synthesis uses the same slots Linux wrote. */
 static bool dirext_position(uint32_t cluster, int *owner_out, uint32_t *pos_out)
 {
-    int owner = -2;
+    uint32_t owner_key = 0xFFFFFFFFu;
     for (int i = 0; i < s_ndirext; i++)
-        if (s_dirext[i].cluster == cluster) { owner = s_dirext[i].dir; break; }
+        if (s_dirext[i].cluster == cluster) {
+            owner_key = s_dirext[i].owner;
+            break;
+        }
+    if (owner_key == 0xFFFFFFFFu) return false;
+    int owner = dirext_owner_index(owner_key);
     if (owner == -2) return false;
 
     uint32_t start, base;
@@ -783,9 +822,14 @@ static bool dirext_position(uint32_t cluster, int *owner_out, uint32_t *pos_out)
 static void dirext_forget(const char *vpath)
 {
     for (int i = 0; i < s_ndirext; ) {
-        int dir = s_dirext[i].dir;
-        const char *owner = (dir >= 0 && dir < s_ndir) ? s_dir[dir].vpath : NULL;
+        const char *owner = NULL;
+        for (int a = 0; a < s_nasn; a++)
+            if (s_asn[a].start == s_dirext[i].owner) {
+                owner = s_asn[a].vpath;
+                break;
+            }
         if (owner && vpath_at_or_below(owner, vpath)) {
+            chain_forget_cluster(s_dirext[i].cluster);
             memmove(s_dirext + i, s_dirext + i + 1,
                     (s_ndirext - i - 1) * sizeof s_dirext[0]);
             s_ndirext--;
@@ -799,15 +843,19 @@ static void dirext_forget(const char *vpath)
  * before the preceding sector containing the first LFN fragment. Committing that
  * SFN immediately permanently exposes the host's generated XXXXXX~1 alias. Keep a
  * transaction for the exact owning directory + target SFN slot + checksum instead;
- * an unresolved SFN is retained until SYNCHRONIZE CACHE, by which point the other
- * sector has arrived. Checksum alone is not an identity: collisions are common and
- * whole-directory rewrites can interleave several names with the same byte sum. */
+ * an unresolved file SFN remains upgradeable across SYNCHRONIZE CACHE if the
+ * preceding sector arrives later. Checksum alone is not an identity: collisions
+ * are common and whole-directory rewrites can interleave equal byte sums. */
 #define LFN_POOL 16
 #define LFN_ACTIVE 0x80u
 #define LFN_HAVE_SHORT 0x40u
+#define LFN_SHORT_COMMITTED 0x20u
+#define LFN_FRAGMENT_CACHED 0x80u
+#define LFN_EXPECTED_MASK 0x7Fu
 /* `state` uses its low five bits as the received-fragment mask. The implementation
  * supports a 63-character leaf (five LFN fragments), matching the path model's
- * existing limit. `short_entry` is populated only when the SFN outruns a fragment. */
+ * existing limit. `expected` uses its high bit for a passive fragment cache.
+ * `short_entry` is populated only when the SFN outruns a fragment. */
 static struct lfnp_s {
     uint32_t owner;
     uint32_t sfn_slot;
@@ -817,6 +865,8 @@ static struct lfnp_s {
     char name[64];
 } *s_lfnp;                                             /* lazy heap */
 static uint32_t s_lfn_next_order;
+
+static bool lfn_complete(int slot);
 
 /* Root uses owner 0 (not a legal FAT cluster); other directories keep their
  * mounted-host cluster even if a model rebuild reorders the s_dir array. */
@@ -856,13 +906,41 @@ static int lfn_slot(uint32_t owner, uint32_t sfn_slot, uint8_t ck)
         s_lfnp[i].cksum = ck;
         return i;
     }
+    /* A cached fragment has no durable file state and is the safest eviction. */
+    for (i = 0; i < LFN_POOL; i++)
+        if ((s_lfnp[i].expected & LFN_FRAGMENT_CACHED) &&
+            !(s_lfnp[i].state & LFN_HAVE_SHORT)) {
+            memset(&s_lfnp[i], 0, sizeof s_lfnp[i]);
+            s_lfnp[i].state = LFN_ACTIVE;
+            s_lfnp[i].owner = owner;
+            s_lfnp[i].sfn_slot = sfn_slot;
+            s_lfnp[i].cksum = ck;
+            return i;
+        }
+    /* A provisional short name is already durable. Under pool pressure, lose
+     * only an incomplete late-name upgrade, never file data. */
+    int oldest = -1;
+    for (i = 0; i < LFN_POOL; i++)
+        if ((s_lfnp[i].state & (LFN_ACTIVE | LFN_SHORT_COMMITTED)) ==
+            (LFN_ACTIVE | LFN_SHORT_COMMITTED) &&
+            !lfn_complete(i) &&
+            (oldest < 0 || s_lfnp[i].order < s_lfnp[oldest].order))
+            oldest = i;
+    if (oldest >= 0) {
+        memset(&s_lfnp[oldest], 0, sizeof s_lfnp[oldest]);
+        s_lfnp[oldest].state = LFN_ACTIVE;
+        s_lfnp[oldest].owner = owner;
+        s_lfnp[oldest].sfn_slot = sfn_slot;
+        s_lfnp[oldest].cksum = ck;
+        return oldest;
+    }
     return -1;
 }
 
 static bool lfn_complete(int slot)
 {
     if (!s_lfnp || slot < 0 || slot >= LFN_POOL) return false;
-    uint8_t expected = s_lfnp[slot].expected;
+    uint8_t expected = s_lfnp[slot].expected & LFN_EXPECTED_MASK;
     if (!expected || expected > 5) return false;
     uint8_t mask = (uint8_t)((1u << expected) - 1u);
     return (s_lfnp[slot].state & mask) == mask;
@@ -904,7 +982,10 @@ static bool lfn_has_active_transaction(void)
 {
     if (!s_lfnp) return false;
     for (int i = 0; i < LFN_POOL; i++)
-        if (s_lfnp[i].state & LFN_ACTIVE) return true;
+        if ((s_lfnp[i].state & LFN_ACTIVE) &&
+            !(s_lfnp[i].expected & LFN_FRAGMENT_CACHED) &&
+            (!(s_lfnp[i].state & LFN_SHORT_COMMITTED) || lfn_complete(i)))
+            return true;
     return false;
 }
 
@@ -913,6 +994,8 @@ static bool lfn_has_unresolved_transaction(void)
     if (!s_lfnp) return false;
     for (int i = 0; i < LFN_POOL; i++)
         if ((s_lfnp[i].state & LFN_ACTIVE) &&
+            !(s_lfnp[i].expected & LFN_FRAGMENT_CACHED) &&
+            !(s_lfnp[i].state & LFN_SHORT_COMMITTED) &&
             (!(s_lfnp[i].state & LFN_HAVE_SHORT) || !lfn_complete(i)))
             return true;
     return false;
@@ -920,9 +1003,10 @@ static bool lfn_has_unresolved_transaction(void)
 
 /* Replay retained SFNs only at a write durability/session boundary, never on an
  * intervening directory read. Complete transactions consume their reconstructed
- * LFN. A real SCSI sync may fall an incomplete transaction back to native 8.3;
- * an asynchronous USB unplug may not, because a missing fragment can mean the
- * write itself was interrupted. */
+ * LFN. A real SCSI sync may provisionally expose an incomplete file transaction
+ * as native 8.3; retaining its fragments lets a later sector upgrade that alias.
+ * Directory fallbacks are not retained because their layout changes on replay.
+ * An asynchronous USB unplug may not invent a fallback. */
 static bool s_lfn_force_short;
 static bool s_lfn_ordered_recovery;
 static void lfn_pending_flush(bool fallback_incomplete)
@@ -936,6 +1020,9 @@ static void lfn_pending_flush(bool fallback_incomplete)
                 (LFN_ACTIVE | LFN_HAVE_SHORT))
                 continue;
             if (!fallback_incomplete && !lfn_complete(k)) continue;
+            if (!lfn_complete(k) &&
+                (s_lfnp[k].state & LFN_SHORT_COMMITTED))
+                continue;
             if (i < 0 || s_lfnp[k].order < oldest) {
                 i = k;
                 oldest = s_lfnp[k].order;
@@ -962,15 +1049,39 @@ static void lfn_pending_flush(bool fallback_incomplete)
         }
 
         bool complete = lfn_complete(i);
-        if (!complete) lfn_release(i);          /* make replay take the SFN path */
+        bool provisional = !complete && !(entry[11] & 0x10u);
+        if (provisional) s_lfnp[i].state |= LFN_SHORT_COMMITTED;
+        else if (!complete) lfn_release(i);
         s_lfn_force_short = !complete;
         write_dir(dir, prefix, slot, 0, entry, sizeof entry);
         s_lfn_force_short = false;
     }
-    /* Fragments without a retained SFN belong to harmless whole-sector rewrites,
-     * or to an abandoned transaction. Do not let either consume the bounded pool
-     * for the rest of a long-lived composite-USB mount. */
-    for (int i = 0; i < LFN_POOL; i++) lfn_release(i);
+}
+
+static bool lfn_fragment_crosses_sector(int slot)
+{
+    uint8_t fragments = s_lfnp[slot].state & 0x1Fu;
+    uint32_t target_offset = s_lfnp[slot].sfn_slot % EPS;
+    /* Fragment seq is seq + 1 entries before its target SFN. */
+    return (fragments >> target_offset) != 0;
+}
+
+/* Fragments from the sector before their SFN remain available for that SFN. They
+ * are reconstruction data only and must not defer unrelated tombstone commits. */
+static void lfn_fragment_cache_prune(void)
+{
+    if (!s_lfnp) return;
+    for (int i = 0; i < LFN_POOL; i++) {
+        if (!(s_lfnp[i].state & LFN_ACTIVE) ||
+            (s_lfnp[i].state & (LFN_HAVE_SHORT | LFN_SHORT_COMMITTED)))
+            continue;
+        if (s_lfnp[i].expected & LFN_FRAGMENT_CACHED)
+            continue;
+        if (!lfn_fragment_crosses_sector(i))
+            lfn_release(i);
+        else
+            s_lfnp[i].expected |= LFN_FRAGMENT_CACHED;
+    }
 }
 
 static uint8_t sfn_cksum(const uint8_t *e)
@@ -1081,7 +1192,15 @@ static bool model_ensure(unsigned nd, unsigned nf)
 /* Renamed-away / deleted files awaiting commit (see the tomb_* section below). Kept
  * here with the other lazy-heap reconcile buffers so recon_bufs_* can manage it. */
 #define MAX_TOMB 16
-static struct tomb_s { char vpath[VPATH_MAX]; uint32_t cluster; } *s_tomb;   /* lazy heap */
+#define TOMB_IS_DIR 0x01u
+#define TOMB_DEST   0x02u
+static struct tomb_s {
+    char vpath[VPATH_MAX];
+    uint32_t cluster;
+    uint32_t slot;
+    uint8_t sfn[11];
+    uint8_t flags;
+} *s_tomb;                                                        /* lazy heap */
 static int s_ntomb;
 
 /* The write-side reconcile buffers (~5 KB) are only needed while a host is writing the
@@ -1133,24 +1252,22 @@ static void ext_scratch_free_all(void)
     }
 }
 
+static void reconcile_before_reset(bool orderly)
+{
+    if (!s_pending || s_capture_failed) return;
+    if (!orderly && lfn_has_unresolved_transaction())
+        lfn_pending_flush(false);
+    else
+        (void)fatrd_sync();
+}
+
 void fatrd_release(void)
 {
     fatrd_store_lock();
     /* Eject normally follows SYNCHRONIZE CACHE, but unplug paths can arrive
-     * without it. Resolve a retained SFN before its source tombstone, then make
-     * any staged data durable before freeing the reconstruction state. */
-    if (!s_capture_failed) {
-        bool interrupted_name = lfn_has_unresolved_transaction();
-        lfn_pending_flush(false);
-        if (!s_capture_failed && !interrupted_name) {
-            /* An incomplete rename destination may own one of these source
-             * tombstones. On abrupt unplug, preserving an extra source is safer
-             * than deleting it without its destination; without a durability
-             * boundary its other staged writes are ambiguous too. */
-            tomb_flush();
-            (void)flush_pending();
-        }
-    }
+     * without it. Use the same full reconciliation before freeing the state;
+     * this includes directory sectors captured before their parent route. */
+    reconcile_before_reset(false);
     ext_scratch_free_all();
     vPortFree(s_dir); vPortFree(s_file); vPortFree(s_newdir); vPortFree(s_asn);
     s_dir = NULL; s_file = NULL; s_newdir = NULL; s_asn = NULL;
@@ -1271,16 +1388,12 @@ static bool asn_deleted_sfn_compare(const char *vpath, uint32_t start,
     return false;
 }
 
-/* Carry an assignment across a rename so the destination keeps the source's
- * cluster (the host kept the data in place, only the name changed). */
+/* Carry assignments across a rename so the destination subtree keeps the
+ * source's clusters (the host kept the data in place, only the name changed). */
 static void asn_rename(const char *from, const char *to)
 {
     for (int i = 0; i < s_nasn; i++)
-        if (strcmp(s_asn[i].vpath, from) == 0) {
-            strncpy(s_asn[i].vpath, to, VPATH_MAX - 1);
-            s_asn[i].vpath[VPATH_MAX - 1] = '\0';
-            return;
-        }
+        vpath_rebase(s_asn[i].vpath, from, to);
 }
 
 static void asn_forget(const char *path)
@@ -1537,48 +1650,172 @@ static void synth_dir(int dir, uint32_t first_entry, uint8_t s[BPS])
  * file; the cluster is only used to match a rename within one stable-model op. */
 /* s_tomb / MAX_TOMB are declared up with the other lazy-heap reconcile buffers. */
 
-static void tomb_add(const char *vpath, uint32_t cluster)
+static void tomb_erase(int i)
+{
+    memmove(s_tomb + i, s_tomb + i + 1,
+            (s_ntomb - i - 1) * sizeof s_tomb[0]);
+    s_ntomb--;
+}
+
+static bool mounted_state_rename_fits(const char *from, const char *to);
+static void mounted_state_rename(const char *from, const char *to);
+
+static bool tomb_complete_dir_dest(int dst, const char *from)
+{
+    struct tomb_s *d = &s_tomb[dst];
+    uint8_t ntres = d->flags & ASN_SFN_CASE_MASK;
+    if (!mounted_state_rename_fits(from, d->vpath) ||
+        vfs_msc_rename(from, d->vpath) != 0)
+        return false;
+    mounted_state_rename(from, d->vpath);
+    asn_sfn_record(d->vpath, d->cluster, d->sfn, ntres, d->slot);
+    return true;
+}
+
+static void tomb_add(const char *vpath, uint32_t cluster, bool is_dir)
 {
     if (!s_tomb) return;
-    if (s_ntomb >= MAX_TOMB) {            /* commit the oldest to make room */
-        pending_drop(s_tomb[0].vpath, s_tomb[0].cluster);
-        if (vfs_msc_remove(s_tomb[0].vpath) == 0)
-            newdir_forget(s_tomb[0].vpath);
-        asn_forget(s_tomb[0].vpath);
-        memmove(s_tomb, s_tomb + 1, (MAX_TOMB - 1) * sizeof s_tomb[0]);
-        s_ntomb = MAX_TOMB - 1;
-    }
+    if (is_dir)
+        for (int i = 0; i < s_ntomb; i++)
+            if ((s_tomb[i].flags & (TOMB_IS_DIR | TOMB_DEST)) ==
+                (TOMB_IS_DIR | TOMB_DEST) &&
+                s_tomb[i].cluster == cluster) {
+                if (tomb_complete_dir_dest(i, vpath)) tomb_erase(i);
+                else s_capture_failed = true;
+                return;
+            }
+    uint8_t type = is_dir ? TOMB_IS_DIR : 0;
+    for (int i = 0; i < s_ntomb; i++)
+        if (s_tomb[i].cluster == cluster &&
+            !(s_tomb[i].flags & TOMB_DEST) &&
+            (s_tomb[i].flags & TOMB_IS_DIR) == type &&
+            strcmp(s_tomb[i].vpath, vpath) == 0) return;
+    /* A source may still be claimed by a later rename destination, so never
+     * evict a tomb while directory writes are still arriving. */
+    if (s_ntomb >= MAX_TOMB) { s_capture_failed = true; return; }
     strncpy(s_tomb[s_ntomb].vpath, vpath, VPATH_MAX - 1);
     s_tomb[s_ntomb].vpath[VPATH_MAX - 1] = '\0';
     s_tomb[s_ntomb].cluster = cluster;
+    s_tomb[s_ntomb].slot = 0;
+    memset(s_tomb[s_ntomb].sfn, 0, sizeof s_tomb[s_ntomb].sfn);
+    s_tomb[s_ntomb].flags = type;
     s_ntomb++;
+}
+
+/* A moved directory's destination can reach us before its deleted source slot.
+ * Retain that half until the source proves the shared cluster is a rename. */
+static bool tomb_add_dir_dest(const char *vpath, uint32_t cluster,
+                              const uint8_t *sfn, uint32_t slot)
+{
+    if (!s_tomb) return false;
+    for (int i = 0; i < s_ntomb; i++)
+        if ((s_tomb[i].flags & TOMB_DEST) &&
+            s_tomb[i].cluster == cluster) {
+            strncpy(s_tomb[i].vpath, vpath, VPATH_MAX - 1);
+            s_tomb[i].vpath[VPATH_MAX - 1] = '\0';
+            s_tomb[i].slot = slot;
+            memcpy(s_tomb[i].sfn, sfn, sizeof s_tomb[i].sfn);
+            s_tomb[i].flags = TOMB_IS_DIR | TOMB_DEST |
+                              (sfn[12] & ASN_SFN_CASE_MASK);
+            return true;
+        }
+    if (s_ntomb >= MAX_TOMB) return false;
+    strncpy(s_tomb[s_ntomb].vpath, vpath, VPATH_MAX - 1);
+    s_tomb[s_ntomb].vpath[VPATH_MAX - 1] = '\0';
+    s_tomb[s_ntomb].cluster = cluster;
+    s_tomb[s_ntomb].slot = slot;
+    memcpy(s_tomb[s_ntomb].sfn, sfn, sizeof s_tomb[s_ntomb].sfn);
+    s_tomb[s_ntomb].flags = TOMB_IS_DIR | TOMB_DEST |
+                            (sfn[12] & ASN_SFN_CASE_MASK);
+    s_ntomb++;
+    return true;
 }
 
 /* If a tombstone owns `cluster`, copy its vpath to `out` and drop it (a rename is
  * reclaiming that file's data under a new name). Returns true on a match. */
-static bool tomb_claim(uint32_t cluster, char *out)
+static bool tomb_claim(uint32_t cluster, bool is_dir, char *out)
 {
+    uint8_t type = is_dir ? TOMB_IS_DIR : 0;
     for (int i = 0; i < s_ntomb; i++)
-        if (s_tomb[i].cluster == cluster) {
+        if (s_tomb[i].cluster == cluster &&
+            !(s_tomb[i].flags & TOMB_DEST) &&
+            (s_tomb[i].flags & TOMB_IS_DIR) == type) {
             strcpy(out, s_tomb[i].vpath);
-            memmove(s_tomb + i, s_tomb + i + 1, (s_ntomb - i - 1) * sizeof s_tomb[0]);
-            s_ntomb--;
+            tomb_erase(i);
             return true;
         }
     return false;
 }
 
-static void tomb_flush(void)             /* commit the surviving deletes */
+static bool tomb_resolve_dir_dests(void)
 {
-    for (int i = 0; i < s_ntomb; i++) {
-        pending_drop(s_tomb[i].vpath, s_tomb[i].cluster);
-        if (vfs_msc_remove(s_tomb[i].vpath) == 0)
-            newdir_forget(s_tomb[i].vpath);
-        /* Its FAT chain was released by the mounted host. Drop the stale pin
-         * before that cluster can be reused for another object. */
-        asn_forget(s_tomb[i].vpath);
+    for (;;) {
+        int dst = -1, src = -1;
+        for (int d = 0; d < s_ntomb && dst < 0; d++) {
+            if ((s_tomb[d].flags & (TOMB_IS_DIR | TOMB_DEST)) !=
+                (TOMB_IS_DIR | TOMB_DEST))
+                continue;
+            for (int s = 0; s < s_ntomb; s++)
+                if (!(s_tomb[s].flags & TOMB_DEST) &&
+                    (s_tomb[s].flags & TOMB_IS_DIR) &&
+                    s_tomb[s].cluster == s_tomb[d].cluster) {
+                    dst = d;
+                    src = s;
+                    break;
+                }
+        }
+        if (dst < 0) return true;
+
+        char from[VPATH_MAX];
+        vpath_copy(from, sizeof from, s_tomb[src].vpath);
+        if (!tomb_complete_dir_dest(dst, from)) return false;
+        int hi = dst > src ? dst : src;
+        int lo = dst > src ? src : dst;
+        tomb_erase(hi);
+        tomb_erase(lo);
     }
-    s_ntomb = 0;
+}
+
+static void tomb_discard_dir_dests(void)
+{
+    for (int i = 0; i < s_ntomb; ) {
+        if (s_tomb[i].flags & TOMB_DEST) tomb_erase(i);
+        else i++;
+    }
+}
+
+static bool tomb_remove(int i)
+{
+    if (s_tomb[i].flags & TOMB_DEST) return false;
+    bool pending_only = !(s_tomb[i].flags & TOMB_IS_DIR) &&
+                        pending_has(s_tomb[i].vpath, s_tomb[i].cluster) &&
+                        vfs_size(s_tomb[i].vpath) < 0;
+    if (!pending_only && vfs_msc_remove(s_tomb[i].vpath) != 0) return false;
+    pending_drop(s_tomb[i].vpath, s_tomb[i].cluster);
+    dirext_forget(s_tomb[i].vpath);
+    newdir_forget(s_tomb[i].vpath);
+    /* Its FAT chain was released by the mounted host. Drop the stale pin before
+     * that cluster can be reused for another object. */
+    asn_forget(s_tomb[i].vpath);
+    tomb_erase(i);
+    return true;
+}
+
+static bool tomb_flush(void)             /* commit the surviving deletes */
+{
+    if (!tomb_resolve_dir_dests()) return false;
+    bool progress;
+    do {
+        progress = false;
+        for (int i = 0; i < s_ntomb; ) {
+            if (s_tomb[i].flags & TOMB_DEST) { i++; continue; }
+            if (tomb_remove(i)) progress = true;
+            else i++;
+        }
+    } while (s_ntomb && progress);
+    for (int i = 0; i < s_ntomb; i++)
+        if (!(s_tomb[i].flags & TOMB_DEST)) return false;
+    return true;
 }
 
 /* Synthesize one 512-byte sector `lba` into `sec` (assumes the model is built). */
@@ -1688,15 +1925,10 @@ int fatrd_read(uint32_t lba, uint32_t offset, void *buf, uint32_t len)
      * is the normal trigger) - then drop stale routes/assignments and free whatever
      * staging is left (abandoned partials). Non-boot reads don't reconcile: the host
      * reads its own cache mid-write, so committing partial state early would just churn. */
-    if (lba == 0) { if (!s_capture_failed) {
-                        lfn_pending_flush(true);
-                        if (!s_capture_failed) {
-                            tomb_flush();
-                            (void)flush_pending();
-                        }
-                    }
+    if (lba == 0) { reconcile_before_reset(true);
                     ext_scratch_free_all();
-                    s_nnewdir = 0; s_ndirext = 0; s_nfatchain = 0; s_nasn = 0; s_hiwater = 2; s_have_model = false;
+                    s_nnewdir = 0; s_ndirext = 0; s_nfatchain = 0; s_ntomb = 0;
+                    s_nasn = 0; s_hiwater = 2; s_have_model = false;
                     if (s_lfnp)    for (int k = 0; k < LFN_POOL; k++)   s_lfnp[k].state = 0;
                     if (s_pending) for (int k = 0; k < MAX_PENDING; k++) s_pending[k].start = 0;
                     stage_free_all();
@@ -1704,7 +1936,7 @@ int fatrd_read(uint32_t lba, uint32_t offset, void *buf, uint32_t len)
     /* Any read may observe a directory listing, so commit deferred deletes first;
      * a rename writes its 0xE5 + new entry back-to-back with no read between, so
      * this never pre-empts an in-flight rename. */
-    if (!lfn_has_active_transaction()) tomb_flush();
+    if (!lfn_has_active_transaction()) (void)tomb_flush();
     build_model();
     if (!s_file) { memset(buf, 0, len); fatrd_store_unlock(); return 0; }   /* model couldn't allocate (OOM): present a blank sector, don't crash */
 
@@ -1820,6 +2052,72 @@ struct flush_iter_s {
     uint32_t remaining;
 };
 
+struct ext_flush_iter_s {
+    uint32_t clus, intra;
+    uint32_t remaining;
+    uint8_t sector[BPS];
+};
+
+static bool ext_chain_sector_pos(uint32_t start, uint32_t sector,
+                                 uint32_t *clus, uint32_t *intra)
+{
+    uint32_t c = start;
+    if (!cluster_is_passthrough(c)) return false;
+    for (uint32_t i = 0; i < sector / g_sec_per_clus; i++) {
+        c = card_fat_next(c);
+        if (!cluster_is_passthrough(c)) return false;
+    }
+    *clus = c;
+    *intra = sector % g_sec_per_clus;
+    return true;
+}
+
+static bool ext_flush_next_chunk(void *arg, uint32_t off,
+                                 const void **data, uint32_t *len)
+{
+    (void)off;
+    struct ext_flush_iter_s *it = arg;
+    if (!it->remaining || !cluster_is_passthrough(it->clus)) return false;
+    uint32_t lba = g_pt_data_lba + (it->clus - 2u) * g_sec_per_clus + it->intra;
+    if (fatrd_ext_read(lba, it->sector) != 0) return false;
+
+    uint32_t n = it->remaining > BPS ? BPS : it->remaining;
+    *data = it->sector;
+    *len = n;
+    it->remaining -= n;
+    if (++it->intra == g_sec_per_clus) {
+        it->intra = 0;
+        if (it->remaining) {
+            uint32_t next = card_fat_next(it->clus);
+            if (!cluster_is_passthrough(next)) return false;
+            it->clus = next;
+        }
+    }
+    return true;
+}
+
+/* Stream an internal file out of the SD scratch chain after the host's FAT links
+ * have reached the synchronization boundary. */
+static bool do_ext_flush(struct pending_s *p)
+{
+    uint32_t clus, intra;
+    if (p->size) {
+        uint32_t last_clus, last_intra;
+        if (!ext_chain_sector_pos(p->start, (p->size - 1u) / BPS,
+                                  &last_clus, &last_intra))
+            return false;
+    }
+    if (!ext_chain_sector_pos(p->start, p->committed / BPS, &clus, &intra))
+        return false;
+    struct ext_flush_iter_s it = {
+        .clus = clus,
+        .intra = intra,
+        .remaining = p->size - p->committed,
+    };
+    return vfs_msc_write_chunks(p->vpath, p->committed, p->size,
+                                ext_flush_next_chunk, &it) == 0;
+}
+
 static bool flush_next_chunk(void *arg, uint32_t off,
                              const void **data, uint32_t *len)
 {
@@ -1883,23 +2181,32 @@ static void pending_add(const char *vpath, uint32_t start, uint32_t size)
             }
             return;
         }
+
+    int slot = -1;
     for (int i = 0; i < MAX_PENDING; i++)
-        if (!s_pending[i].start) {
-            /* A successful sync retires its record and staged partial sector so
-             * a long-lived composite MSC mount cannot exhaust MAX_PENDING one
-             * completed file at a time. If this is a later append, resume at
-             * the persisted file's last sector boundary: FAT writes whole
-             * sectors, so the old partial tail (if any) is staged again. A
-             * rewrite that touches the first cluster must still start at zero. */
-            synfile_t *live = file_of_path(vpath);
-            uint32_t committed = 0;
-            if (live && live->size < size && !stage_first_touched(start))
-                committed = (live->size / BPS) * BPS;
-            s_pending[i].start = start;
-            s_pending[i].size = size;
-            s_pending[i].committed = committed;
-            vpath_copy(s_pending[i].vpath, VPATH_MAX, vpath); return;
-        }
+        if (!s_pending[i].start) { slot = i; break; }
+    if (slot < 0) { s_capture_failed = true; return; }
+
+    /* If this is a later append, resume at the persisted file's last sector
+     * boundary. A rewrite touching the first cluster still starts at zero. */
+    synfile_t *live = file_of_path(vpath);
+    uint32_t committed = 0;
+    if (!cluster_is_passthrough(start) && live && live->size < size &&
+        !stage_first_touched(start))
+        committed = (live->size / BPS) * BPS;
+    s_pending[slot].start = start;
+    s_pending[slot].size = size;
+    s_pending[slot].committed = committed;
+    vpath_copy(s_pending[slot].vpath, VPATH_MAX, vpath);
+}
+
+static void pending_snapshot_mark(void)
+{
+    if (!s_pending) return;
+    for (int i = 0; i < MAX_PENDING; i++)
+        if (s_pending[i].start)
+            asn_snapshot_mark(s_pending[i].vpath, s_pending[i].start,
+                              file_nclus(s_pending[i].size));
 }
 
 /* A whole directory sector is written back when one entry changes.  Most of its
@@ -1933,6 +2240,11 @@ static void pending_drop(const char *vpath, uint32_t start)
         struct pending_s *p = &s_pending[i];
         if (p->start != start || strcmp(p->vpath, vpath) != 0) continue;
 
+        if (cluster_is_passthrough(p->start)) {
+            p->start = 0;
+            return;
+        }
+
         uint32_t first = p->committed / BPS;
         uint32_t count = p->size ? (p->size + BPS - 1u) / BPS : 0;
         uint32_t clus, intra;
@@ -1953,15 +2265,36 @@ static void pending_drop(const char *vpath, uint32_t start)
  * tail used for a later append. Move that pending ownership with the name so a
  * following SYNCHRONIZE CACHE cannot replay the tail under the old path and
  * recreate the rename source. */
-static void pending_rename(const char *from, const char *to, uint32_t start)
+static void pending_rename(const char *from, const char *to)
 {
     if (!s_pending) return;
     for (int i = 0; i < MAX_PENDING; i++)
-        if (s_pending[i].start == start &&
-            strcmp(s_pending[i].vpath, from) == 0) {
-            vpath_copy(s_pending[i].vpath, VPATH_MAX, to);
-            return;
-        }
+        if (s_pending[i].start)
+            vpath_rebase(s_pending[i].vpath, from, to);
+}
+
+static bool mounted_state_rename_fits(const char *from, const char *to)
+{
+    for (int i = 0; i < s_nasn; i++)
+        if (!vpath_rebase_fits(s_asn[i].vpath, from, to)) return false;
+    for (int i = 0; i < s_nnewdir; i++)
+        if (!vpath_rebase_fits(s_newdir[i].vpath, from, to)) return false;
+    if (s_pending)
+        for (int i = 0; i < MAX_PENDING; i++)
+            if (s_pending[i].start &&
+                !vpath_rebase_fits(s_pending[i].vpath, from, to)) return false;
+    for (int i = 0; i < s_ntomb; i++)
+        if (!vpath_rebase_fits(s_tomb[i].vpath, from, to)) return false;
+    return true;
+}
+
+static void mounted_state_rename(const char *from, const char *to)
+{
+    asn_rename(from, to);
+    newdir_rename(from, to);
+    pending_rename(from, to);
+    for (int i = 0; i < s_ntomb; i++)
+        vpath_rebase(s_tomb[i].vpath, from, to);
 }
 
 void fatrd_external_forget(const char *path)
@@ -2002,18 +2335,8 @@ void fatrd_external_rename(const char *from, const char *to)
 {
     if (!from || !to) return;
     fatrd_store_lock();
-    asn_rename(from, to);
-    newdir_rename(from, to);
-    if (s_pending) {
-        for (int i = 0; i < MAX_PENDING; i++)
-            if (s_pending[i].start && strcmp(s_pending[i].vpath, from) == 0) {
-                pending_rename(from, to, s_pending[i].start);
-                break;
-            }
-    }
-    for (int i = 0; i < s_ntomb; i++)
-        if (strcmp(s_tomb[i].vpath, from) == 0)
-            vpath_copy(s_tomb[i].vpath, VPATH_MAX, to);
+    if (mounted_state_rename_fits(from, to))
+        mounted_state_rename(from, to);
     fatrd_store_unlock();
 }
 
@@ -2027,6 +2350,14 @@ static bool flush_pending(void)
     bool ok = true;
     for (int i = 0; i < MAX_PENDING; i++) {
         if (!s_pending[i].start) continue;
+        if (cluster_is_passthrough(s_pending[i].start)) {
+            if (!do_ext_flush(&s_pending[i])) {
+                ok = false;
+                continue;
+            }
+            s_pending[i].start = 0;
+            continue;
+        }
         if (!all_staged(s_pending[i].start, s_pending[i].committed,
                         s_pending[i].size) || !do_flush(&s_pending[i])) {
             ok = false;
@@ -2159,8 +2490,13 @@ static void write_dir(int dir, const char *prefix, uint32_t slot0,
                                    ? s_dir[dd].vpath : NULL;
                     resolved = nd && vpath_copy(vp, sizeof vp, nd);
                 } else if (clus >= 2) {
-                    synfile_t *ff = file_of_cluster_parent(clus, dir);
-                    resolved = ff && vpath_copy(vp, sizeof vp, ff->vpath);
+                    const char *pending = pending_path_for_start(clus);
+                    if (pending && vpath_is_direct_child(pending, prefix))
+                        resolved = vpath_copy(vp, sizeof vp, pending);
+                    else {
+                        synfile_t *ff = file_of_cluster_parent(clus, dir);
+                        resolved = ff && vpath_copy(vp, sizeof vp, ff->vpath);
+                    }
                 }
                 /* FAT leaves a deleted entry's old cluster bytes in place, and
                  * Linux can replay that same 0xE5 slot on an unrelated later
@@ -2182,7 +2518,7 @@ static void write_dir(int dir, const char *prefix, uint32_t slot0,
                                               &deleted_alias_matches) ||
                      !deleted_alias_matches))
                     resolved = false;
-                if (resolved) tomb_add(vp, clus);
+                if (resolved) tomb_add(vp, clus, (attr & 0x10) != 0);
             }
             continue;
         }
@@ -2199,14 +2535,18 @@ static void write_dir(int dir, const char *prefix, uint32_t slot0,
                     s_capture_failed = true;
                     continue;
                 }
+                uint8_t bit = (uint8_t)(1u << seq);
                 for (int j = 0; j < LFN_CHARS; j++) {
                     uint16_t ch = e[pos[j]] | (e[pos[j]+1] << 8);
                     int ci = seq * LFN_CHARS + j;
                     if (ch == 0x0000 || ch == 0xFFFF) { if (ci < (int)sizeof(s_lfnp[sl].name) - 1) s_lfnp[sl].name[ci] = '\0'; }
                     else if (ci < (int)sizeof(s_lfnp[sl].name) - 1) s_lfnp[sl].name[ci] = (char)(ch & 0xff);
                 }
-                if (seq < 5) s_lfnp[sl].state |= (uint8_t)(1u << seq);
-                if (e[0] & 0x40) s_lfnp[sl].expected = (uint8_t)(seq + 1);
+                s_lfnp[sl].state |= bit;
+                if (e[0] & 0x40)
+                    s_lfnp[sl].expected = (s_lfnp[sl].expected &
+                                           LFN_FRAGMENT_CACHED) |
+                                          (uint8_t)(seq + 1);
             }
             continue;
         }
@@ -2248,6 +2588,8 @@ static void write_dir(int dir, const char *prefix, uint32_t slot0,
         }
         if (sl < 0) lfn_cancel(owner, entry_slot); /* a reused slot supersedes another checksum */
         bool have_lfn = lfn_complete(sl);
+        bool cached_lfn = sl >= 0 &&
+                          (s_lfnp[sl].expected & LFN_FRAGMENT_CACHED);
         bool known_match = known &&
                            (known_by_slot ||
                             known_sfn_matches(dir, known, attr, entry_start, e));
@@ -2271,6 +2613,7 @@ static void write_dir(int dir, const char *prefix, uint32_t slot0,
                 continue;
             }
             if (!(s_lfnp[sl].state & LFN_HAVE_SHORT)) {
+                s_lfnp[sl].expected &= LFN_EXPECTED_MASK;
                 s_lfn_next_order++;
                 if (!s_lfn_next_order) s_lfn_next_order++;
                 s_lfnp[sl].order = s_lfn_next_order;
@@ -2294,7 +2637,7 @@ static void write_dir(int dir, const char *prefix, uint32_t slot0,
         }
         /* A colliding short entry may arrive between fragments of another name.
          * Only the complete matching transaction is consumable/releasable. */
-        if (have_lfn) lfn_release(sl);
+        if (have_lfn && (!cached_lfn || entry_start >= 2)) lfn_release(sl);
         if (nm[0] == '\0') continue;
 
         char vpath[VPATH_MAX];
@@ -2308,21 +2651,60 @@ static void write_dir(int dir, const char *prefix, uint32_t slot0,
              * false UNIT ATTENTION in the middle of an upload makes Linux drop
              * its FAT chain and remount the volume read-only. */
             uint32_t dclus = entry_start;            /* FAT32 full first cluster */
-            if (dir_index(vpath) < 0 && vfs_msc_mkdir(vpath) == 0) {
-                asn_put(vpath, dclus, 1);
-                /* Only a genuinely new directory needs a host-chosen mapping.
-                 * Whole-sector rewrites also contain every unchanged built-in;
-                 * recording those exhausted MAX_NEWDIR before a real nested
-                 * directory on a deep mount such as /mnt/ext0. */
-                if (dclus >= 2 && !newdir_lookup(dclus)) {
-                    if (s_nnewdir < MAX_NEWDIR) {
-                        s_newdir[s_nnewdir].cluster = dclus;
-                        s_newdir[s_nnewdir].reconciled = false;
-                        strncpy(s_newdir[s_nnewdir].vpath, vpath, VPATH_MAX-1);
-                        s_newdir[s_nnewdir].vpath[VPATH_MAX-1] = '\0';
-                        s_nnewdir++;
-                    } else {
-                        s_capture_failed = true;   /* do not ACK children we cannot route */
+            if (dclus < 2) continue;                 /* incomplete directory entry */
+            if (dir_index(vpath) < 0) {
+                const char *from = NULL;
+                bool from_tomb = false;
+                char tvp[VPATH_MAX];
+                if (tomb_claim(dclus, true, tvp)) {
+                    from = tvp;
+                    from_tomb = true;
+                } else {
+                    int live = dir_of_cluster(dclus);
+                    if (live >= 0 && s_dir[live].start == dclus) {
+                        char old[VPATH_MAX];
+                        uint32_t oldclus;
+                        if (slot_resolve(dir, entry_slot, old, sizeof old,
+                                         &oldclus) && oldclus == dclus &&
+                            strcmp(old, s_dir[live].vpath) == 0) {
+                            from = s_dir[live].vpath;
+                        } else {
+                            /* A moved-slot destination may precede its deleted
+                             * source. Defer it rather than duplicating an owner. */
+                            if (!tomb_add_dir_dest(vpath, dclus, e, entry_slot))
+                                s_capture_failed = true;
+                            continue;
+                        }
+                    } else if (live >= 0) {
+                        /* A first cluster cannot begin inside another directory's
+                         * chain. Never create two paths for overlapping storage. */
+                        s_capture_failed = true;
+                        continue;
+                    }
+                }
+                if (from && strcmp(from, vpath) != 0) {
+                    if (!mounted_state_rename_fits(from, vpath) ||
+                        vfs_msc_rename(from, vpath) != 0) {
+                        if (from_tomb) tomb_add(tvp, dclus, true);
+                        s_capture_failed = true;
+                        continue;
+                    }
+                    mounted_state_rename(from, vpath);
+                } else if (vfs_msc_mkdir(vpath) == 0) {
+                    asn_put(vpath, dclus, 1);
+                    /* Only a genuinely new directory needs a host-chosen mapping;
+                     * unchanged entries from whole-sector rewrites must not consume
+                     * the bounded table. */
+                    if (!newdir_lookup(dclus)) {
+                        if (s_nnewdir < MAX_NEWDIR) {
+                            s_newdir[s_nnewdir].cluster = dclus;
+                            s_newdir[s_nnewdir].reconciled = false;
+                            strncpy(s_newdir[s_nnewdir].vpath, vpath, VPATH_MAX-1);
+                            s_newdir[s_nnewdir].vpath[VPATH_MAX-1] = '\0';
+                            s_nnewdir++;
+                        } else {
+                            s_capture_failed = true;   /* do not ACK children we cannot route */
+                        }
                     }
                 }
             }
@@ -2360,7 +2742,7 @@ static void write_dir(int dir, const char *prefix, uint32_t slot0,
         bool from_tomb = false;
         char tvp[VPATH_MAX];
         synfile_t *live = file_of_cluster(start);
-        if (tomb_claim(start, tvp)) {
+        if (tomb_claim(start, false, tvp)) {
             from = tvp; from_tomb = true;                    /* renamed-from a 0xE5 */
         } else if (!stage_first_touched(start) ||
                    (live && pending_has(live->vpath, start))) {
@@ -2372,58 +2754,30 @@ static void write_dir(int dir, const char *prefix, uint32_t slot0,
             if (live) from = live->vpath;
         }
         if (from && strcmp(from, vpath) != 0) {
-            int rrc = vfs_msc_rename(from, vpath);
-            if (rrc == 0) {
+            bool pending_only = pending_has(from, start) && vfs_size(from) < 0;
+            if (pending_only) {
                 asn_rename(from, vpath);          /* destination keeps the source's cluster */
-                pending_rename(from, vpath, start);
-            } else {                              /* no backend rename (cross-FS / ramfs): copy */
-                const uint8_t *data; uint32_t dlen; bool owned;
-                if (vfs_read_all(from, &data, &dlen, &owned) == 0) {
-                    vfs_msc_write_file(vpath, data, dlen);
-                    asn_put(vpath, start, nclus);
-                    if (owned) vPortFree((void *)data);
-                    /* Complete the move: the host 0xE5'd the source, so drop it
-                     * (a live-source match is a copy, not a move - leave it). */
-                    if (from_tomb) vfs_msc_remove(from);
+                pending_rename(from, vpath);
+            } else {
+                int rrc = vfs_msc_rename(from, vpath);
+                if (rrc == 0) {
+                    asn_rename(from, vpath);      /* destination keeps the source's cluster */
+                    pending_rename(from, vpath);
+                } else {                          /* no backend rename (cross-FS / ramfs): copy */
+                    const uint8_t *data; uint32_t dlen; bool owned;
+                    if (vfs_read_all(from, &data, &dlen, &owned) == 0) {
+                        vfs_msc_write_file(vpath, data, dlen);
+                        asn_put(vpath, start, nclus);
+                        if (owned) vPortFree((void *)data);
+                        /* Complete the move: the host 0xE5'd the source, so drop it
+                         * (a live-source match is a copy, not a move - leave it). */
+                        if (from_tomb) vfs_msc_remove(from);
+                    }
                 }
             }
-        } else if (from && (size == 0 || stage_first_touched(start) ||
-                            pending_has(vpath, start))) {
-            /* After an incremental prefix commits, build_model() sees the file
-             * and file_of_cluster(start) resolves it to this same path. Later
-             * directory-size checkpoints are still new staged suffixes, not a
-             * metadata-only no-op. Keep extending the pending record. Unchanged
-             * neighbours arrive in the same whole-sector directory write, but
-             * have neither staged data nor an existing pending record and are
-             * deliberately ignored. */
-            try_flush(vpath, start, size);
-            asn_put(vpath, start, nclus);
         } else {
-            if (cluster_is_passthrough(start)) {
-                /* Internal-subtree file whose data the host put in the card scratch
-                 * (the internal region offers no free clusters). The host writes a
-                 * file's data + FAT chain before this final directory entry, so the
-                 * data is complete now: read it back off the card and commit it to
-                 * the VFS. (An empty file - size 0 - just creates the entry.) */
-                uint8_t *b = pvPortMalloc(size ? size : 1);
-                if (b) {
-                    if (size == 0 || ext_read_file(start, size, b) == 0) {
-                        /* This is the mounted host's own write: do not raise
-                         * UNIT ATTENTION underneath it. Keep the card scratch
-                         * chain (and its assignment) alive until remount so
-                         * cached FAT/data reads remain valid. */
-                        if (vfs_msc_write_file(vpath, b, size) == 0)
-                            asn_put(vpath, start, nclus);
-                        else
-                            s_capture_failed = true;
-                    }
-                    else s_capture_failed = true;
-                    vPortFree(b);
-                } else s_capture_failed = true;
-            } else {
-                try_flush(vpath, start, size);
-                asn_put(vpath, start, nclus);     /* pin the file to the cluster the host chose */
-            }
+            try_flush(vpath, start, size);
+            asn_put(vpath, start, nclus);         /* pin the file to the cluster the host chose */
         }
         asn_sfn_record(vpath, start, e, e[12], slot0 + i);
     }
@@ -2445,7 +2799,12 @@ static __attribute__((noinline)) bool newdir_reconcile_all(void)
         for (uint32_t intra = 0; intra < g_sec_per_clus; intra++) {
             build_model();                    /* a prior sector may have added a nested dir */
             int dir = dir_index(s_newdir[n].vpath);
-            if (dir < 0) { ok = false; break; }
+            uint32_t assigned;
+            if (dir < 0 || s_dir[dir].start != clus ||
+                !asn_lookup(s_newdir[n].vpath, &assigned, NULL) || assigned != clus) {
+                ok = false;
+                break;
+            }
 
             const uint8_t *sec = NULL;
             if (cluster_is_passthrough(clus)) {
@@ -2461,9 +2820,9 @@ static __attribute__((noinline)) bool newdir_reconcile_all(void)
                 stage_t *st = stage_find(stage_sector(clus, intra));
                 if (st) sec = st->data;
             }
-            /* An empty new directory need not have a captured synthetic-sector
-             * write. Card-backed sectors, however, must remain readable. */
-            if (!sec) break;
+            /* An internal sector need not have been captured, while a later one
+             * may still be staged. Card-backed sectors must remain readable. */
+            if (!sec) continue;
 
             uint32_t decode_len = BPS;
             bool end = false;
@@ -2479,9 +2838,16 @@ static __attribute__((noinline)) bool newdir_reconcile_all(void)
             if (s_capture_failed) { ok = false; break; }
             if (end) break;
         }
-        if (ok) s_newdir[n].reconciled = true;
+        if (ok) {
+            if (!cluster_is_passthrough(clus))
+                for (uint32_t intra = 0; intra < g_sec_per_clus; intra++)
+                    (void)stage_drop(stage_sector(clus, intra));
+            s_newdir[n].reconciled = true;
+        }
     }
     vPortFree(scratch);
+    /* The mounted model now owns every path-to-cluster route in this map. */
+    if (ok) s_nnewdir = 0;
     return ok;
 }
 
@@ -2569,12 +2935,14 @@ static int write_one_sector(uint32_t lba, uint32_t offset, const uint8_t *buf, u
                 if (A < 2) continue;
                 uint32_t B = ((uint32_t)buf[i*4] | ((uint32_t)buf[i*4+1] << 8) |
                               ((uint32_t)buf[i*4+2] << 16) | ((uint32_t)buf[i*4+3] << 24)) & 0x0FFFFFFFu;
+                chain_record(A, B);                        /* update any non-contiguous jump */
                 if (B < 2 || B >= 0x0FFFFFF8u) continue;   /* not a forward chain link */
-                if (B != A + 1) chain_record(A, B);        /* remember the non-contiguous jump */
                 int own = dir_owner(A);                    /* A must already be directory space */
                 if (own == -2 || dir_owner(B) != -2) continue;   /* B already known/owned */
                 if (s_ndirext < MAX_DIREXT) {
-                    s_dirext[s_ndirext].cluster = B; s_dirext[s_ndirext].dir = (int16_t)own; s_ndirext++;
+                    s_dirext[s_ndirext].cluster = B;
+                    s_dirext[s_ndirext].owner = dirext_owner_key(own);
+                    s_ndirext++;
                 }
             }
         }
@@ -2597,11 +2965,17 @@ static int write_one_sector(uint32_t lba, uint32_t offset, const uint8_t *buf, u
         int rc = ext_write_sector(g_pt_data_lba +
                                   (clus - 2u) * g_sec_per_clus + intra,
                                   offset, buf, len);
-        const char *nd = newdir_lookup(clus);
-        if (rc == 0 && nd) {
-            int ndi = dir_index(nd);
-            if (ndi >= 0)
-                write_dir(ndi, nd, intra * EPS, offset, buf, len);
+        int d = dir_of_cluster(clus);
+        if (rc == 0 && d >= 0) {
+            uint32_t slot0 = ((clus - s_dir[d].start) * g_sec_per_clus + intra) * EPS;
+            write_dir(d, s_dir[d].vpath, slot0, offset, buf, len);
+        } else if (rc == 0) {
+            const char *nd = newdir_lookup(clus);
+            if (nd) {
+                int ndi = dir_index(nd);
+                if (ndi >= 0)
+                    write_dir(ndi, nd, intra * EPS, offset, buf, len);
+            }
         }
         return rc;
     }
@@ -2664,6 +3038,11 @@ static int write_one_sector(uint32_t lba, uint32_t offset, const uint8_t *buf, u
 bool fatrd_sync(void)
 {
     fatrd_store_lock();
+    if (!s_pending) {
+        bool ok = !s_capture_failed;
+        fatrd_store_unlock();
+        return ok;
+    }
     /* At this quiescent durability boundary, an unclaimed tombstone is a real
      * delete. First replay any SFN that was waiting for a cross-sector LFN: a
      * rename destination must be allowed to claim its source tombstone before
@@ -2688,9 +3067,12 @@ bool fatrd_sync(void)
         if (!settled) ok = false;
     }
     if (ok) {
-        tomb_flush();
-        ok = flush_pending();
+        ok = tomb_resolve_dir_dests();
+        if (ok) tomb_discard_dir_dests();
+        if (ok) ok = tomb_flush();
+        if (ok) ok = flush_pending();
     }
+    if (ok) lfn_fragment_cache_prune();
     fatrd_store_unlock();
     return ok;
 }

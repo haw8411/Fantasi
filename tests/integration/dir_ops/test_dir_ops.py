@@ -27,6 +27,7 @@ import re
 import subprocess
 import sys
 import uuid
+import zlib
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from lib.device import (
@@ -124,6 +125,23 @@ class Fail(Exception):
 def check(cond, msg):
     if not cond:
         raise Fail(msg)
+
+
+def find_msc_mount():
+    """Return the connected Fantasi MSC block device and mountpoint."""
+    usb_dev = find_usb_device(USB_VID, USB_PID)
+    blocks = glob.glob(os.path.join(
+        usb_dev, "*", "host*", "target*", "*:*:*:*", "block", "sd*"))
+    check(bool(blocks), "composite MSC block device was not found")
+    block = "/dev/" + os.path.basename(blocks[0])
+    r = subprocess.run(
+        ["findmnt", "-rn", "-S", block, "-o", "TARGET"],
+        capture_output=True, text=True, timeout=10,
+    )
+    mounts = [line.strip() for line in r.stdout.splitlines() if line.strip()]
+    check(r.returncode == 0 and mounts,
+          f"composite MSC block {block} is not mounted ({r.stderr!r})")
+    return block, mounts[0]
 
 
 def battery(m, v, fses):
@@ -378,6 +396,8 @@ def msc_presync_newdir(serial, verify):
     parents = (f"/kdl_{tag}", f"/kdu_{tag}")
     marker = f"/kd_{tag}.trg"
     payloads = (("child", f"lower-{tag}\n"), ("CHILD", f"upper-{tag}\n"))
+    large_parent = f"/kde_{tag}"
+    large_block = None
     local = os.path.join(REPO_ROOT, "build", f"kd_{tag}.txt")
     with open(local, "w") as f:
         f.write(f"seed-{tag}\n")
@@ -392,19 +412,7 @@ def msc_presync_newdir(serial, verify):
 
         # Force the serial/MSC path to refresh and mount the just-seeded layout.
         serial.run(f"ls {parents[0]}\nexit\n")
-        usb_dev = find_usb_device(USB_VID, USB_PID)
-        blocks = glob.glob(os.path.join(
-            usb_dev, "*", "host*", "target*", "*:*:*:*", "block", "sd*"))
-        check(bool(blocks), "composite MSC block device was not found")
-        block = "/dev/" + os.path.basename(blocks[0])
-        r = subprocess.run(
-            ["findmnt", "-rn", "-S", block, "-o", "TARGET"],
-            capture_output=True, text=True, timeout=10,
-        )
-        mounts = [line.strip() for line in r.stdout.splitlines() if line.strip()]
-        check(r.returncode == 0 and mounts,
-              f"composite MSC block {block} is not mounted ({r.stderr!r})")
-        mountpoint = mounts[0]
+        _, mountpoint = find_msc_mount()
 
         # Deliberately no fsync/syncfs between mkdir and child creation.
         for parent, (child, payload) in zip(parents, payloads):
@@ -423,6 +431,66 @@ def msc_presync_newdir(serial, verify):
                   f"({parent}/{child}, sync={sync_out!r}, "
                   f"names={sorted(names)!r}, read={readback!r})")
         print("  MSC pre-sync new-directory recovery OK")
+
+        # Exercise the normal desktop unmount boundary with a child file larger
+        # than one reported FAT allocation unit.
+        verify.run(f"upload {local} {marker}\nexit\n")
+        serial.run("ls /\nexit\n")
+        large_block, mountpoint = find_msc_mount()
+        cluster_bytes = os.statvfs(mountpoint).f_frsize
+        check(cluster_bytes >= 512,
+              "MSC mount reported invalid cluster geometry")
+        seed = sum(tag.encode()) & 0xff
+        initial_payload = bytes((seed + i * 37) & 0xff
+                                for i in range(cluster_bytes + 137))
+        large_payload = bytes((seed + 19 + i * 41) & 0xff
+                              for i in range(cluster_bytes + 649))
+        raw_dir = os.path.join(mountpoint, large_parent.lstrip("/"))
+        os.mkdir(raw_dir)
+        pending_path = os.path.join(raw_dir, "pending.bin")
+        payload_path = os.path.join(raw_dir, "payload.bin")
+        deleted_path = os.path.join(raw_dir, "deleted.bin")
+        with open(pending_path, "wb") as f:
+            f.write(initial_payload)
+        r = subprocess.run(["sync", "-f", mountpoint], timeout=30)
+        check(r.returncode == 0, "syncfs failed before pending-file rename")
+        os.rename(pending_path, payload_path)
+        with open(deleted_path, "wb") as f:
+            f.write(initial_payload[:1024])
+        r = subprocess.run(["sync", "-f", mountpoint], timeout=30)
+        check(r.returncode == 0, "syncfs failed before pending-file delete")
+        os.unlink(deleted_path)
+        r = subprocess.run(["sync", "-f", mountpoint], timeout=30)
+        check(r.returncode == 0, "syncfs failed after pending-file delete")
+        sync1_out = serial.run(f"rm {marker}\nexit\n")
+
+        path = f"{large_parent}/payload.bin"
+        names = verify.ls(large_parent)
+        crc_out = verify.run(f"crc32 {path}\nexit\n")
+        initial = (f"{zlib.crc32(initial_payload) & 0xffffffff:08x} "
+                   f"{len(initial_payload)} {path}")
+        check("payload.bin" in names and "pending.bin" not in names and
+              "deleted.bin" not in names and initial in crc_out,
+              "MSC pending rename/delete reconciliation failed "
+              f"(sync={sync1_out!r}, names={sorted(names)!r}, crc={crc_out!r})")
+
+        with open(payload_path, "wb") as f:
+            f.write(large_payload)
+        r = subprocess.run(
+            ["udisksctl", "unmount", "-b", large_block],
+            capture_output=True, text=True, timeout=30,
+        )
+        check(r.returncode == 0,
+              f"MSC multi-cluster unmount failed ({r.stderr!r})")
+        large_block = None
+        names = verify.ls(large_parent)
+        crc_out = verify.run(f"crc32 {path}\nexit\n")
+        expected = f"{zlib.crc32(large_payload) & 0xffffffff:08x} {len(large_payload)} {path}"
+        check("payload.bin" in names and "deleted.bin" not in names and
+              expected in crc_out,
+              "MSC unmount lost a multi-cluster overwrite in a new directory "
+              f"(names={sorted(names)!r}, crc={crc_out!r})")
+        print("  MSC multi-cluster new-directory recovery OK")
     finally:
         # Best effort: first make any raw host writes visible, then remove only
         # this test's unique fixture through the VFS ground-truth transport.
@@ -430,13 +498,156 @@ def msc_presync_newdir(serial, verify):
             serial.run(f"rm {marker}\nexit\n")
         except (OSError, subprocess.SubprocessError):
             pass
+        if large_block:
+            subprocess.run(
+                ["udisksctl", "unmount", "-b", large_block],
+                capture_output=True, timeout=30,
+            )
         cleanup = []
         for parent, (child, _) in zip(parents, payloads):
             cleanup.append(f"rm {parent}/{child}/file.txt")
             cleanup.append(f"rmdir {parent}/{child}")
             cleanup.extend(f"rm {parent}/a{i}.txt" for i in range(7))
             cleanup.append(f"rmdir {parent}")
+        cleanup.append(f"rm {large_parent}/payload.bin")
+        cleanup.append(f"rm {large_parent}/pending.bin")
+        cleanup.append(f"rm {large_parent}/deleted.bin")
+        cleanup.append(f"rmdir {large_parent}")
         cleanup.append(f"rm {marker}")
+        try:
+            verify.run("\n".join(cleanup) + "\nexit\n")
+        except (OSError, subprocess.SubprocessError):
+            pass
+        os.remove(local)
+
+
+def msc_newdir_reclaim(serial, verify, raw_mount):
+    """Reuse reconciled routes and preserve them across a directory rename."""
+    tag = uuid.uuid4().hex[:6]
+    root = f"/nr{tag}"
+    dirs = [f"{root}/d{i:02d}" for i in range(12)]
+    content = f"newdir-reclaim-{tag}\n"
+    local = os.path.join(REPO_ROOT, "build", f"nr_{tag}.txt")
+    raw_old = dirs[4]
+    raw_renamed = f"{root}/r04"
+    raw_name = "after.txt"
+    raw_marker = f"{root}/sync.trg"
+    raw_block = None
+    with open(local, "w") as f:
+        f.write(content)
+
+    try:
+        # One CLI process keeps one MSC mount alive. Each mkdir synchronizes,
+        # so its transient route should be available for the next directory.
+        commands = [f"mkdir {root}"]
+        for path in dirs:
+            commands.append(f"mkdir {path}")
+            commands.append(f"upload {local} {path}/f.txt")
+        old = dirs[3]
+        renamed = f"{root}/r03"
+        nested = f"{dirs[11]}/sub"
+        extended = [f"x{i:02d}.txt" for i in range(15)]
+        commands.extend(f"cp {old}/f.txt {old}/{name}" for name in extended)
+        commands.extend((
+            f"mv {old} {renamed}",
+            f"mv {renamed}/f.txt {renamed}/g.txt",
+            f"upload {local} {renamed}/after.txt",
+            f"mkdir {nested}",
+            f"upload {local} {nested}/n.txt",
+            f"upload {local} {raw_marker}",
+        ))
+        out = serial.run(";".join(commands) + "\nexit\n", timeout=180)
+
+        names = verify.ls(root)
+        expected = [renamed if path == old else path for path in dirs]
+        missing = [os.path.basename(path) for path in expected
+                   if os.path.basename(path) not in names]
+        check(not missing,
+              "MSC new-directory routes were exhausted "
+              f"(missing={missing!r}, command={out!r})")
+        check(os.path.basename(old) not in names,
+              "MSC directory rename left its source behind "
+              f"(names={sorted(names)!r}, command={out!r})")
+        for path in expected:
+            child_names = verify.ls(path)
+            leaf = "g.txt" if path == renamed else "f.txt"
+            readback = verify.cat(f"{path}/{leaf}")
+            check(leaf in child_names and content.strip() in readback,
+                  "MSC write after new-directory reconciliation was lost "
+                  f"({path}, names={sorted(child_names)!r}, read={readback!r}, "
+                  f"command={out!r})")
+        renamed_names = verify.ls(renamed)
+        missing_extended = [name for name in extended if name not in renamed_names]
+        after_read = verify.cat(f"{renamed}/after.txt")
+        check(not missing_extended and "after.txt" in renamed_names and
+              content.strip() in after_read,
+              "MSC directory-extension route did not survive a rename "
+              f"(missing={missing_extended!r}, names={sorted(renamed_names)!r}, "
+              f"read={after_read!r}, command={out!r})")
+        nested_names = verify.ls(nested)
+        nested_read = verify.cat(f"{nested}/n.txt")
+        check("n.txt" in nested_names and content.strip() in nested_read,
+              "MSC directory rename corrupted a later nested-directory route "
+              f"(names={sorted(nested_names)!r}, read={nested_read!r}, "
+              f"command={out!r})")
+
+        if raw_mount:
+            # Operate on the continuously mounted filesystem so Linux can publish
+            # a moved directory's destination before its deleted source.
+            serial.run(f"ls {raw_old}\nexit\n")
+            raw_block, mountpoint = find_msc_mount()
+            old_host = os.path.join(mountpoint, raw_old.lstrip("/"))
+            renamed_host = os.path.join(mountpoint, raw_renamed.lstrip("/"))
+            os.rename(old_host, renamed_host)
+            with open(os.path.join(renamed_host, raw_name), "w") as f:
+                f.write(content)
+            r = subprocess.run(["sync", "-f", mountpoint], timeout=30)
+            check(r.returncode == 0, "syncfs failed after raw MSC directory rename")
+            sync_out = serial.run(f"rm {raw_marker}\nexit\n")
+            check("filesystem sync failed" not in sync_out,
+                  f"SCSI sync failed after raw directory rename ({sync_out!r})")
+            r = subprocess.run(
+                ["udisksctl", "unmount", "-b", raw_block],
+                capture_output=True, text=True, timeout=30,
+            )
+            check(r.returncode == 0,
+                  f"MSC unmount failed after raw directory rename ({r.stderr!r})")
+            raw_block = None
+
+            root_names = verify.ls(root)
+            renamed_names = verify.ls(raw_renamed)
+            check(os.path.basename(raw_old) not in root_names and
+                  os.path.basename(raw_renamed) in root_names and
+                  {"f.txt", raw_name}.issubset(renamed_names),
+                  "mounted MSC directory rename failed "
+                  f"(root={sorted(root_names)!r}, names={sorted(renamed_names)!r})")
+            check(content.strip() in verify.cat(f"{raw_renamed}/{raw_name}"),
+                  "mounted MSC write after directory rename lost file content")
+        print("  MSC new-directory route reclamation OK")
+    finally:
+        if raw_block:
+            subprocess.run(
+                ["udisksctl", "unmount", "-b", raw_block],
+                capture_output=True, timeout=30,
+            )
+        cleanup = []
+        for path in (dirs[3], f"{root}/r03"):
+            cleanup.append(f"rm {path}/f.txt")
+            cleanup.append(f"rm {path}/g.txt")
+            cleanup.append(f"rm {path}/n.txt")
+            cleanup.append(f"rm {path}/after.txt")
+            cleanup.extend(f"rm {path}/{name}" for name in extended)
+        cleanup.append(f"rm {dirs[11]}/sub/n.txt")
+        cleanup.append(f"rmdir {dirs[11]}/sub")
+        cleanup.append(f"rm {raw_renamed}/f.txt")
+        cleanup.append(f"rm {raw_renamed}/{raw_name}")
+        cleanup.append(f"rm {raw_marker}")
+        cleanup.append(f"rmdir {raw_renamed}")
+        for path in dirs:
+            cleanup.append(f"rm {path}/f.txt")
+            cleanup.append(f"rmdir {path}")
+        cleanup.append(f"rmdir {root}/r03")
+        cleanup.append(f"rmdir {root}")
         try:
             verify.run("\n".join(cleanup) + "\nexit\n")
         except (OSError, subprocess.SubprocessError):
@@ -535,8 +746,14 @@ def main():
         for t in transports:
             print(f"  === transport: {t.name} ===")
             battery(t, verify, fses)
+        serial = next((t for t in transports if t.name == "serial"), None)
+        if serial:
+            print("  === MSC new-directory route reclamation ===")
+            msc_newdir_reclaim(
+                serial, verify,
+                PLATFORMS[args.platform]["msc_mode"] == "composite",
+            )
         if PLATFORMS[args.platform]["msc_mode"] == "composite":
-            serial = next((t for t in transports if t.name == "serial"), None)
             if serial:
                 print("  === MSC pre-sync directory ordering ===")
                 msc_presync_newdir(serial, verify)

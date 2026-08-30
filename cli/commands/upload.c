@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <sys/stat.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 static void cmd_upload(const char *args)
@@ -37,28 +38,65 @@ static void cmd_upload(const char *args)
                         S_ISDIR(dst_st.st_mode);
     dir_target(local, existing_dir ? "." : remote, rpath, sizeof(rpath));
 
+    if (g_switch_mode) {
+        /* Commit deletion before reusing a FAT chain for replacement data. */
+        if (unlink(fat_path(rpath)) == 0) {
+            if (!fat_sync()) {
+                fprintf(stderr, "could not replace %s\n", rpath);
+                fclose(fp);
+                return;
+            }
+        } else if (errno != ENOENT) {
+            fprintf(stderr, "cannot replace %s: %s\n", rpath, strerror(errno));
+            fclose(fp);
+            return;
+        }
+    }
+
     FILE *out = fopen(fat_path(rpath), "wb");
     if (!out) {
         fprintf(stderr, "cannot create %s\n", rpath);
         fclose(fp); return;
     }
 
-    char buf[4096];
+    /* Twelve sectors stay below the PM3 staging reserve while reducing the
+     * number of LittleFS metadata commits. */
+    enum { MSC_CHUNK = 4096, SWITCH_MSC_CHUNK = 12 * 512 };
+    char buf[SWITCH_MSC_CHUNK];
+    size_t chunk = g_switch_mode ? SWITCH_MSC_CHUNK : MSC_CHUNK;
     size_t n, total = 0;
     bool ok = true;
-    while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) {
+    while ((n = fread(buf, 1, chunk, fp)) > 0) {
         if (fwrite(buf, 1, n, out) != n) { ok = false; break; }
         total += n;
         /* Force FAT data + the current directory size to the device in bounded
          * increments. Firmware can then retire the staged prefix instead of
          * retaining one 520-byte staging node per sector for the whole file. */
-        if (fflush(out) != 0 || fsync(fileno(out)) != 0 || !fat_sync()) {
+        if (fflush(out) != 0 || fsync(fileno(out)) != 0) {
             ok = false;
             break;
         }
+        /* Closing publishes the checkpoint's directory size before a switch-mode
+         * device reconciles and releases its staged sectors. */
+        if (g_switch_mode) {
+            if (fclose(out) != 0) { out = NULL; ok = false; break; }
+            out = NULL;
+        }
+        if (!fat_sync()) { ok = false; break; }
+        if (g_switch_mode) {
+            int fd = open(fat_path(rpath), O_WRONLY);
+            out = fd >= 0 ? fdopen(fd, "wb") : NULL;
+            if (!out && fd >= 0) close(fd);
+            if (!out || fseek(out, (long)total, SEEK_SET) != 0) {
+                if (out) fclose(out);
+                out = NULL;
+                ok = false;
+                break;
+            }
+        }
     }
     fclose(fp);
-    if (fclose(out) != 0) ok = false;
+    if (out && fclose(out) != 0) ok = false;
 
     if (!ok) { fprintf(stderr, "write failed\n"); return; }
 

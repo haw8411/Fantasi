@@ -222,10 +222,13 @@ def main():
                 print(malformed_text[:1600])
                 return 1
 
-            baseline_run = subprocess.run(
-                [CLI_BIN, *TRANSPORT_ARGS, "-c", "free"],
-                capture_output=True, text=True, timeout=30)
-            baseline = heap_free(baseline_run.stdout)
+            baseline_samples = []
+            for _ in range(3):
+                baseline_run, _ = run("free", app_dir)
+                sample = heap_free(baseline_run.stdout)
+                if baseline_run.returncode == 0 and sample is not None:
+                    baseline_samples.append(sample)
+            baseline = max(baseline_samples) if baseline_samples else None
             env = os.environ.copy()
             env["FANTASI_APP_DIR"] = blocked_dir
             import pexpect
@@ -251,15 +254,24 @@ def main():
                 print(f"FAIL: blocked MFC read did not cancel cleanly: {exc}")
                 print(transcript[:1600])
                 return 1
-            time.sleep(0.25)
-            health = subprocess.run(
-                [CLI_BIN, *TRANSPORT_ARGS, "-c", "free;ps"],
-                capture_output=True, text=True, timeout=30)
-            after = heap_free(health.stdout)
-            if (baseline is None or after != baseline or
-                    re.search(r"^\s*\d+\s+(?:app|apppump)\s", health.stdout, re.MULTILINE)):
+            after = None
+            for _ in range(10):
+                health, _ = run("free", app_dir)
+                after = heap_free(health.stdout)
+                if (health.returncode == 0 and baseline is not None and
+                        after == baseline):
+                    break
+                time.sleep(0.05)
+            tasks, _ = run("ps", app_dir)
+            app_task = re.search(r"^\s*\d+\s+(?:app|apppump)\s",
+                                 tasks.stdout, re.MULTILINE)
+            if (baseline is None or health.returncode != 0 or
+                    after != baseline or tasks.returncode != 0 or
+                    "PID  NAME" not in tasks.stdout or app_task):
                 print("FAIL: cancelled MFC read left an app task or heap allocation")
-                print(health.stdout[:1600])
+                print(f"  heap baseline={baseline}, last={after}")
+                print((health.stdout + health.stderr +
+                       tasks.stdout + tasks.stderr)[:1600])
                 return 1
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         print(f"FAIL: could not exercise the synthetic MFC contract: {exc}")

@@ -446,11 +446,17 @@ void dcd_init(uint8_t rhport) {
     _queue_deferred_needed = 0;
     ep0_epoch_invalidate();
 
-    /* Program the PLL's USB divider to /1 so UDPCK = 48 MHz. The PM3
-     * bootrom programs the main PLL for 96 MHz, and this CKGR_USBDIV
-     * field lives in the top bits of CKGR_PLLR — OR it in rather than
-     * overwriting so we preserve the MUL/DIV values. */
-    AT91C_BASE_CKGR->CKGR_PLLR |= AT91C_CKGR_USBDIV_1;
+    /* The PM3 bootloader normally leaves the 96 MHz PLL and /2 USB divider
+     * configured. Do not rewrite a live PLL on every USB personality switch.
+     * If a foreign bootloader left another divider, change only that field and
+     * wait until both the PLL and master clock are ready before touching UDP. */
+    uint32_t const pllr = AT91C_BASE_CKGR->CKGR_PLLR;
+    if ((pllr & AT91C_CKGR_USBDIV) != AT91C_CKGR_USBDIV_1) {
+        AT91C_BASE_CKGR->CKGR_PLLR =
+            (pllr & ~AT91C_CKGR_USBDIV) | AT91C_CKGR_USBDIV_1;
+        while (!(AT91C_BASE_PMC->PMC_SR & AT91C_PMC_LOCK)) {}
+        while (!(AT91C_BASE_PMC->PMC_SR & AT91C_PMC_MCKRDY)) {}
+    }
 
     /* Bring up the peripheral clock (PMC_PCER bit 11) and the USB
      * system clock (PMC_SCER.UDP = bit 7). Both are needed before

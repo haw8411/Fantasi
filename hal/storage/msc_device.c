@@ -99,7 +99,15 @@ bool tud_msc_start_stop_cb(uint8_t lun, uint8_t power_condition,
     /* The host flushes with SYNCHRONIZE CACHE before eject. Eject must still fire
      * hal_on_msc_eject() so switch-mode platforms (PM3) leave MSC and re-enumerate
      * as CDC, then discard this mount's bounded staging/model state. */
-    if (load_eject && !start) { hal_on_msc_eject(); fatrd_release(); }   /* host ejected: drop the ~6 KB FAT model */
+    if (load_eject && !start) {
+        bool synced = fatrd_sync();
+        hal_on_msc_eject();
+        if (!synced) {
+            tud_msc_set_sense(lun, SCSI_SENSE_MEDIUM_ERROR, 0x0C, 0x00);
+            return false;
+        }
+        fatrd_release();                         /* host ejected: drop the ~6 KB FAT model */
+    }
     return true;
 }
 

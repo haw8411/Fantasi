@@ -779,7 +779,11 @@ void usb_proto_task(void *arg)
 {
     (void)arg;
     peer_init();
+#ifdef WEBUSB_FRAME_ON_TASK_STACK
+    uint8_t frame[FANTASI_PROTO_FRAME_MAX];
+#else
     static uint8_t frame[FANTASI_PROTO_FRAME_MAX];
+#endif
     fantasi_proto_endpoint_t endpoint;
     fantasi_proto_endpoint_init(&endpoint, &s_bulk_transport, 0,
                                 frame, sizeof(frame));

@@ -918,10 +918,21 @@ static void sniff_emit(const char *s)
     }
     if (lbl > 0) {
         lb[lbl] = 0;
-        if (!strcmp(lb, "rfid> "))                         /* the app's prompt: a ready cue, not shown - */
-            { if (g_mfc_sniff) mfc_sniff_finalize();       /* sniff ended -> recover keys to /nfc/mfc.dict */
-              g_rfid_ready = 1; lbl = 0; }                 /* readline draws its own prompt host-side */
-        else if (lb[0] != 'R' && lb[0] != 'C' && lb[0] != 'L' && lb[0] != 'T')
+        static const char prompt[] = "rfid> ";
+        int used = 0;
+        while (lbl - used >= (int)sizeof prompt - 1 &&
+               !memcmp(lb + used, prompt, sizeof prompt - 1))
+            used += sizeof prompt - 1;
+        if (used) {                                        /* one or more prompts: a ready cue, not shown */
+            if (g_mfc_sniff) mfc_sniff_finalize();         /* sniff ended -> recover keys to /nfc/mfc.dict */
+            g_rfid_ready = 1;                              /* readline draws its own prompt host-side */
+            memmove(lb, lb + used, (size_t)(lbl - used));
+            lbl -= used;
+            lb[lbl] = 0;
+        }
+        if (lbl > 0 &&
+            !(lbl < (int)sizeof prompt - 1 && !memcmp(lb, prompt, (size_t)lbl)) &&
+            lb[0] != 'R' && lb[0] != 'C' && lb[0] != 'L' && lb[0] != 'T')
             { fputs(lb, stdout); lbl = 0; }
     }
     fflush(stdout);
@@ -2058,10 +2069,6 @@ static void rfid_read_mfc(uint32_t sid, const rw_args_t *a)
     int cr = app_capture(sid, devcmd, cap, sizeof cap, CAPTURE_READ_PROGRESS);
     if (cr != 0) {
         read_progress_end();
-        /* The resident driver self-cleans on every normal return. A forced
-         * app_stop can bypass that epilogue, so remove only here rather than
-         * charging every RFID launch two remote filesystem round trips. */
-        if (cr == -2) { delete_ram(MFC_REQ_RAM); delete_ram(MFC_KEY_RAM); }
         printf("\nread: %s\n", cr == -2 ? "cancelled" : "link lost");
         return;
     }
@@ -2430,6 +2437,12 @@ void proto_cmd_rfid(const char *arg)
     signal(SIGINT, old_sigint);
     signal(SIGTERM, old_sigterm);
     free(oneshot);
+    /* A forced app stop can bypass the resident driver's epilogue. Wait until
+     * that stop has completed before removing its staged read arguments. */
+    if (g_rfid_sigstop) {
+        delete_ram(MFC_REQ_RAM);
+        delete_ram(MFC_KEY_RAM);
+    }
     delete_ram(DRIVER_RAM);                                  /* nothing persists */
     for (int i = 0; i < NMODS; i++) delete_ram(RFID_MODS[i].ram);
     delete_ram(MFC_CFG_RAM);

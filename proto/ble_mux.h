@@ -113,21 +113,9 @@ fantasi_ble_mux_response_accept(fantasi_ble_mux_response_rx_t *state,
         return FANTASI_BLE_MUX_RESPONSE_CONSUMED;
     }
 
-    /* Early Chameleon builds expose a fixed-width TX characteristic and pad
-     * every notification to the negotiated ATT payload with zeroes.  The mux
-     * header still states the exact frame length, so accept only an all-zero
-     * suffix beyond the bytes remaining in this frame.  This keeps upgraded
-     * host CLIs compatible with those devices while rejecting arbitrary
-     * overlong envelopes. */
-    size_t remaining = (size_t)(total - offset);
-    if (payload_len > remaining) {
-        for (size_t i = remaining; i < payload_len; i++) {
-            if (payload[i] != 0) {
-                state->active = false;
-                return FANTASI_BLE_MUX_RESPONSE_CONSUMED;
-            }
-        }
-        payload_len = remaining;
+    if (payload_len > (size_t)(total - offset)) {
+        state->active = false;
+        return FANTASI_BLE_MUX_RESPONSE_CONSUMED;
     }
 
     /* Notifications for different sessions can be interspersed before BlueZ

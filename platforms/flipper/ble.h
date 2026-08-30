@@ -40,6 +40,11 @@ void     ble_shutdown(void);
 void     ble_adv_refresh(void);   /* re-issue background adv at the idle-policy interval */
 bool     ble_is_active(void);
 bool     ble_cpu2_running(void);
+typedef enum {
+    BLE_SYSCLK_HSE_TO_PLL = 0,
+    BLE_SYSCLK_PLL_ON_TO_HSE,
+} ble_system_clock_t;
+int      ble_cpu2_set_system_clock(ble_system_clock_t clock);
 int      ble_flash_erase_activity(int on);
 void     ble_activate_fus(void);
 int      ble_scan(ble_scan_cb_t cb, uint32_t duration_ms);

@@ -4,6 +4,7 @@
  * berry_resolve_api). Only compiled where FANTASI_ENABLE_RFID is set, so on
  * non-RFID builds the weak hook returns 0 and apps see no RFID symbol. */
 #include "rfid.h"
+#include "../app_run.h"
 #include "../../hal/hal_rfid.h"
 #include "app_rfid.h"
 
@@ -24,7 +25,13 @@ static int api_iso14443a_select(uint8_t uid[10], int *uid_len,
     return 0;
 }
 
-static int  api_set_mode(int mode) { return hal_rfid_set_mode((rfid_mode_t)mode); }
+static int api_set_mode(int mode)
+{
+    void *gate = app_api_gate_enter();
+    int rc = hal_rfid_set_mode((rfid_mode_t)mode);
+    app_api_gate_leave(gate);
+    return rc;
+}
 static void api_field(int on)      { hal_rfid_field(on != 0); }
 
 /* Loadable-gateware entries weak-default to "no FPGA" here, so chip-based
@@ -82,6 +89,24 @@ __attribute__((weak)) int hal_rfid_hf_emu_send_stream(uint8_t (*next)(void *), v
 { (void)next; (void)ctx; (void)nsymbols; return RFID_ERR_UNSUPP; }
 __attribute__((weak)) int hal_rfid_hf_emu_send_stream_buf(const uint8_t *tosend, int len)
 { (void)tosend; (void)len; return RFID_ERR_UNSUPP; }
+__attribute__((weak)) int hal_rfid_hf_emu_recv_progress(
+    uint8_t *rx, uint8_t *rx_par, int cap, uint32_t timeout_ms,
+    void (*data_ready)(void *, int, uint8_t, int), void *ctx)
+{
+    (void)rx; (void)rx_par; (void)cap; (void)timeout_ms; (void)data_ready; (void)ctx;
+    return RFID_ERR_UNSUPP;
+}
+__attribute__((weak)) int hal_rfid_hf_emu_prepare(const uint8_t *tosend, int len)
+{ (void)tosend; (void)len; return RFID_ERR_UNSUPP; }
+__attribute__((weak)) int hal_rfid_hf_emu_send_stream_match(
+    uint8_t (*next)(void *), void *ctx, int nsymbols,
+    const uint8_t *request, int request_len, int request_min_len, int *result)
+{
+    (void)next; (void)ctx; (void)nsymbols; (void)request; (void)request_len;
+    (void)request_min_len;
+    if (result) *result = 0;
+    return RFID_ERR_UNSUPP;
+}
 static int api_hf_emu_recv(uint8_t *rx, uint8_t *rx_par, int cap, uint32_t timeout_ms)
 { return hal_rfid_hf_emu_recv(rx, rx_par, cap, timeout_ms); }
 static int api_hf_emu_send(const uint8_t *tosend, int len)
@@ -90,7 +115,6 @@ static int api_hf_emu_send_stream(uint8_t (*next)(void *), void *ctx, int nsymbo
 { return hal_rfid_hf_emu_send_stream(next, ctx, nsymbols); }
 static int api_hf_emu_send_stream_buf(const uint8_t *tosend, int len)
 { return hal_rfid_hf_emu_send_stream_buf(tosend, len); }
-
 static const fantasi_rfid_t g_rfid = {
     .abi              = FANTASI_RFID_ABI,
     .caps             = hal_rfid_caps,
@@ -111,6 +135,9 @@ static const fantasi_rfid_t g_rfid = {
     .hf_emu_send      = api_hf_emu_send,
     .hf_emu_send_stream = api_hf_emu_send_stream,
     .hf_emu_send_stream_buf = api_hf_emu_send_stream_buf,
+    .hf_emu_recv_progress = hal_rfid_hf_emu_recv_progress,
+    .hf_emu_prepare = hal_rfid_hf_emu_prepare,
+    .hf_emu_send_stream_match = hal_rfid_hf_emu_send_stream_match,
 };
 
 const fantasi_rfid_t *fantasi_rfid(void) { return &g_rfid; }
